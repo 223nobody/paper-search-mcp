@@ -56,6 +56,7 @@ from .paper import Paper
 # Initialize MCP server
 mcp = FastMCP("paper_search_server")
 logger = logging.getLogger(__name__)
+ALLOW_CUSTOM_SAVE_PATH_ENV = "ALLOW_CUSTOM_SAVE_PATH"
 
 # Instances of searchers
 arxiv_searcher = ArxivSearcher()
@@ -84,7 +85,7 @@ ssrn_searcher = SSRNSearcher()
 
 
 def _wrap_save_path_methods(searcher: Any) -> None:
-    """Expand ~/Desktop-style defaults before source connectors touch paths."""
+    """Expand ~/Desktop/papers-style defaults before source connectors touch paths."""
     if searcher is None or getattr(searcher, "_paper_search_save_path_wrapped", False):
         return
 
@@ -102,6 +103,34 @@ def _wrap_save_path_methods(searcher: Any) -> None:
         setattr(searcher, method_name, _make_wrapper(original))
 
     setattr(searcher, "_paper_search_save_path_wrapped", True)
+
+
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    value = get_env(name, default).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def _custom_save_paths_allowed() -> bool:
+    return _env_flag_enabled(ALLOW_CUSTOM_SAVE_PATH_ENV)
+
+
+def _invalid_mcp_save_path(save_path: str) -> Optional[Dict[str, Any]]:
+    """Return a structured error when MCP callers try to override ~/Desktop/papers."""
+    requested = resolve_save_path(save_path)
+    default = resolve_save_path(DEFAULT_SAVE_PATH)
+    if requested == default or _custom_save_paths_allowed():
+        return None
+
+    return {
+        "status": "invalid_save_path",
+        "message": (
+            f"MCP save_path overrides are disabled. Omit save_path to use {DEFAULT_SAVE_PATH}, "
+            f"or set PAPER_SEARCH_MCP_{ALLOW_CUSTOM_SAVE_PATH_ENV}=true to allow custom directories."
+        ),
+        "requested_save_path": requested,
+        "default_save_path": default,
+        "allow_env": f"PAPER_SEARCH_MCP_{ALLOW_CUSTOM_SAVE_PATH_ENV}",
+    }
 
 
 # Asynchronous helper to adapt synchronous searchers
@@ -713,6 +742,11 @@ async def _download_source_pdf(
     downloader: str = "",
     legal_status: str = "source_native_or_open_access",
 ) -> Any:
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
+    save_path = resolve_save_path(save_path)
     try:
         result = await asyncio.to_thread(searcher.download_pdf, paper_id, save_path)
     except NotImplementedError as exc:
@@ -741,6 +775,10 @@ async def _read_source_paper(
     doi: str = "",
     title: str = "",
 ) -> Any:
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
     resolved_save_path = resolve_save_path(save_path)
     before = _snapshot_pdf_files(resolved_save_path)
     try:
@@ -1184,6 +1222,10 @@ async def parse_selected_papers(
     selected_indices accepts "all", comma-separated values such as "1,3,5",
     or ranges such as "2-4". Sci-Hub remains opt-in via use_scihub.
     """
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
     save_path = resolve_save_path(save_path)
     session = await asyncio.to_thread(cache_get_search_session, selection_token)
     if not session:
@@ -1405,7 +1447,7 @@ async def download_arxiv(
 
     Args:
         paper_id: arXiv paper ID (e.g., '2106.12345').
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         Path to the downloaded PDF file.
     """
@@ -1428,7 +1470,7 @@ async def download_pubmed(
 
     Args:
         paper_id: PubMed ID (PMID).
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Message indicating that direct PDF download is not supported.
     """
@@ -1454,7 +1496,7 @@ async def download_biorxiv(
 
     Args:
         paper_id: bioRxiv DOI.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         Path to the downloaded PDF file.
     """
@@ -1478,7 +1520,7 @@ async def download_medrxiv(
 
     Args:
         paper_id: medRxiv DOI.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         Path to the downloaded PDF file.
     """
@@ -1502,7 +1544,7 @@ async def download_iacr(
 
     Args:
         paper_id: IACR paper ID (e.g., '2009/101').
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         Path to the downloaded PDF file.
     """
@@ -1525,7 +1567,7 @@ async def read_arxiv_paper(
 
     Args:
         paper_id: arXiv paper ID (e.g., '2106.12345').
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: The extracted text content of the paper.
     """
@@ -1571,7 +1613,7 @@ async def read_biorxiv_paper(
 
     Args:
         paper_id: bioRxiv DOI.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: The extracted text content of the paper.
     """
@@ -1595,7 +1637,7 @@ async def read_medrxiv_paper(
 
     Args:
         paper_id: medRxiv DOI.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: The extracted text content of the paper.
     """
@@ -1619,7 +1661,7 @@ async def read_iacr_paper(
 
     Args:
         paper_id: IACR paper ID (e.g., '2009/101').
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: The extracted text content of the paper.
     """
@@ -1668,7 +1710,7 @@ async def download_semantic(
             - PMID:<id> (e.g., "PMID:19872477")
             - PMCID:<id> (e.g., "PMCID:2323736")
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         Path to the downloaded PDF file.
     """ 
@@ -1699,7 +1741,7 @@ async def read_semantic_paper(
             - PMID:<id> (e.g., "PMID:19872477")
             - PMCID:<id> (e.g., "PMCID:2323736")
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: The extracted text content of the paper.
     """
@@ -1767,7 +1809,7 @@ async def download_crossref(
 
     Args:
         paper_id: CrossRef DOI (e.g., '10.1038/nature12373').
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Message indicating that direct PDF download is not supported.
         
@@ -1801,6 +1843,10 @@ async def download_scihub(
     Returns:
         Downloaded PDF path on success; error message on failure.
     """
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
     save_path = resolve_save_path(save_path)
     fetcher = SciHubFetcher(base_url=base_url, output_dir=save_path)
     result = await asyncio.to_thread(fetcher.download_pdf, identifier)
@@ -2059,6 +2105,10 @@ async def download_with_fallback(
     ctx: Optional[Context] = None,
 ) -> Any:
     """Try source-native/OA fallback download, then ask whether to parse saved PDFs."""
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
     result = await _download_with_fallback_path(
         source=source,
         paper_id=paper_id,
@@ -2249,6 +2299,10 @@ async def parse_downloaded_paper(
     force: bool = False,
 ) -> Dict[str, Any]:
     """Download a paper using the legal-first fallback chain, then parse the PDF."""
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
     pdf_path = await _download_with_fallback_path(
         source=source,
         paper_id=paper_id,
@@ -2335,7 +2389,7 @@ async def read_crossref_paper(
 
     Args:
         paper_id: CrossRef DOI (e.g., '10.1038/nature12373').
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Message indicating that direct paper reading is not supported.
         
@@ -2579,7 +2633,7 @@ async def download_dblp(
 
     Args:
         paper_id: dblp paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Message indicating that direct PDF download is not supported.
     """
@@ -2602,7 +2656,7 @@ async def read_openaire_paper(
 
     Args:
         paper_id: OpenAIRE paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text or error message.
     """
@@ -2625,7 +2679,7 @@ async def download_openaire(
 
     Args:
         paper_id: OpenAIRE paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF or error message.
     """
@@ -2648,7 +2702,7 @@ async def read_citeseerx_paper(
 
     Args:
         paper_id: CiteSeerX paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text or fallback abstract/error message.
     """
@@ -2671,7 +2725,7 @@ async def download_citeseerx(
 
     Args:
         paper_id: CiteSeerX paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF or error message.
     """
@@ -2694,7 +2748,7 @@ async def read_doaj_paper(
 
     Args:
         paper_id: DOAJ paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text content.
     """
@@ -2717,7 +2771,7 @@ async def download_doaj(
 
     Args:
         paper_id: DOAJ paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF.
     """
@@ -2740,7 +2794,7 @@ async def read_base_paper(
 
     Args:
         paper_id: BASE paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text content.
     """
@@ -2763,7 +2817,7 @@ async def download_base(
 
     Args:
         paper_id: BASE paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF.
     """
@@ -2786,7 +2840,7 @@ async def read_zenodo_paper(
 
     Args:
         paper_id: Zenodo paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text content.
     """
@@ -2809,7 +2863,7 @@ async def download_zenodo(
 
     Args:
         paper_id: Zenodo paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF.
     """
@@ -2832,7 +2886,7 @@ async def read_hal_paper(
 
     Args:
         paper_id: HAL paper identifier.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Extracted text content.
     """
@@ -2855,7 +2909,7 @@ async def download_hal(
 
     Args:
         paper_id: HAL paper identifier.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Path to downloaded PDF.
     """
@@ -2928,7 +2982,7 @@ async def read_openalex_paper(
 
     Args:
         paper_id: OpenAlex paper ID.
-        save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+        save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
     Returns:
         str: Message indicating that direct paper reading is not supported natively.
     """
@@ -2951,7 +3005,7 @@ async def download_openalex(
 
     Args:
         paper_id: OpenAlex paper ID.
-        save_path: Directory to save the PDF (default: '~/Desktop').
+        save_path: Directory to save the PDF (default: '~/Desktop/papers').
     Returns:
         str: Error message, typically OpenAlex relies on extracted pdf_url instead of direct downloads.
     """
@@ -2990,7 +3044,7 @@ if ieee_searcher is not None:
 
         Args:
             paper_id: IEEE Xplore paper identifier.
-            save_path: Directory to save the PDF (default: '~/Desktop').
+            save_path: Directory to save the PDF (default: '~/Desktop/papers').
         Returns:
             str: Path to saved PDF or error message.
         """
@@ -3012,7 +3066,7 @@ if ieee_searcher is not None:
 
         Args:
             paper_id: IEEE Xplore paper identifier.
-            save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+            save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
         Returns:
             str: Extracted text content.
         """
@@ -3051,7 +3105,7 @@ if acm_searcher is not None:
 
         Args:
             paper_id: ACM DL paper identifier.
-            save_path: Directory to save the PDF (default: '~/Desktop').
+            save_path: Directory to save the PDF (default: '~/Desktop/papers').
         Returns:
             str: Path to saved PDF or error message.
         """
@@ -3073,7 +3127,7 @@ if acm_searcher is not None:
 
         Args:
             paper_id: ACM DL paper identifier.
-            save_path: Directory where the PDF is/will be saved (default: '~/Desktop').
+            save_path: Directory where the PDF is/will be saved (default: '~/Desktop/papers').
         Returns:
             str: Extracted text content.
         """

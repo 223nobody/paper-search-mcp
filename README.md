@@ -1,11 +1,11 @@
-# Paper Search MCP
+<h2 align="center">Paper Search MCP</h1>
 
 A Model Context Protocol (MCP) server for searching and downloading academic papers from multiple sources. The project follows a free-first strategy: prioritize open and public data sources, support optional API keys when they improve stability or coverage, and keep source-specific connectors extensible for advanced users.
 
 ![PyPI](https://img.shields.io/pypi/v/paper-search-mcp.svg) ![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 [![smithery badge](https://smithery.ai/badge/@openags/paper-search-mcp)](https://smithery.ai/server/@openags/paper-search-mcp)
 
-Chinese documentation: [README_CN.md](README_CN.md)
+<p align="center"><a href="README_CN.md">Chinese</a> | <a href="README.md">English</a></p>
 
 ---
 
@@ -195,34 +195,34 @@ Recommended free-first roadmap:
 
 This matrix reflects **verified live-integration results** from functional and end-to-end regression tests in this repository. Columns show the highest capability level observed under normal conditions.
 
-| Platform | Search | Download | Read | Notes |
-|---|---|---|---|---|
-| arXiv | ✅ | ✅ | ✅ | Open API; reliable |
-| PubMed | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
-| bioRxiv | ✅ | ✅ | ✅ | Open API; reliable |
-| medRxiv | ✅ | ✅ | ✅ | Open API; reliable |
-| Google Scholar | ⚠️ | ❌ | ❌ | Bot-detection active; set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` |
-| IACR | ✅ | ✅ | ✅ | Open API; reliable |
-| Semantic Scholar | ✅ | ✅ (OA) | ✅ (OA) | Works without key (rate-limited); key improves limits; key rejection (403) retried automatically without key |
-| Crossref | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
-| OpenAlex | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
-| PMC | ✅ | ✅ (OA only) | ✅ (OA only) | OA PDFs only; direct download may be blocked by some proxy environments |
-| CORE | ✅ | ✅ (record-dependent) | ✅ (record-dependent) | Free key recommended; connector retries with backoff and falls back to key-less on 401/403 |
-| Europe PMC | ✅ | ✅ (OA) | ✅ (OA) | OA PDFs only; direct download may be blocked by some proxy environments |
-| dblp | ✅ | ❌ | ⚠️ info-only | Open API; reliable |
-| OpenAIRE | ✅ | ❌ | ❌ | Open API; retries 3× with escalating request profiles on transient 403 |
-| CiteSeerX | ⚠️ | ✅ (record-dependent) | ⚠️ | API endpoint intermittently unavailable / redirects to web archive |
-| DOAJ | ✅ | ⚠️ (URL-dependent) | ⚠️ (URL-dependent) | PDF availability varies by article; free key raises rate limits |
-| BASE | ⚠️ | ✅ (record-dependent) | ✅ (record-dependent) | OAI-PMH endpoint requires institutional IP registration; returns empty gracefully otherwise |
-| Zenodo | ✅ | ✅ (record-dependent) | ✅ (record-dependent) | Open API; reliable |
-| HAL | ✅ | ✅ (record-dependent) | ✅ (record-dependent) | Open API; reliable |
-| SSRN | ⚠️ | ⚠️ best-effort | ⚠️ best-effort | 403 bot-detection active; public PDF only |
-| Unpaywall | ✅ (DOI lookup) | ❌ | ❌ | **Requires** `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` |
-| Sci-Hub (optional) | ⚠️ fallback-only | ✅ | ❌ | Optional; unstable mirrors; user responsibility |
-| **IEEE Xplore** 🔑 | 🚧 skeleton | 🚧 skeleton | 🚧 skeleton | Requires `PAPER_SEARCH_MCP_IEEE_API_KEY` to activate |
-| **ACM DL** 🔑 | 🚧 skeleton | 🚧 skeleton | 🚧 skeleton | Requires `PAPER_SEARCH_MCP_ACM_API_KEY` to activate |
+| Platform           | Search           | Download              | Read                  | Notes                                                                                                        |
+| ------------------ | ---------------- | --------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| arXiv              | ✅               | ✅                    | ✅                    | Open API; reliable                                                                                           |
+| PubMed             | ✅               | ❌                    | ⚠️ info-only          | Open API; reliable                                                                                           |
+| bioRxiv            | ✅               | ✅                    | ✅                    | Open API; reliable                                                                                           |
+| medRxiv            | ✅               | ✅                    | ✅                    | Open API; reliable                                                                                           |
+| Google Scholar     | ⚠️               | ❌                    | ❌                    | Bot-detection active; set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL`                                        |
+| IACR               | ✅               | ✅                    | ✅                    | Open API; reliable                                                                                           |
+| Semantic Scholar   | ✅               | ✅ (OA)               | ✅ (OA)               | Works without key (rate-limited); key improves limits; key rejection (403) retried automatically without key |
+| Crossref           | ✅               | ❌                    | ⚠️ info-only          | Open API; reliable                                                                                           |
+| OpenAlex           | ✅               | ❌                    | ⚠️ info-only          | Open API; reliable                                                                                           |
+| PMC                | ✅               | ✅ (OA only)          | ✅ (OA only)          | OA PDFs only; direct download may be blocked by some proxy environments                                      |
+| CORE               | ✅               | ✅ (record-dependent) | ✅ (record-dependent) | Free key recommended; connector retries with backoff and falls back to key-less on 401/403                   |
+| Europe PMC         | ✅               | ✅ (OA)               | ✅ (OA)               | OA PDFs only; direct download may be blocked by some proxy environments                                      |
+| dblp               | ✅               | ❌                    | ⚠️ info-only          | Open API; reliable                                                                                           |
+| OpenAIRE           | ✅               | ❌                    | ❌                    | Open API; retries 3× with escalating request profiles on transient 403                                       |
+| CiteSeerX          | ⚠️               | ✅ (record-dependent) | ⚠️                    | API endpoint intermittently unavailable / redirects to web archive                                           |
+| DOAJ               | ✅               | ⚠️ (URL-dependent)    | ⚠️ (URL-dependent)    | PDF availability varies by article; free key raises rate limits                                              |
+| BASE               | ⚠️               | ✅ (record-dependent) | ✅ (record-dependent) | OAI-PMH endpoint requires institutional IP registration; returns empty gracefully otherwise                  |
+| Zenodo             | ✅               | ✅ (record-dependent) | ✅ (record-dependent) | Open API; reliable                                                                                           |
+| HAL                | ✅               | ✅ (record-dependent) | ✅ (record-dependent) | Open API; reliable                                                                                           |
+| SSRN               | ⚠️               | ⚠️ best-effort        | ⚠️ best-effort        | 403 bot-detection active; public PDF only                                                                    |
+| Unpaywall          | ✅ (DOI lookup)  | ❌                    | ❌                    | **Requires** `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL`                                                              |
+| Sci-Hub (optional) | ⚠️ fallback-only | ✅                    | ❌                    | Optional; unstable mirrors; user responsibility                                                              |
+| **IEEE Xplore** 🔑 | 🚧 skeleton      | 🚧 skeleton           | 🚧 skeleton           | Requires `PAPER_SEARCH_MCP_IEEE_API_KEY` to activate                                                         |
+| **ACM DL** 🔑      | 🚧 skeleton      | 🚧 skeleton           | 🚧 skeleton           | Requires `PAPER_SEARCH_MCP_ACM_API_KEY` to activate                                                          |
 
-> ✅ = reliable in live tests.  ⚠️ = works but subject to upstream instability or access restrictions.  ❌ = not supported.  🔑 = key required.  🚧 = skeleton only.
+> ✅ = reliable in live tests. ⚠️ = works but subject to upstream instability or access restrictions. ❌ = not supported. 🔑 = key required. 🚧 = skeleton only.
 
 ---
 
@@ -230,16 +230,16 @@ This matrix reflects **verified live-integration results** from functional and e
 
 All keys are **optional** unless noted. Configure them in `.env` (preferred) or as shell exports.
 
-| Environment Variable | Provider | Required? | How to obtain |
-|---|---|---|---|
-| `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` | Unpaywall | **Yes** (Unpaywall disabled without it) | Any valid email; register at [unpaywall.org](https://unpaywall.org/products/api) |
-| `PAPER_SEARCH_MCP_CORE_API_KEY` | CORE | Recommended | Free at [core.ac.uk/services/api](https://core.ac.uk/services/api) |
-| `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar | Optional | Free at [semanticscholar.org](https://www.semanticscholar.org/product/api) — improves rate limits |
-| `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` | Google Scholar | Optional | Your HTTP/HTTPS proxy URL — bypasses bot-detection |
-| `PAPER_SEARCH_MCP_DOAJ_API_KEY` | DOAJ | Optional | Free at [doaj.org](https://doaj.org/apply-for-api-key/) — raises hourly rate limit |
-| `PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN` | Zenodo | Optional | Free at [zenodo.org](https://zenodo.org/account/settings/applications/) — required for private records |
-| `PAPER_SEARCH_MCP_IEEE_API_KEY` | IEEE Xplore | **Required to activate** | Free at [developer.ieee.org](https://developer.ieee.org/) |
-| `PAPER_SEARCH_MCP_ACM_API_KEY` | ACM DL | **Required to activate** | See [libraries.acm.org/digital-library/acm-open](https://libraries.acm.org/digital-library/acm-open) |
+| Environment Variable                        | Provider         | Required?                               | How to obtain                                                                                          |
+| ------------------------------------------- | ---------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL`          | Unpaywall        | **Yes** (Unpaywall disabled without it) | Any valid email; register at [unpaywall.org](https://unpaywall.org/products/api)                       |
+| `PAPER_SEARCH_MCP_CORE_API_KEY`             | CORE             | Recommended                             | Free at [core.ac.uk/services/api](https://core.ac.uk/services/api)                                     |
+| `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar | Optional                                | Free at [semanticscholar.org](https://www.semanticscholar.org/product/api) — improves rate limits      |
+| `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` | Google Scholar   | Optional                                | Your HTTP/HTTPS proxy URL — bypasses bot-detection                                                     |
+| `PAPER_SEARCH_MCP_DOAJ_API_KEY`             | DOAJ             | Optional                                | Free at [doaj.org](https://doaj.org/apply-for-api-key/) — raises hourly rate limit                     |
+| `PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN`      | Zenodo           | Optional                                | Free at [zenodo.org](https://zenodo.org/account/settings/applications/) — required for private records |
+| `PAPER_SEARCH_MCP_IEEE_API_KEY`             | IEEE Xplore      | **Required to activate**                | Free at [developer.ieee.org](https://developer.ieee.org/)                                              |
+| `PAPER_SEARCH_MCP_ACM_API_KEY`              | ACM DL           | **Required to activate**                | See [libraries.acm.org/digital-library/acm-open](https://libraries.acm.org/digital-library/acm-open)   |
 
 All variables follow the `PAPER_SEARCH_MCP_<NAME>` prefix scheme. Legacy names without the prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
 
@@ -249,27 +249,27 @@ All variables follow the `PAPER_SEARCH_MCP_<NAME>` prefix scheme. Legacy names w
 
 Some search failures are caused by external provider instability, not by bugs in this project:
 
-| Source | Symptom | Cause | Workaround |
-|---|---|---|---|
-| Google Scholar | Returns 0 results / empty HTML | Bot-detection (CAPTCHA) | Set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` to a proxy |
-| Semantic Scholar | 429 rate-limited responses | Anonymous access rate limit | Set `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY`; if key is rejected (403) connector automatically retries without key |
-| CORE | 500 / timeout errors | Unauthenticated rate limiting | Set `PAPER_SEARCH_MCP_CORE_API_KEY` (free); connector retries with exponential backoff and falls back to key-less on 401/403 |
-| OpenAIRE | Transient 403 responses | IP-based session rate limiting | Connector retries 3× per profile, escalating: plain session → XML Accept header → raw `requests.get` with Mozilla UA |
-| CiteSeerX | 404 via web archive redirect | PSU endpoint intermittently redirects to archive | No workaround; connector returns empty gracefully |
-| BASE | Search returns 0 results | OAI-PMH endpoint requires institutional IP registration | Register at [base-search.net](https://www.base-search.net/about/en/) for API access; connector returns empty gracefully otherwise |
-| SSRN | HTTP 403 | Bot-detection (Cloudflare) | No workaround; connector tries two endpoints and returns a clear message on failure |
-| PMC / Europe PMC | PDF download ProxyError | Local proxy blocking direct HTTPS PDF download | Disable proxy or use `download_with_fallback` instead |
-| Unpaywall | Skipped entirely | `UNPAYWALL_EMAIL` env var not set | Set `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` in `.env` |
+| Source           | Symptom                        | Cause                                                   | Workaround                                                                                                                        |
+| ---------------- | ------------------------------ | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Google Scholar   | Returns 0 results / empty HTML | Bot-detection (CAPTCHA)                                 | Set `PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL` to a proxy                                                                        |
+| Semantic Scholar | 429 rate-limited responses     | Anonymous access rate limit                             | Set `PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY`; if key is rejected (403) connector automatically retries without key             |
+| CORE             | 500 / timeout errors           | Unauthenticated rate limiting                           | Set `PAPER_SEARCH_MCP_CORE_API_KEY` (free); connector retries with exponential backoff and falls back to key-less on 401/403      |
+| OpenAIRE         | Transient 403 responses        | IP-based session rate limiting                          | Connector retries 3× per profile, escalating: plain session → XML Accept header → raw `requests.get` with Mozilla UA              |
+| CiteSeerX        | 404 via web archive redirect   | PSU endpoint intermittently redirects to archive        | No workaround; connector returns empty gracefully                                                                                 |
+| BASE             | Search returns 0 results       | OAI-PMH endpoint requires institutional IP registration | Register at [base-search.net](https://www.base-search.net/about/en/) for API access; connector returns empty gracefully otherwise |
+| SSRN             | HTTP 403                       | Bot-detection (Cloudflare)                              | No workaround; connector tries two endpoints and returns a clear message on failure                                               |
+| PMC / Europe PMC | PDF download ProxyError        | Local proxy blocking direct HTTPS PDF download          | Disable proxy or use `download_with_fallback` instead                                                                             |
+| Unpaywall        | Skipped entirely               | `UNPAYWALL_EMAIL` env var not set                       | Set `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL` in `.env`                                                                                  |
 
 ## Optional Paid Platform Connectors (Phase 3)
 
 IEEE Xplore and ACM Digital Library connectors are included as **opt-in skeletons**.
 They are **disabled by default** — no API calls are made unless you explicitly configure the corresponding keys.
 
-| Platform | Env Var | Status |
-|---|---|---|
-| IEEE Xplore | `PAPER_SEARCH_MCP_IEEE_API_KEY` | 🚧 skeleton — search registered, download/read raise `NotImplementedError` |
-| ACM Digital Library | `PAPER_SEARCH_MCP_ACM_API_KEY` | 🚧 skeleton — search registered, download/read raise `NotImplementedError` |
+| Platform            | Env Var                         | Status                                                                     |
+| ------------------- | ------------------------------- | -------------------------------------------------------------------------- |
+| IEEE Xplore         | `PAPER_SEARCH_MCP_IEEE_API_KEY` | 🚧 skeleton — search registered, download/read raise `NotImplementedError` |
+| ACM Digital Library | `PAPER_SEARCH_MCP_ACM_API_KEY`  | 🚧 skeleton — search registered, download/read raise `NotImplementedError` |
 
 **How to enable:**
 
@@ -348,6 +348,7 @@ The skill uses a CLI (`paper-search`) that wraps the same library as the MCP ser
 ---
 
 > **MCP Server Config file locations** (for methods below)
+>
 > - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 > - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 > - **Linux**: `~/.config/Claude/claude_desktop_config.json`
@@ -546,8 +547,10 @@ uv run -m paper_search_mcp.server
       "command": "uv",
       "args": [
         "run",
-        "--directory", "/path/to/paper-search-mcp",
-        "-m", "paper_search_mcp.server"
+        "--directory",
+        "/path/to/paper-search-mcp",
+        "-m",
+        "paper_search_mcp.server"
       ],
       "env": {
         "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
@@ -653,6 +656,7 @@ We welcome contributions! Here's how to get started:
 - [√] Sci-Hub warning and enablement docs
 
 ### Development Tasks
+
 - [√] Fix Async search bugs and ensure reliable fast MCP events
 - [√] End-to-End full pipeline testing script (search, parse, download)
 - [√] Establish two-layer federated architecture (Layer 1 tool: `search_papers`)
@@ -687,8 +691,8 @@ We welcome contributions! Here's how to get started:
 - [ ] Web of Science
 - [ ] Scopus
 
-
 ---
+
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.

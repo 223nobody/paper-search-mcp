@@ -1,8 +1,8 @@
-# Paper Search MCP 中文说明
+<h2 align="center">Paper Search MCP</h1>
 
 `paper-search-mcp` 是一个面向论文检索、PDF 下载和论文解析的 MCP Server，也提供 `paper-search` 命令行工具。当前版本在原始多源论文检索能力上，补齐了“检索/下载 PDF -> 询问用户是否解析 -> MinerU PDF parsing -> 缓存与同名 zip 导出”的完整链路。
 
-英文文档见 [README.md](README.md)。
+<p align="center"><a href="README_CN.md">Chinese</a> | <a href="README.md">English</a></p>
 
 ## 项目定位
 

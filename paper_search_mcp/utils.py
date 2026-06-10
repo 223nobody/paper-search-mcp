@@ -2,11 +2,11 @@ import re
 from pathlib import Path
 
 
-DEFAULT_SAVE_PATH = "~/Desktop"
+DEFAULT_SAVE_PATH = "~/Desktop/papers"
 
 
 def resolve_save_path(save_path: str = DEFAULT_SAVE_PATH) -> str:
-    """Expand a user-facing save path such as ~/Desktop to an absolute path."""
+    """Expand a user-facing save path such as ~/Desktop/papers to an absolute path."""
     value = (save_path or DEFAULT_SAVE_PATH).strip() or DEFAULT_SAVE_PATH
     return str(Path(value).expanduser().resolve())
 

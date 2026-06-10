@@ -71,14 +71,27 @@ class TestPaperSearchServer(unittest.TestCase):
         os.makedirs(save_path, exist_ok=True)  # 确保目录存在
 
         # 下载每个搜索结果的 PDF
-        for paper in search_results:
-            paper_id = paper['paper_id']
-            result = asyncio.run(server.download_arxiv(paper_id, save_path))
-            self.assertIsInstance(result, dict, f"Result for {paper_id} should include download metadata")
-            self.assertEqual(result["status"], "downloaded")
-            self.assertTrue(result["pdf_path"].endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
-            self.assertTrue(os.path.exists(result["pdf_path"]), f"PDF file for {paper_id} should exist on disk")
-            self.assertEqual(result["parse_prompt"]["interaction"], "backend_session_numbered_selection")
+        with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true"}):
+            for paper in search_results:
+                paper_id = paper['paper_id']
+                result = asyncio.run(server.download_arxiv(paper_id, save_path))
+                self.assertIsInstance(result, dict, f"Result for {paper_id} should include download metadata")
+                self.assertEqual(result["status"], "downloaded")
+                self.assertTrue(result["pdf_path"].endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
+                self.assertTrue(os.path.exists(result["pdf_path"]), f"PDF file for {paper_id} should exist on disk")
+                self.assertEqual(result["parse_prompt"]["interaction"], "backend_session_numbered_selection")
+
+    def test_download_arxiv_rejects_custom_save_path_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "false"}), patch.object(
+                server.arxiv_searcher,
+                "download_pdf",
+                side_effect=AssertionError("download should not start for rejected save_path"),
+            ):
+                result = asyncio.run(server.download_arxiv("2601.00001", tmp))
+
+        self.assertEqual(result["status"], "invalid_save_path")
+        self.assertEqual(result["allow_env"], "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH")
 
 if __name__ == "__main__":
     unittest.main()

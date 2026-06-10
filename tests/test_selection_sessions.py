@@ -98,7 +98,13 @@ class TestSelectionSessions(unittest.TestCase):
                 "result_zip_path": str(Path(tmp) / "downloaded.zip"),
             }
 
-            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_CACHE_DIR": tmp}), patch(
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true",
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                },
+            ), patch(
                 "paper_search_mcp.server._download_from_url",
                 new=AsyncMock(return_value=str(pdf)),
             ), patch(
@@ -118,6 +124,33 @@ class TestSelectionSessions(unittest.TestCase):
             self.assertEqual(result["parsed"], 1)
             self.assertEqual(result["results"][0]["download_method"], "search_result_pdf_url")
             self.assertEqual(result["results"][0]["parse"]["result_zip_path"], parse_payload["result_zip_path"])
+
+    def test_parse_selected_papers_rejects_custom_save_path_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cache.create_search_session(
+                query="mineru parsing",
+                sources="arxiv",
+                papers=[{"title": "Paper", "source": "arxiv", "paper_id": "2601.00002"}],
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "false",
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                },
+            ):
+                result = asyncio.run(
+                    server.parse_selected_papers(
+                        session["selection_token"],
+                        selected_indices="1",
+                        save_path=tmp,
+                    )
+                )
+
+            self.assertEqual(result["status"], "invalid_save_path")
+            self.assertEqual(result["allow_env"], "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH")
 
     def test_after_saved_pdf_creates_numbered_session_without_context(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -209,7 +242,13 @@ class TestSelectionSessions(unittest.TestCase):
                 return "extracted text"
 
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_CACHE_DIR": tmp}):
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true",
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                },
+            ):
                 result = asyncio.run(
                     server._read_source_paper(
                         FakeSearcher(),

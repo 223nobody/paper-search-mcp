@@ -28,12 +28,12 @@ For speed, prefer targeted sources (`-s arxiv,semantic,crossref`) over "all" unl
 
 ### Download PDF
 ```bash
-uv run --directory <REPO_PATH> paper-search download <source> <paper_id> [-o ~/Desktop]
+uv run --directory <REPO_PATH> paper-search download <source> <paper_id> [-o ~/Desktop/papers]
 ```
 
 ### Read (extract text)
 ```bash
-uv run --directory <REPO_PATH> paper-search read <source> <paper_id> [-o ~/Desktop]
+uv run --directory <REPO_PATH> paper-search read <source> <paper_id> [-o ~/Desktop/papers]
 ```
 
 ### Parse PDF (MinerU-first, pypdf fallback)
@@ -50,7 +50,7 @@ uv run --directory <REPO_PATH> paper-search parse <pdf_path> --paper-key <key> -
 
 For MCP clients with elicitation support, prefer:
 
-- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop", use_scihub=False, mode="auto", backend="", force=False)`
+- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
 
 This searches papers, asks the client to show a native multi-select form, then
 parses the selected papers with the MinerU pipeline. In VS Code Copilot Agent
@@ -72,9 +72,9 @@ If the MCP client cannot provide elicitation UI, use the backend session flow:
 4. Call MCP tool `parse_selected_papers` with the returned `selection_token` and selected indices.
 
 Useful MCP tools for this flow:
-- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop", use_scihub=False, mode="auto", backend="", force=False)`
+- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
 - `search_papers_for_parsing(query, max_results_per_source=5, sources="all", year=None)`
-- `parse_selected_papers(selection_token, selected_indices="all", save_path="~/Desktop", use_scihub=False, mode="auto", backend="", force=False)`
+- `parse_selected_papers(selection_token, selected_indices="all", save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
 - `list_search_sessions()`
 - `get_search_session(selection_token)`
 - `delete_search_session(selection_token)`
