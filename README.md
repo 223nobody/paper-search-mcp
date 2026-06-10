@@ -5,6 +5,8 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 ![PyPI](https://img.shields.io/pypi/v/paper-search-mcp.svg) ![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 [![smithery badge](https://smithery.ai/badge/@openags/paper-search-mcp)](https://smithery.ai/server/@openags/paper-search-mcp)
 
+Chinese documentation: [README_CN.md](README_CN.md)
+
 ---
 
 ## Table of Contents
@@ -29,6 +31,7 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - [Star History](#star-history)
 - [License](#license)
 - [TODO](#todo)
+- [Acknowledgements](#acknowledgements)
 
 ---
 
@@ -55,9 +58,121 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - **Free-First Design**: Open and public sources are prioritized before any optional commercial or restricted integrations.
 - **Optional API-Key Enhancement**: Sources like Semantic Scholar can work better with a user-provided API key, but are not intended to force paid usage.
 - **Discovery + Retrieval Workflow**: Google Scholar and Crossref can be used for discovery and DOI backfilling, while open repositories and publisher links are used for lawful full-text resolution where available.
-- **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub.
+- **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub. Sci-Hub fallback is opt-in.
+- **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into cached `full.md`, `content_list.json`, `manifest.json`, and extracted assets. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `auto` mode first uses MinerU official extract API, then local API/CLI, and finally `pypdf`.
+- **Saved-PDF Parse Prompt**: Every MCP tool path that saves a PDF returns a parse prompt. Clients with MCP Elicitation can render a native multi-select/checkbox UI; clients without it receive a backend `selection_token` and numbered fallback list.
 - **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
 - **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
+
+## MinerU Parsing Workflow
+
+The project now separates discovery/download from parsing. A typical agent workflow is:
+
+1. Use `search_papers` or `paper-search search` to discover candidate papers.
+2. Use source-native download or `download_with_fallback` to obtain a PDF.
+3. Parse the PDF with MinerU. This writes a same-name result zip beside the PDF
+   (for example `example.pdf` -> `example.zip`) and keeps a reusable cache copy:
+
+```bash
+paper-search parse ~/Desktop/example.pdf --paper-key example --mode auto
+```
+
+4. Reuse parsed artifacts from cache:
+
+```bash
+paper-search cache list
+paper-search cache get example -f markdown
+paper-search cache search example "attention"
+paper-search cache assets example
+```
+
+Parser configuration:
+
+```dotenv
+PAPER_SEARCH_MCP_CACHE_DIR=.paper_search_cache
+PAPER_SEARCH_MCP_MINERU_MODE=auto
+PAPER_SEARCH_MCP_MINERU_BASE_URL=http://127.0.0.1:8000
+PAPER_SEARCH_MCP_MINERU_BACKEND=pipeline
+PAPER_SEARCH_MCP_MINERU_API_KEY=
+PAPER_SEARCH_MCP_MINERU_EXTRACT_BASE_URL=https://mineru.net/api/v4
+PAPER_SEARCH_MCP_MINERU_MODEL_VERSION=vlm
+PAPER_SEARCH_MCP_MINERU_LANGUAGE=ch
+PAPER_SEARCH_MCP_MINERU_IS_OCR=false
+PAPER_SEARCH_MCP_MINERU_ENABLE_FORMULA=true
+PAPER_SEARCH_MCP_MINERU_ENABLE_TABLE=true
+```
+
+Set `PAPER_SEARCH_MCP_MINERU_MODE=extract` to force MinerU official extract
+API only. In `auto` mode, the extract API is tried first when an API key is
+present; if it fails, the chain continues to local MinerU API/CLI and `pypdf`.
+
+### MCP elicitation selection and numbered fallback
+
+MCP clients with elicitation support, such as VS Code Copilot Agent Mode, can
+use `search_papers_with_elicitation` to show a native multi-select form after
+searching. The server creates a search session, asks the client to collect the
+selected papers, then runs `parse_selected_papers` automatically.
+
+The same interaction is also triggered after any MCP download/read tool saves a
+PDF. For example, `download_arxiv` now returns `pdf_path`, `pdf_paths`, and
+`parse_prompt`. The `parse_prompt` is either an accepted elicitation parse
+result or a numbered fallback payload with `selection_token`.
+
+Example MCP flow:
+
+```json
+{
+  "tool": "search_papers_with_elicitation",
+  "arguments": {
+    "query": "agentic spatial reasoning",
+    "sources": "arxiv,semantic,openalex",
+    "max_results_per_source": 3,
+    "save_path": "~/Desktop",
+    "mode": "auto"
+  }
+}
+```
+
+If the client does not support elicitation, or the user cancels the form, the
+tool returns the same `selection_token` and numbered `papers` list used by the
+backend fallback workflow:
+
+1. Call `search_papers_for_parsing`.
+2. Present the returned numbered `papers` list to the user.
+3. Ask the user to choose indices such as `1,3,5`, `2-4`, or `all`.
+4. Call `parse_selected_papers` with the returned `selection_token`.
+
+Fallback MCP flow:
+
+```json
+{
+  "tool": "search_papers_for_parsing",
+  "arguments": {
+    "query": "agentic spatial reasoning",
+    "sources": "arxiv,semantic,openalex",
+    "max_results_per_source": 3
+  }
+}
+```
+
+Then parse selected entries:
+
+```json
+{
+  "tool": "parse_selected_papers",
+  "arguments": {
+    "selection_token": "search_20260610_abcdef12",
+    "selected_indices": "1,3",
+    "save_path": "~/Desktop",
+    "mode": "auto"
+  }
+}
+```
+
+Search sessions are stored under `.paper_search_cache/sessions/`. Use
+`list_search_sessions`, `get_search_session`, and `delete_search_session` to
+inspect or clean them. Each parsed PDF still writes a same-name result zip next
+to the downloaded PDF and keeps reusable artifacts in the parsed-paper cache.
 
 ## Source Strategy
 
@@ -572,14 +687,8 @@ We welcome contributions! Here's how to get started:
 - [ ] Web of Science
 - [ ] Scopus
 
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=openags/paper-search-mcp&type=Date)](https://star-history.com/#openags/paper-search-mcp&Date)
 
 ---
-
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
@@ -587,3 +696,15 @@ This project is licensed under the MIT License. See the LICENSE file for details
 ---
 
 Happy researching with `paper-search-mcp`! If you encounter issues, open a GitHub issue.
+
+---
+
+## Acknowledgements
+
+This fork and extension benefited from the following open-source projects and prior art:
+
+- [openags/paper-search-mcp](https://github.com/openags/paper-search-mcp): the upstream MCP server for multi-source academic paper search and download.
+- [Dictation354/paper-fetch-skill](https://github.com/Dictation354/paper-fetch-skill): reference workflow for paper fetching, PDF retrieval, and agent-facing paper utilities.
+- [Rimagination/scansci-pdf](https://github.com/Rimagination/scansci-pdf): reference ideas for scientific PDF processing and extraction-oriented workflows.
+- [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero): reference implementation direction for integrating MinerU-style PDF parsing into a research-reading workflow.
+- [opendatalab/MinerU](https://github.com/opendatalab/MinerU): the document parsing engine used for high-quality PDF-to-Markdown/JSON/assets extraction.

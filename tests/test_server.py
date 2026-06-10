@@ -2,6 +2,10 @@
 import unittest
 import asyncio
 import os
+import tempfile
+from pathlib import Path
+from pypdf import PdfWriter
+from unittest.mock import patch
 from paper_search_mcp import server
 
 class TestPaperSearchServer(unittest.TestCase):
@@ -19,6 +23,33 @@ class TestPaperSearchServer(unittest.TestCase):
     def test_parse_sources_with_new_platforms(self):
         parsed = server._parse_sources("dblp,doaj,base,zenodo,hal,ssrn,unpaywall,invalid")
         self.assertEqual(parsed, ["dblp", "doaj", "base", "zenodo", "hal", "ssrn", "unpaywall"])
+
+    def test_list_sources_exposes_capabilities(self):
+        result = asyncio.run(server.list_sources())
+        self.assertIn("sources", result)
+        arxiv = next(source for source in result["sources"] if source["name"] == "arxiv")
+        self.assertTrue(arxiv["search"])
+        self.assertTrue(arxiv["download"])
+
+    def test_parse_pdf_with_mineru_pypdf_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=72, height=72)
+            with pdf.open("wb") as fh:
+                writer.write(fh)
+
+            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_CACHE_DIR": tmp}):
+                result = asyncio.run(
+                    server.parse_pdf_with_mineru(
+                        str(pdf),
+                        paper_key="server-test",
+                        mode="pypdf",
+                        force=True,
+                    )
+                )
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(Path(result["full_md_path"]).exists())
 
     def test_search_arxiv(self):
         """Test the search_arxiv tool returns 10 results."""
@@ -43,9 +74,11 @@ class TestPaperSearchServer(unittest.TestCase):
         for paper in search_results:
             paper_id = paper['paper_id']
             result = asyncio.run(server.download_arxiv(paper_id, save_path))
-            self.assertIsInstance(result, str, f"Result for {paper_id} should be a file path")
-            self.assertTrue(result.endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
-            self.assertTrue(os.path.exists(result), f"PDF file for {paper_id} should exist on disk")
+            self.assertIsInstance(result, dict, f"Result for {paper_id} should include download metadata")
+            self.assertEqual(result["status"], "downloaded")
+            self.assertTrue(result["pdf_path"].endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
+            self.assertTrue(os.path.exists(result["pdf_path"]), f"PDF file for {paper_id} should exist on disk")
+            self.assertEqual(result["parse_prompt"]["interaction"], "backend_session_numbered_selection")
 
 if __name__ == "__main__":
     unittest.main()

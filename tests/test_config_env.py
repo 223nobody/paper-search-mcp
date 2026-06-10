@@ -43,14 +43,15 @@ class TestConfigEnv(unittest.TestCase):
             self.assertEqual(config.get_env("CORE_API_KEY", "default"), "")
 
     def test_loads_from_custom_env_file(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=True) as tmp:
-            tmp.write("PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=test@example.com\n")
-            tmp.flush()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "paper-search.env")
+            with open(tmp_path, "w", encoding="utf-8") as tmp:
+                tmp.write("PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=test@example.com\n")
 
             with patch.dict(
                 os.environ,
                 {
-                    "PAPER_SEARCH_MCP_ENV_FILE": tmp.name,
+                    "PAPER_SEARCH_MCP_ENV_FILE": tmp_path,
                 },
                 clear=True,
             ):

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from typing import Any, Dict, List
 
@@ -31,6 +32,17 @@ from .academic_platforms.unpaywall import UnpaywallResolver, UnpaywallSearcher
 from .academic_platforms.zenodo import ZenodoSearcher
 from .academic_platforms.hal import HALSearcher
 from .academic_platforms.ssrn import SSRNSearcher
+from .cache import (
+    delete_cache,
+    get_cached_paths,
+    list_assets,
+    list_parsed,
+    read_parsed,
+    record_download,
+    search_parsed,
+)
+from .parsers.mineru import mineru_health_check, parse_pdf_with_mineru
+from .utils import DEFAULT_SAVE_PATH, resolve_save_path
 
 # ---------------------------------------------------------------------------
 # Searcher registry
@@ -189,7 +201,16 @@ async def cmd_download(args: argparse.Namespace) -> int:
 
     searcher = SEARCHERS[source]
     try:
-        result = await asyncio.to_thread(searcher.download_pdf, args.paper_id, args.save_path)
+        save_path = resolve_save_path(args.save_path)
+        result = await asyncio.to_thread(searcher.download_pdf, args.paper_id, save_path)
+        if isinstance(result, str) and os.path.exists(result):
+            record_download(
+                pdf_path=result,
+                source=source,
+                paper_id=args.paper_id,
+                downloader=f"{source}.download_pdf",
+                legal_status="source_native_or_open_access",
+            )
         print(json.dumps({"status": "ok", "path": result}))
         return 0
     except Exception as e:
@@ -207,7 +228,8 @@ async def cmd_read(args: argparse.Namespace) -> int:
 
     searcher = SEARCHERS[source]
     try:
-        text = await asyncio.to_thread(searcher.read_paper, args.paper_id, args.save_path)
+        save_path = resolve_save_path(args.save_path)
+        text = await asyncio.to_thread(searcher.read_paper, args.paper_id, save_path)
         print(text)
         return 0
     except Exception as e:
@@ -219,6 +241,62 @@ async def cmd_sources(args: argparse.Namespace) -> int:
     _init_searchers()
     print(json.dumps({"sources": sorted(SEARCHERS.keys())}, indent=2))
     return 0
+
+
+async def cmd_parse(args: argparse.Namespace) -> int:
+    result = await asyncio.to_thread(
+        parse_pdf_with_mineru,
+        args.pdf_path,
+        paper_key_hint=args.paper_key or "",
+        source=args.source or "",
+        paper_id=args.paper_id or "",
+        doi=args.doi or "",
+        title=args.title or "",
+        mode=args.mode,
+        backend=args.backend or "",
+        force=args.force,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result.get("status") in {"ok", "cached"} else 1
+
+
+async def cmd_mineru_health(args: argparse.Namespace) -> int:
+    result = await asyncio.to_thread(mineru_health_check, mode=args.mode, backend=args.backend or "")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+async def cmd_cache(args: argparse.Namespace) -> int:
+    action = args.cache_command
+    if action == "list":
+        papers = list_parsed()
+        print(json.dumps({"papers": papers, "total": len(papers)}, indent=2, ensure_ascii=False))
+        return 0
+    if action == "get":
+        result = read_parsed(args.paper_key, args.format)
+        if isinstance(result, str):
+            print(result)
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if action == "assets":
+        result = list_assets(args.paper_key, args.asset_type)
+        print(json.dumps({"assets": result, "total": len(result)}, indent=2, ensure_ascii=False))
+        return 0
+    if action == "search":
+        result = search_parsed(args.paper_key, args.query, args.max_results)
+        print(json.dumps({"hits": result, "total": len(result)}, indent=2, ensure_ascii=False))
+        return 0
+    if action == "paths":
+        result = get_cached_paths(args.paper_key)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    if action == "delete":
+        deleted = delete_cache(args.paper_key)
+        print(json.dumps({"paper_key": args.paper_key, "deleted": deleted}, indent=2, ensure_ascii=False))
+        return 0 if deleted else 1
+    print(json.dumps({"error": f"Unknown cache command: {action}"}))
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -245,16 +323,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl = sub.add_parser("download", help="Download a paper PDF")
     p_dl.add_argument("source", help="Source platform (e.g. arxiv, semantic)")
     p_dl.add_argument("paper_id", help="Paper identifier")
-    p_dl.add_argument("-o", "--save-path", default="./downloads", help="Save directory (default: ./downloads)")
+    p_dl.add_argument("-o", "--save-path", default=DEFAULT_SAVE_PATH, help=f"Save directory (default: {DEFAULT_SAVE_PATH})")
 
     # read
     p_read = sub.add_parser("read", help="Download and extract text from a paper")
     p_read.add_argument("source", help="Source platform (e.g. arxiv, semantic)")
     p_read.add_argument("paper_id", help="Paper identifier")
-    p_read.add_argument("-o", "--save-path", default="./downloads", help="Save directory (default: ./downloads)")
+    p_read.add_argument("-o", "--save-path", default=DEFAULT_SAVE_PATH, help=f"Save directory (default: {DEFAULT_SAVE_PATH})")
 
     # sources
     sub.add_parser("sources", help="List available sources")
+
+    # parse
+    p_parse = sub.add_parser("parse", help="Parse a local PDF into cached Markdown/JSON/assets")
+    p_parse.add_argument("pdf_path", help="Path to a local PDF")
+    p_parse.add_argument("--paper-key", default="", help="Optional stable cache key")
+    p_parse.add_argument("--source", default="", help="Source platform for provenance")
+    p_parse.add_argument("--paper-id", default="", help="Source paper ID for provenance")
+    p_parse.add_argument("--doi", default="", help="DOI for cache key/provenance")
+    p_parse.add_argument("--title", default="", help="Paper title for cache key/provenance")
+    p_parse.add_argument("--mode", default="auto", choices=["auto", "extract", "local_api", "cloud_api", "cli", "pypdf"],
+                         help="Parser mode (default: auto)")
+    p_parse.add_argument("--backend", default="", help="MinerU backend, e.g. pipeline/vlm/hybrid")
+    p_parse.add_argument("--force", action="store_true", help="Re-parse even if cached")
+
+    # mineru-health
+    p_health = sub.add_parser("mineru-health", help="Check MinerU local API/CLI and pypdf fallback")
+    p_health.add_argument("--mode", default="auto", choices=["auto", "extract", "local_api", "cloud_api", "cli", "pypdf"])
+    p_health.add_argument("--backend", default="", help="MinerU backend, e.g. pipeline/vlm/hybrid")
+
+    # cache
+    p_cache = sub.add_parser("cache", help="Inspect parsed paper cache")
+    cache_sub = p_cache.add_subparsers(dest="cache_command", required=True)
+    cache_sub.add_parser("list", help="List cached parsed papers")
+
+    p_cache_get = cache_sub.add_parser("get", help="Read cached parsed paper data")
+    p_cache_get.add_argument("paper_key")
+    p_cache_get.add_argument("-f", "--format", default="markdown",
+                             choices=["markdown", "md", "json", "content_list", "manifest", "metadata", "paths"])
+
+    p_cache_assets = cache_sub.add_parser("assets", help="List cached extracted assets")
+    p_cache_assets.add_argument("paper_key")
+    p_cache_assets.add_argument("-t", "--asset-type", default="all")
+
+    p_cache_search = cache_sub.add_parser("search", help="Search cached parsed text")
+    p_cache_search.add_argument("paper_key")
+    p_cache_search.add_argument("query")
+    p_cache_search.add_argument("-n", "--max-results", type=int, default=20)
+
+    p_cache_paths = cache_sub.add_parser("paths", help="Show cache file paths")
+    p_cache_paths.add_argument("paper_key")
+
+    p_cache_delete = cache_sub.add_parser("delete", help="Delete one cached parsed paper")
+    p_cache_delete.add_argument("paper_key")
 
     return parser
 
@@ -268,6 +389,9 @@ def main() -> None:
         "download": cmd_download,
         "read": cmd_read,
         "sources": cmd_sources,
+        "parse": cmd_parse,
+        "mineru-health": cmd_mineru_health,
+        "cache": cmd_cache,
     }
 
     exit_code = asyncio.run(dispatch[args.command](args))
