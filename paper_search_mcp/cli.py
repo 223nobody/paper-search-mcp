@@ -33,12 +33,13 @@ from .academic_platforms.zenodo import ZenodoSearcher
 from .academic_platforms.hal import HALSearcher
 from .academic_platforms.ssrn import SSRNSearcher
 from .cache import (
+    cleanup_redundant_artifacts,
     delete_cache,
-    get_cached_paths,
     list_assets,
     list_parsed,
     read_parsed,
     record_download,
+    resolved_parsed_paths,
     search_parsed,
 )
 from .parsers.mineru import mineru_health_check, parse_pdf_with_mineru
@@ -288,13 +289,17 @@ async def cmd_cache(args: argparse.Namespace) -> int:
         print(json.dumps({"hits": result, "total": len(result)}, indent=2, ensure_ascii=False))
         return 0
     if action == "paths":
-        result = get_cached_paths(args.paper_key)
+        result = resolved_parsed_paths(args.paper_key)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     if action == "delete":
         deleted = delete_cache(args.paper_key)
         print(json.dumps({"paper_key": args.paper_key, "deleted": deleted}, indent=2, ensure_ascii=False))
         return 0 if deleted else 1
+    if action == "cleanup-redundant":
+        result = cleanup_redundant_artifacts(dry_run=not args.apply)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
     print(json.dumps({"error": f"Unknown cache command: {action}"}))
     return 1
 
@@ -348,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_parse.add_argument("--force", action="store_true", help="Re-parse even if cached")
 
     # mineru-health
-    p_health = sub.add_parser("mineru-health", help="Check MinerU local API/CLI and pypdf fallback")
+    p_health = sub.add_parser("mineru-health", help="Check MinerU API key setup and pypdf fallback")
     p_health.add_argument("--mode", default="auto", choices=["auto", "extract", "local_api", "cloud_api", "cli", "pypdf"])
     p_health.add_argument("--backend", default="", help="MinerU backend, e.g. pipeline/vlm/hybrid")
 
@@ -376,6 +381,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_cache_delete = cache_sub.add_parser("delete", help="Delete one cached parsed paper")
     p_cache_delete.add_argument("paper_key")
+
+    p_cache_cleanup = cache_sub.add_parser(
+        "cleanup-redundant",
+        help="Remove historical heavyweight cache duplicates; dry-run by default",
+    )
+    p_cache_cleanup.add_argument("--apply", action="store_true", help="Actually delete redundant files")
 
     return parser
 

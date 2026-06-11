@@ -84,3 +84,55 @@ def get_env(name: str, default: Optional[str] = "") -> str:
             return os.environ.get(key, "")
 
     return "" if default is None else str(default)
+
+
+def env_file_path() -> Path:
+    """Return the writable .env path used for persisted project settings."""
+    explicit_path = os.getenv(f"{ENV_PREFIX}ENV_FILE", "").strip()
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    return Path(__file__).resolve().parent.parent / ".env"
+
+
+def _quote_env_value(value: str) -> str:
+    if not value:
+        return ""
+    if any(char.isspace() for char in value) or any(char in value for char in "#'\"\\"):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
+
+
+def set_env_value(name: str, value: str, env_file: Optional[Path] = None) -> Path:
+    """Persist a prefixed PAPER_SEARCH_MCP_* value to .env and current process env."""
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("Environment variable name is required")
+    key = normalized if normalized.startswith(ENV_PREFIX) else f"{ENV_PREFIX}{normalized}"
+
+    target = env_file or env_file_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    if target.exists():
+        lines = target.read_text(encoding="utf-8").splitlines()
+
+    rendered = f"{key}={_quote_env_value(value.strip())}"
+    updated = False
+    next_lines: list[str] = []
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        candidate = stripped[7:].strip() if stripped.startswith("export ") else stripped
+        if candidate.startswith(f"{key}="):
+            if not updated:
+                next_lines.append(rendered)
+                updated = True
+            continue
+        next_lines.append(raw_line)
+
+    if not updated:
+        next_lines.append(rendered)
+
+    target.write_text("\n".join(next_lines).rstrip() + "\n", encoding="utf-8")
+    os.environ[key] = value.strip()
+    return target

@@ -44,7 +44,8 @@ uv run --directory <REPO_PATH> paper-search parse <pdf_path> --paper-key <key> -
 - `--mode extract`: force MinerU official extract API only
 - `--mode pypdf`: force lightweight PDF text extraction
 - `--force`: re-parse even if cached
-- The parse command also writes a same-name result zip beside the PDF, e.g. `paper.pdf` -> `paper.zip`
+- The parse command writes artifacts beside the PDF in `<pdf_stem>_mineru/` plus a same-name result zip, e.g. `paper.pdf` -> `paper_mineru/` and `paper.zip`
+- `.paper_search_cache` stores metadata/status/session indexes only; do not expect duplicate PDFs or duplicate parsed Markdown/assets there
 
 ### MCP Elicitation Selection
 
@@ -79,7 +80,7 @@ Useful MCP tools for this flow:
 - `get_search_session(selection_token)`
 - `delete_search_session(selection_token)`
 
-### Parsed Cache
+### Parsed Artifacts By Paper Key
 ```bash
 uv run --directory <REPO_PATH> paper-search cache list
 uv run --directory <REPO_PATH> paper-search cache get <paper_key> -f markdown
@@ -87,6 +88,7 @@ uv run --directory <REPO_PATH> paper-search cache search <paper_key> "<query>"
 uv run --directory <REPO_PATH> paper-search cache assets <paper_key>
 uv run --directory <REPO_PATH> paper-search cache paths <paper_key>
 ```
+These commands resolve from the lightweight cache index back to the PDF-side `<pdf_stem>_mineru/` artifacts when available.
 
 ### Parser Health
 ```bash

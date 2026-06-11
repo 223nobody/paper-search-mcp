@@ -107,14 +107,62 @@ def write_json(path: str | Path, payload: Any) -> None:
     target.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
+def visible_artifact_paths(pdf_path: str | Path) -> Dict[str, str]:
+    pdf = Path(pdf_path).expanduser().resolve()
+    export_dir = (pdf.parent / f"{pdf.stem}_mineru").resolve()
+    return {
+        "export_dir": str(export_dir),
+        "full_md": str(export_dir / "full.md"),
+        "content_list": str(export_dir / "content_list.json"),
+        "manifest": str(export_dir / "manifest.json"),
+        "metadata": str(export_dir / "metadata.json"),
+        "status": str(export_dir / "status.json"),
+        "assets_dir": str(export_dir / "assets"),
+        "result_zip": str(pdf.with_suffix(".zip").resolve()),
+    }
+
+
+def _visible_paths_from_metadata(metadata: Dict[str, Any]) -> Dict[str, str]:
+    pdf_path = str(metadata.get("pdf_path") or "").strip()
+    if not pdf_path:
+        return {}
+    return visible_artifact_paths(pdf_path)
+
+
+def resolved_parsed_paths(key: str, cache_dir: Optional[str] = None) -> Dict[str, str]:
+    paths = get_cached_paths(key, cache_dir)
+    metadata = read_json(paths["metadata"], {}) or {}
+    visible_paths = _visible_paths_from_metadata(metadata) if isinstance(metadata, dict) else {}
+    if not visible_paths:
+        return paths
+
+    resolved = dict(paths)
+    pdf_path = str(metadata.get("pdf_path") or "").strip()
+    if pdf_path:
+        resolved["pdf_path"] = str(Path(pdf_path).expanduser().resolve())
+    for name in ("full_md", "content_list", "manifest", "assets_dir"):
+        visible = visible_paths.get(name)
+        if visible and Path(visible).exists():
+            resolved[name] = visible
+    for name in ("export_dir", "status", "metadata", "result_zip"):
+        visible = visible_paths.get(name)
+        if visible:
+            resolved[f"visible_{name}"] = visible
+    return resolved
+
+
 def copy_pdf_to_cache(pdf_path: str | Path, key: str, cache_dir: Optional[str] = None) -> Path:
+    """Compatibility wrapper: validate and return the source PDF path.
+
+    Older versions copied PDFs into ``.paper_search_cache`` as ``source.pdf``.
+    The cache now stores metadata and indexes only; user-visible artifacts live
+    beside the PDF.
+    """
     source = Path(pdf_path).expanduser().resolve()
     if not source.exists():
         raise FileNotFoundError(f"PDF not found: {source}")
-    destination = paper_dir(key, cache_dir) / "source.pdf"
-    if source != destination:
-        shutil.copy2(source, destination)
-    return destination
+    paper_dir(key, cache_dir)
+    return source
 
 
 def record_download(
@@ -172,8 +220,10 @@ def list_parsed(cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
         metadata = read_json(directory / "metadata.json", {}) or {}
         manifest = read_json(directory / "mineru" / "manifest.json", {}) or {}
         status = read_json(directory / "status.json", {}) or {}
-        full_md = directory / "mineru" / "full.md"
-        content_list = directory / "mineru" / "content_list.json"
+        paths = resolved_parsed_paths(directory.name, cache_dir)
+        full_md = Path(paths["full_md"])
+        content_list = Path(paths["content_list"])
+        visible_dir = paths.get("visible_export_dir", "")
         entries.append(
             {
                 "paper_key": directory.name,
@@ -187,6 +237,7 @@ def list_parsed(cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
                 "status": status.get("status", ""),
                 "updated_at": manifest.get("created_at") or metadata.get("recorded_at", ""),
                 "path": str(directory),
+                "visible_path": visible_dir,
             }
         )
     return entries
@@ -209,7 +260,7 @@ def get_cached_paths(key: str, cache_dir: Optional[str] = None) -> Dict[str, str
 
 
 def read_parsed(key: str, output_format: str = "markdown", cache_dir: Optional[str] = None) -> Any:
-    paths = get_cached_paths(key, cache_dir)
+    paths = resolved_parsed_paths(key, cache_dir)
     fmt = output_format.strip().lower()
     if fmt in {"markdown", "md"}:
         path = Path(paths["full_md"])
@@ -226,7 +277,7 @@ def read_parsed(key: str, output_format: str = "markdown", cache_dir: Optional[s
 
 
 def list_assets(key: str, asset_type: str = "all", cache_dir: Optional[str] = None) -> List[Dict[str, str]]:
-    paths = get_cached_paths(key, cache_dir)
+    paths = resolved_parsed_paths(key, cache_dir)
     assets_dir = Path(paths["assets_dir"])
     if not assets_dir.exists():
         return []
@@ -310,6 +361,159 @@ def delete_cache(key: str, cache_dir: Optional[str] = None) -> bool:
         return False
     shutil.rmtree(directory)
     return True
+
+
+def _path_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    if path.is_dir():
+        total = 0
+        for item in path.rglob("*"):
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except OSError:
+                    continue
+        return total
+    return 0
+
+
+def _same_existing_file(left: Path, right: Path) -> bool:
+    if not left.exists() or not right.exists() or not left.is_file() or not right.is_file():
+        return False
+    try:
+        if left.resolve() == right.resolve():
+            return False
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        return sha256_file(left) == sha256_file(right)
+    except OSError:
+        return False
+
+
+def _cleanup_candidate(path: Path, *, reason: str, dry_run: bool) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    size = _path_size(path)
+    entry = {
+        "path": str(path),
+        "kind": "directory" if path.is_dir() else "file",
+        "bytes": size,
+        "reason": reason,
+        "deleted": False,
+    }
+    if not dry_run:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        entry["deleted"] = True
+    return entry
+
+
+def cleanup_redundant_artifacts(cache_dir: Optional[str] = None, *, dry_run: bool = True) -> Dict[str, Any]:
+    """Remove historical heavyweight cache duplicates while preserving indexes.
+
+    The current parser writes normalized outputs beside the source PDF and keeps
+    only metadata/status/manifest indexes in the cache. This cleaner targets
+    old cache layouts that stored PDFs, parsed Markdown/JSON/assets, or raw
+    MinerU intermediates under ``.paper_search_cache``.
+    """
+    root = papers_root(cache_dir)
+    removed: List[Dict[str, Any]] = []
+    preserved: List[Dict[str, Any]] = []
+
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+
+        key = directory.name
+        paths = get_cached_paths(key, cache_dir)
+        metadata = read_json(paths["metadata"], {}) or {}
+        visible_paths = _visible_paths_from_metadata(metadata) if isinstance(metadata, dict) else {}
+
+        for raw_name in ("raw", "raw_cli"):
+            candidate = Path(paths["mineru_dir"]) / raw_name
+            entry = _cleanup_candidate(
+                candidate,
+                reason=f"legacy MinerU {raw_name} intermediate output",
+                dry_run=dry_run,
+            )
+            if entry:
+                entry["paper_key"] = key
+                removed.append(entry)
+
+        paired_files = (
+            ("full_md", "legacy parsed Markdown duplicate"),
+            ("content_list", "legacy parsed content_list duplicate"),
+            ("manifest", "legacy parsed manifest duplicate"),
+        )
+        for name, reason in paired_files:
+            cached_path = Path(paths[name])
+            visible_value = visible_paths.get(name)
+            if not visible_value:
+                continue
+            visible_path = Path(visible_value)
+            if visible_path.exists() and cached_path.exists() and cached_path.resolve() != visible_path.resolve():
+                entry = _cleanup_candidate(cached_path, reason=reason, dry_run=dry_run)
+                if entry:
+                    entry["paper_key"] = key
+                    removed.append(entry)
+
+        cached_assets = Path(paths["assets_dir"])
+        visible_assets_value = visible_paths.get("assets_dir")
+        visible_assets = Path(visible_assets_value) if visible_assets_value else None
+        if (
+            visible_assets is not None
+            and visible_assets.exists()
+            and cached_assets.exists()
+            and cached_assets.is_dir()
+            and cached_assets.resolve() != visible_assets.resolve()
+        ):
+            entry = _cleanup_candidate(
+                cached_assets,
+                reason="legacy parsed assets duplicate",
+                dry_run=dry_run,
+            )
+            if entry:
+                entry["paper_key"] = key
+                removed.append(entry)
+
+        source_pdf = Path(paths["source_pdf"])
+        metadata_pdf = Path(str(metadata.get("pdf_path") or "")).expanduser() if isinstance(metadata, dict) else Path("")
+        if source_pdf.exists():
+            if _same_existing_file(source_pdf, metadata_pdf):
+                entry = _cleanup_candidate(
+                    source_pdf,
+                    reason="legacy cached source.pdf duplicate of recorded PDF",
+                    dry_run=dry_run,
+                )
+                if entry:
+                    entry["paper_key"] = key
+                    removed.append(entry)
+            else:
+                preserved.append(
+                    {
+                        "paper_key": key,
+                        "path": str(source_pdf),
+                        "kind": "file",
+                        "bytes": _path_size(source_pdf),
+                        "reason": "source.pdf was not removed because no distinct matching recorded PDF was found",
+                    }
+                )
+
+    return {
+        "status": "dry_run" if dry_run else "ok",
+        "cache_root": str(cache_root(cache_dir)),
+        "dry_run": dry_run,
+        "removed": removed,
+        "preserved": preserved,
+        "removed_total": len(removed),
+        "preserved_total": len(preserved),
+        "bytes_reclaimable": sum(int(item.get("bytes", 0)) for item in removed),
+        "bytes_deleted": 0 if dry_run else sum(int(item.get("bytes", 0)) for item in removed),
+    }
 
 
 def _session_path(selection_token: str, cache_dir: Optional[str] = None) -> Path:

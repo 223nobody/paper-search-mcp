@@ -1,11 +1,13 @@
 # tests/test_server.py
-import unittest
 import asyncio
 import os
 import tempfile
+import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
 from pypdf import PdfWriter
-from unittest.mock import patch
+
 from paper_search_mcp import server
 
 class TestPaperSearchServer(unittest.TestCase):
@@ -23,6 +25,35 @@ class TestPaperSearchServer(unittest.TestCase):
     def test_parse_sources_with_new_platforms(self):
         parsed = server._parse_sources("dblp,doaj,base,zenodo,hal,ssrn,unpaywall,invalid")
         self.assertEqual(parsed, ["dblp", "doaj", "base", "zenodo", "hal", "ssrn", "unpaywall"])
+
+    def test_parse_sources_defaults_to_fast_profile(self):
+        with patch.dict(os.environ, {"PAPER_SEARCH_MCP_SEARCH_PROFILE": "fast"}):
+            parsed = server._parse_sources("")
+
+        self.assertEqual(parsed, server.FAST_SOURCES)
+
+    def test_search_papers_uses_cache_for_repeated_query(self):
+        async def fake_search_arxiv(query, max_results):
+            return [{"title": "Cached Paper", "paper_id": "1", "source": "arxiv"}]
+
+        with patch.dict(
+            os.environ,
+            {
+                "PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS": "300",
+                "PAPER_SEARCH_MCP_SEARCH_TIMEOUT_SECONDS": "5",
+            },
+        ), patch(
+            "paper_search_mcp.server.search_arxiv",
+            new=AsyncMock(side_effect=fake_search_arxiv),
+        ) as search_mock:
+            server._SEARCH_RESULT_CACHE.clear()
+            first = asyncio.run(server.search_papers("cached query", sources="arxiv", max_results_per_source=1))
+            second = asyncio.run(server.search_papers("cached query", sources="arxiv", max_results_per_source=1))
+
+        self.assertFalse(first["cache"]["hit"])
+        self.assertTrue(second["cache"]["hit"])
+        self.assertEqual(second["total"], 1)
+        search_mock.assert_awaited_once()
 
     def test_list_sources_exposes_capabilities(self):
         result = asyncio.run(server.list_sources())
@@ -71,7 +102,18 @@ class TestPaperSearchServer(unittest.TestCase):
         os.makedirs(save_path, exist_ok=True)  # 确保目录存在
 
         # 下载每个搜索结果的 PDF
-        with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true"}):
+        parse_payload = {
+            "status": "ok",
+            "results": [{"status": "ok"}],
+            "total": 1,
+            "parsed": 1,
+            "failed": 0,
+            "skipped": 0,
+        }
+        with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true"}), patch(
+            "paper_search_mcp.server.parse_selected_papers",
+            new=AsyncMock(return_value=parse_payload),
+        ):
             for paper in search_results:
                 paper_id = paper['paper_id']
                 result = asyncio.run(server.download_arxiv(paper_id, save_path))
@@ -79,9 +121,45 @@ class TestPaperSearchServer(unittest.TestCase):
                 self.assertEqual(result["status"], "downloaded")
                 self.assertTrue(result["pdf_path"].endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
                 self.assertTrue(os.path.exists(result["pdf_path"]), f"PDF file for {paper_id} should exist on disk")
-                self.assertEqual(result["parse_prompt"]["interaction"], "backend_session_numbered_selection")
+                self.assertEqual(result["parse_prompt"]["interaction"], "auto_parse_saved_pdfs")
+                self.assertEqual(result["parse_prompt"]["selected_indices"], [1])
 
-    def test_download_arxiv_rejects_custom_save_path_by_default(self):
+    def test_download_arxiv_allows_custom_save_path_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def fake_download(paper_id, save_path):
+                target = Path(save_path) / f"{paper_id}.pdf"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"%PDF-1.4\n%%EOF")
+                return str(target)
+
+            parse_payload = {
+                "status": "ok",
+                "results": [{"status": "ok"}],
+                "total": 1,
+                "parsed": 1,
+                "failed": 0,
+                "skipped": 0,
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ENV_FILE": str(Path(tmp) / "missing.env"),
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "USERPROFILE": tmp,
+                },
+                clear=True,
+            ), patch.object(server.arxiv_searcher, "download_pdf", side_effect=fake_download), patch(
+                "paper_search_mcp.server.parse_selected_papers",
+                new=AsyncMock(return_value=parse_payload),
+            ):
+                result = asyncio.run(server.download_arxiv("2601.00001", tmp))
+
+        self.assertEqual(result["status"], "downloaded")
+        self.assertEqual(Path(result["pdf_path"]).parent, Path(tmp).resolve())
+        self.assertEqual(result["parse_prompt"]["interaction"], "auto_parse_saved_pdfs")
+        self.assertNotIn("app", result)
+
+    def test_download_arxiv_rejects_custom_save_path_when_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "false"}), patch.object(
                 server.arxiv_searcher,
@@ -92,6 +170,106 @@ class TestPaperSearchServer(unittest.TestCase):
 
         self.assertEqual(result["status"], "invalid_save_path")
         self.assertEqual(result["allow_env"], "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH")
+
+    def test_configure_mineru_api_key_writes_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = str(Path(tmp) / ".env")
+            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ENV_FILE": env_path}, clear=True):
+                result = asyncio.run(server.configure_mineru_api_key("test-mineru-key"))
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["env_file_path"], env_path)
+            self.assertIn("PAPER_SEARCH_MCP_MINERU_API_KEY=test-mineru-key", Path(env_path).read_text())
+
+    def test_mineru_setup_status_returns_app_prompt_when_key_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = str(Path(tmp) / ".env")
+            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ENV_FILE": env_path}, clear=True):
+                result = asyncio.run(server.mineru_setup_status())
+
+            self.assertEqual(result["status"], "mineru_api_key_required")
+            self.assertFalse(result["configured"])
+            self.assertEqual(result["render_tool"], server.MINERU_KEY_WIDGET_TOOL)
+            self.assertEqual(result["resource_uri"], server.MINERU_KEY_WIDGET_URI)
+
+    def test_mineru_health_check_returns_key_prompt_when_extract_key_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = str(Path(tmp) / ".env")
+            health = {
+                "mode": "auto",
+                "extract_api": {"ok": False, "message": "PAPER_SEARCH_MCP_MINERU_API_KEY is not set"},
+            }
+            with patch.dict(os.environ, {"PAPER_SEARCH_MCP_ENV_FILE": env_path}, clear=True), patch(
+                "paper_search_mcp.server.run_mineru_health_check",
+                return_value=health,
+            ):
+                result = asyncio.run(server.mineru_health_check())
+
+            self.assertIn("mineru_api_key_prompt", result)
+            self.assertEqual(result["mineru_api_key_prompt"]["render_tool"], server.MINERU_KEY_WIDGET_TOOL)
+
+    def test_http_transport_env_configuration(self):
+        original = {
+            "host": server.mcp.settings.host,
+            "port": server.mcp.settings.port,
+            "path": server.mcp.settings.streamable_http_path,
+            "security": server.mcp.settings.transport_security,
+        }
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_HOST": "0.0.0.0",
+                    "PAPER_SEARCH_MCP_PORT": "8765",
+                    "PAPER_SEARCH_MCP_MCP_PATH": "/mcp",
+                    "PAPER_SEARCH_MCP_ALLOWED_HOSTS": "example.ngrok-free.app,example.com",
+                    "PAPER_SEARCH_MCP_ALLOWED_ORIGINS": "https://chatgpt.com,https://example.com",
+                },
+                clear=False,
+            ):
+                server._configure_http_transport_from_env()
+
+            self.assertEqual(server.mcp.settings.host, "0.0.0.0")
+            self.assertEqual(server.mcp.settings.port, 8765)
+            self.assertEqual(server.mcp.settings.streamable_http_path, "/mcp")
+            security = server.mcp.settings.transport_security
+            self.assertTrue(security.enable_dns_rebinding_protection)
+            self.assertIn("example.ngrok-free.app", security.allowed_hosts)
+            self.assertIn("https://chatgpt.com", security.allowed_origins)
+        finally:
+            server.mcp.settings.host = original["host"]
+            server.mcp.settings.port = original["port"]
+            server.mcp.settings.streamable_http_path = original["path"]
+            server.mcp.settings.transport_security = original["security"]
+
+    def test_parse_pdf_with_mineru_attaches_key_prompt_on_auth_failure(self):
+        parse_error = {
+            "status": "error",
+            "message": "extract: 401 Unauthorized; token expired",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ENV_FILE": str(Path(tmp) / ".env"),
+                    "PAPER_SEARCH_MCP_MINERU_API_KEY": "expired-key",
+                },
+                clear=True,
+            ), patch(
+                "paper_search_mcp.server.run_parse_pdf_with_mineru",
+                return_value=parse_error,
+            ):
+                result = asyncio.run(server.parse_pdf_with_mineru(str(pdf), mode="extract"))
+
+            self.assertIn("mineru_api_key_prompt", result)
+            self.assertEqual(result["mineru_api_key_prompt"]["reason"], "expired_or_invalid")
+
+    def test_mineru_api_key_widget_contains_input_and_config_tool_call(self):
+        html = asyncio.run(server.mineru_api_key_setup_widget())
+        self.assertIn('id="api-key"', html)
+        self.assertIn("configure_mineru_api_key", html)
 
 if __name__ == "__main__":
     unittest.main()

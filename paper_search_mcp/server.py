@@ -1,14 +1,23 @@
 # paper_search_mcp/server.py
 from typing import List, Dict, Optional, Any
 import asyncio
+import copy
+import json
 import os
 import logging
 import re
+import secrets
+import threading
+import time
+import webbrowser
+from html import escape as html_escape
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 from pathlib import Path
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field, create_model
-from .config import get_env
+from .config import env_file_path, get_env, set_env_value
 from .academic_platforms.arxiv import ArxivSearcher
 from .academic_platforms.pubmed import PubMedSearcher
 from .academic_platforms.biorxiv import BioRxivSearcher
@@ -33,16 +42,17 @@ from .academic_platforms.hal import HALSearcher
 from .academic_platforms.ssrn import SSRNSearcher
 from .utils import DEFAULT_SAVE_PATH, extract_doi, resolve_save_path
 from .cache import (
+    cleanup_redundant_artifacts,
     create_search_session as cache_create_search_session,
     delete_cache,
     delete_search_session as cache_delete_search_session,
-    get_cached_paths,
     get_search_session as cache_get_search_session,
     list_assets,
     list_parsed,
     list_search_sessions as cache_list_search_sessions,
     read_parsed,
     record_download,
+    resolved_parsed_paths,
     search_parsed,
 )
 from .parsers.mineru import (
@@ -57,6 +67,1029 @@ from .paper import Paper
 mcp = FastMCP("paper_search_server")
 logger = logging.getLogger(__name__)
 ALLOW_CUSTOM_SAVE_PATH_ENV = "ALLOW_CUSTOM_SAVE_PATH"
+SEARCH_PROFILE_ENV = "SEARCH_PROFILE"
+SEARCH_TIMEOUT_ENV = "SEARCH_TIMEOUT_SECONDS"
+SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
+SEARCH_CACHE_TTL_ENV = "SEARCH_CACHE_TTL_SECONDS"
+PARSE_CONCURRENCY_ENV = "PARSE_CONCURRENCY"
+PAPER_SELECTION_WIDGET_URI = "ui://paper-search/paper-selection.html"
+PAPER_SELECTION_WIDGET_TOOL = "render_paper_selection_app"
+MINERU_KEY_WIDGET_URI = "ui://paper-search/mineru-api-key.html"
+MINERU_KEY_WIDGET_TOOL = "render_mineru_api_key_setup_app"
+MINERU_KEY_CONFIG_TOOL = "configure_mineru_api_key"
+LOCAL_PAPER_SELECTION_TOOL = "open_paper_selection_page"
+LOCAL_PAPER_SELECTION_PATH = "/paper-selection"
+AUTO_PARSE_SAVED_PDF_LIMIT = 10
+_LOCAL_SELECTION_LOCK = threading.Lock()
+_LOCAL_SELECTION_SERVER: Optional[ThreadingHTTPServer] = None
+_LOCAL_SELECTION_THREAD: Optional[threading.Thread] = None
+_LOCAL_SELECTION_BASE_URL = ""
+_LOCAL_SELECTION_PAGES: Dict[str, Dict[str, Any]] = {}
+_SEARCH_RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _split_env_csv(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = get_env(name, "true" if default else "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _configure_http_transport_from_env() -> None:
+    host = get_env("HOST", mcp.settings.host).strip() or mcp.settings.host
+    port_raw = get_env("PORT", str(mcp.settings.port)).strip()
+    try:
+        port = int(port_raw)
+    except ValueError:
+        logger.warning("Invalid PAPER_SEARCH_MCP_PORT=%r; using %s", port_raw, mcp.settings.port)
+        port = mcp.settings.port
+
+    path = get_env("MCP_PATH", mcp.settings.streamable_http_path).strip() or mcp.settings.streamable_http_path
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.streamable_http_path = path
+
+    disable_security = _env_bool("DISABLE_DNS_REBINDING_PROTECTION", False)
+    allowed_hosts = _split_env_csv(get_env("ALLOWED_HOSTS", ""))
+    allowed_origins = _split_env_csv(get_env("ALLOWED_ORIGINS", ""))
+    if disable_security:
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+            allowed_hosts=[],
+            allowed_origins=[],
+        )
+        return
+
+    if allowed_hosts or allowed_origins:
+        existing = mcp.settings.transport_security or TransportSecuritySettings()
+        mcp.settings.transport_security = existing.model_copy(
+            update={
+                "allowed_hosts": allowed_hosts or existing.allowed_hosts,
+                "allowed_origins": allowed_origins or existing.allowed_origins,
+            }
+        )
+
+
+def _local_selection_page_url(page_id: str) -> str:
+    _ensure_local_selection_server()
+    return f"{_LOCAL_SELECTION_BASE_URL}{LOCAL_PAPER_SELECTION_PATH}/{page_id}"
+
+
+def _ensure_local_selection_server() -> None:
+    global _LOCAL_SELECTION_BASE_URL, _LOCAL_SELECTION_SERVER, _LOCAL_SELECTION_THREAD
+    with _LOCAL_SELECTION_LOCK:
+        if _LOCAL_SELECTION_SERVER is not None:
+            return
+
+        host = get_env("LOCAL_UI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        port_raw = get_env("LOCAL_UI_PORT", "0").strip() or "0"
+        try:
+            port = int(port_raw)
+        except ValueError:
+            logger.warning("Invalid PAPER_SEARCH_MCP_LOCAL_UI_PORT=%r; using a random free port", port_raw)
+            port = 0
+
+        _LOCAL_SELECTION_SERVER = ThreadingHTTPServer((host, port), _LocalSelectionHandler)
+        selected_host, selected_port = _LOCAL_SELECTION_SERVER.server_address[:2]
+        if selected_host in {"0.0.0.0", ""}:
+            selected_host = "127.0.0.1"
+        _LOCAL_SELECTION_BASE_URL = f"http://{selected_host}:{selected_port}"
+        _LOCAL_SELECTION_THREAD = threading.Thread(
+            target=_LOCAL_SELECTION_SERVER.serve_forever,
+            name="paper-search-local-selection-ui",
+            daemon=True,
+        )
+        _LOCAL_SELECTION_THREAD.start()
+
+
+def _create_local_selection_page(
+    *,
+    selection_token: str,
+    papers: List[Dict[str, Any]],
+    save_path: str,
+    use_scihub: bool,
+    mode: str,
+    backend: str,
+    force: bool,
+) -> Dict[str, Any]:
+    page_id = secrets.token_urlsafe(16)
+    _LOCAL_SELECTION_PAGES[page_id] = {
+        "selection_token": selection_token,
+        "papers": papers,
+        "save_path": save_path or DEFAULT_SAVE_PATH,
+        "use_scihub": use_scihub,
+        "mode": mode or "auto",
+        "backend": backend or "",
+        "force": force,
+    }
+    return {
+        "page_id": page_id,
+        "url": _local_selection_page_url(page_id),
+    }
+
+
+def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
+    papers = page.get("papers", [])
+    rows = []
+    for paper in papers if isinstance(papers, list) else []:
+        index = paper.get("index")
+        disabled = paper.get("parse_ready") is False or not isinstance(index, int)
+        meta_bits = [
+            str(paper.get("source") or ""),
+            str(paper.get("year") or ""),
+            str(paper.get("paper_id") or ""),
+            str(paper.get("doi") or ""),
+            str(paper.get("reason") or ""),
+        ]
+        meta = " | ".join(bit for bit in meta_bits if bit)
+        rows.append(
+            """
+            <label class="paper{disabled_class}">
+              <input type="checkbox" name="paper" value="{index}" {disabled}>
+              <span>
+                <span class="title">{index}. {title}</span>
+                <span class="meta">{meta}</span>
+              </span>
+            </label>
+            """.format(
+                disabled_class=" disabled" if disabled else "",
+                index=html_escape(str(index or "")),
+                disabled="disabled" if disabled else "",
+                title=html_escape(str(paper.get("title") or "Untitled")),
+                meta=html_escape(meta),
+            )
+        )
+
+    body = "\n".join(rows) if rows else '<div class="empty">No papers available.</div>'
+    data_json = html_escape(
+        json.dumps(
+            {
+                "page_id": page_id,
+                "selection_token": page.get("selection_token", ""),
+                "save_path": page.get("save_path", DEFAULT_SAVE_PATH),
+                "use_scihub": bool(page.get("use_scihub")),
+                "mode": page.get("mode", "auto"),
+                "backend": page.get("backend", ""),
+                "force": bool(page.get("force")),
+            }
+        ),
+        quote=True,
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper selector</title>
+  <style>
+    :root {{ color-scheme: light dark; --bg: #eef3f7; --glass: rgba(255, 255, 255, .68); --glass-strong: rgba(255, 255, 255, .84); --text: #111827; --muted: #667085; --line: rgba(15, 23, 42, .13); --accent: #0f766e; --accent-strong: #0b5f59; --danger: #b42318; --disabled: rgba(148, 163, 184, .18); --shadow: 0 24px 70px rgba(15, 23, 42, .18); }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0d1117; --glass: rgba(22, 27, 34, .70); --glass-strong: rgba(31, 37, 46, .84); --text: #f8fafc; --muted: #aeb7c5; --line: rgba(226, 232, 240, .14); --accent: #2dd4bf; --accent-strong: #5eead4; --danger: #f97066; --disabled: rgba(71, 85, 105, .28); --shadow: 0 28px 80px rgba(0, 0, 0, .38); }} }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #dbeafe 28%)); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; line-height: 1.45; }}
+    main {{ min-height: 100vh; padding: 18px; display: grid; place-items: start center; }}
+    .shell {{ width: min(100%, 860px); margin: 0 auto; background: linear-gradient(180deg, var(--glass-strong), var(--glass)); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); backdrop-filter: blur(22px) saturate(150%); -webkit-backdrop-filter: blur(22px) saturate(150%); }}
+    header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 15px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, rgba(255, 255, 255, .18), transparent); }}
+    h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
+    .token {{ max-width: 46%; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; text-align: right; }}
+    .list {{ display: grid; max-height: 58vh; overflow: auto; padding: 6px 0; scrollbar-width: thin; }}
+    .paper {{ display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--line); transition: background .16s ease, border-color .16s ease; }}
+    .paper:hover {{ background: rgba(255, 255, 255, .22); }}
+    .paper.disabled {{ background: var(--disabled); color: var(--muted); }}
+    input[type="checkbox"] {{ width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); }}
+    .title {{ display: block; font-weight: 650; overflow-wrap: anywhere; }}
+    .meta {{ display: block; color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }}
+    .toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 14px 20px 16px; border-top: 1px solid var(--line); background: rgba(255, 255, 255, .12); }}
+    button {{ min-height: 36px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255, 255, 255, .30); color: var(--text); padding: 8px 13px; font: inherit; font-weight: 600; cursor: pointer; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .35); transition: transform .14s ease, border-color .14s ease, background .14s ease; }}
+    button:hover:not(:disabled) {{ transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent), var(--line)); background: rgba(255, 255, 255, .44); }}
+    button.primary {{ background: linear-gradient(180deg, var(--accent-strong), var(--accent)); border-color: transparent; color: #fff; box-shadow: 0 10px 24px rgba(15, 118, 110, .25); }}
+    button:disabled {{ opacity: .58; cursor: not-allowed; }}
+    .status {{ margin-left: auto; min-height: 20px; color: var(--muted); font-size: 12px; white-space: pre-wrap; }}
+    .status.error {{ color: var(--danger); }}
+    pre {{ margin: 0; padding: 14px 20px; border-top: 1px solid var(--line); overflow: auto; max-height: 280px; background: rgba(15, 23, 42, .06); color: var(--text); }}
+    .empty {{ padding: 34px 20px; color: var(--muted); text-align: center; }}
+    @media (max-width: 640px) {{ main {{ padding: 10px; }} header {{ display: grid; }} .token {{ max-width: none; text-align: left; }} .toolbar {{ align-items: stretch; }} .status {{ width: 100%; margin-left: 0; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="shell">
+      <header>
+        <h1>Paper selector</h1>
+        <div class="token">{html_escape(str(page.get("selection_token", "")))}</div>
+      </header>
+      <form id="form" data-page="{data_json}">
+        <div class="list">{body}</div>
+        <div class="toolbar">
+          <button class="primary" id="parse" type="submit">Parse selected</button>
+          <button id="select-all" type="button">All</button>
+          <button id="clear" type="button">Clear</button>
+          <span class="status" id="status"></span>
+        </div>
+      </form>
+      <pre id="result" hidden></pre>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById("form");
+    const parseButton = document.getElementById("parse");
+    const statusNode = document.getElementById("status");
+    const resultNode = document.getElementById("result");
+    const data = JSON.parse(form.dataset.page);
+
+    function selectedIndices() {{
+      return Array.from(document.querySelectorAll('input[name="paper"]:checked')).map((item) => item.value);
+    }}
+
+    function setStatus(message, kind = "") {{
+      statusNode.textContent = message || "";
+      statusNode.className = kind ? `status ${{kind}}` : "status";
+    }}
+
+    document.getElementById("select-all").addEventListener("click", () => {{
+      document.querySelectorAll('input[name="paper"]:not(:disabled)').forEach((item) => item.checked = true);
+    }});
+
+    document.getElementById("clear").addEventListener("click", () => {{
+      document.querySelectorAll('input[name="paper"]').forEach((item) => item.checked = false);
+    }});
+
+    form.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      const selected = selectedIndices();
+      if (!selected.length) {{
+        setStatus("Select at least one paper.", "error");
+        return;
+      }}
+      parseButton.disabled = true;
+      setStatus("Parsing...");
+      resultNode.hidden = true;
+      try {{
+        const response = await fetch(`/api/parse-selection/${{encodeURIComponent(data.page_id)}}`, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ selected_indices: selected.join(",") }}),
+        }});
+        const body = await response.json();
+        resultNode.textContent = JSON.stringify(body, null, 2);
+        resultNode.hidden = false;
+        setStatus(body.status ? `Done: ${{body.status}}` : "Done.");
+      }} catch (error) {{
+        setStatus(error?.message || String(error), "error");
+      }} finally {{
+        parseButton.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+
+
+class _LocalSelectionHandler(BaseHTTPRequestHandler):
+    server_version = "PaperSearchLocalSelection/1.0"
+
+    def do_GET(self) -> None:
+        page_id = self._page_id_from_path(LOCAL_PAPER_SELECTION_PATH)
+        if not page_id:
+            self._send_json({"status": "not_found"}, status=404)
+            return
+        page = _LOCAL_SELECTION_PAGES.get(page_id)
+        if not page:
+            self._send_json({"status": "not_found", "page_id": page_id}, status=404)
+            return
+        self._send_html(_render_local_selection_html(page_id, page))
+
+    def do_POST(self) -> None:
+        page_id = self._page_id_from_path("/api/parse-selection")
+        if not page_id:
+            self._send_json({"status": "not_found"}, status=404)
+            return
+        page = _LOCAL_SELECTION_PAGES.get(page_id)
+        if not page:
+            self._send_json({"status": "not_found", "page_id": page_id}, status=404)
+            return
+        try:
+            payload = self._read_json()
+            selected_indices = str(payload.get("selected_indices") or "")
+            result = asyncio.run(
+                parse_selected_papers(
+                    selection_token=page["selection_token"],
+                    selected_indices=selected_indices,
+                    save_path=page.get("save_path", DEFAULT_SAVE_PATH),
+                    use_scihub=bool(page.get("use_scihub")),
+                    mode=page.get("mode", "auto"),
+                    backend=page.get("backend", ""),
+                    force=bool(page.get("force")),
+                )
+            )
+            self._send_json(result)
+        except Exception as exc:
+            logger.exception("Local paper selection parse request failed")
+            self._send_json({"status": "error", "message": str(exc)}, status=500)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        logger.debug("local selection ui: " + format, *args)
+
+    def _page_id_from_path(self, prefix: str) -> str:
+        path = self.path.split("?", 1)[0].rstrip("/")
+        expected = prefix.rstrip("/") + "/"
+        if not path.startswith(expected):
+            return ""
+        return path[len(expected) :]
+
+    def _read_json(self) -> Dict[str, Any]:
+        length = int(self.headers.get("content-length") or "0")
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _send_html(self, html: str, status: int = 200) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #eef3f7;
+      --glass: rgba(255, 255, 255, .68);
+      --glass-strong: rgba(255, 255, 255, .84);
+      --text: #111827;
+      --muted: #667085;
+      --line: rgba(15, 23, 42, .13);
+      --accent: #0f766e;
+      --accent-strong: #0b5f59;
+      --danger: #b42318;
+      --disabled: rgba(148, 163, 184, .18);
+      --shadow: 0 24px 70px rgba(15, 23, 42, .18);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --glass: rgba(22, 27, 34, .70);
+        --glass-strong: rgba(31, 37, 46, .84);
+        --text: #f8fafc;
+        --muted: #aeb7c5;
+        --line: rgba(226, 232, 240, .14);
+        --accent: #2dd4bf;
+        --accent-strong: #5eead4;
+        --danger: #f97066;
+        --disabled: rgba(71, 85, 105, .28);
+        --shadow: 0 28px 80px rgba(0, 0, 0, .38);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #dbeafe 28%));
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    main {
+      min-height: 100vh;
+      padding: 18px;
+    }
+
+    .shell {
+      max-width: 820px;
+      margin: 0 auto;
+      background: linear-gradient(180deg, var(--glass-strong), var(--glass));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+    }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px 15px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(255, 255, 255, .18), transparent);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .count {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .list {
+      display: grid;
+      max-height: 460px;
+      overflow: auto;
+      padding: 6px 0;
+      scrollbar-width: thin;
+    }
+
+    .paper {
+      display: grid;
+      grid-template-columns: 26px minmax(0, 1fr);
+      gap: 10px;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--line);
+      transition: background .16s ease, border-color .16s ease;
+    }
+
+    .paper:last-child { border-bottom: 0; }
+    .paper:hover { background: rgba(255, 255, 255, .22); }
+    .paper.disabled { background: var(--disabled); color: var(--muted); }
+
+    input[type="checkbox"] {
+      width: 17px;
+      height: 17px;
+      margin: 2px 0 0;
+      accent-color: var(--accent);
+    }
+
+    .title {
+      overflow-wrap: anywhere;
+      font-weight: 600;
+    }
+
+    .meta {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 9px;
+      padding: 14px 20px 16px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, .12);
+    }
+
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .30);
+      color: var(--text);
+      padding: 8px 13px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .35);
+      transition: transform .14s ease, border-color .14s ease, background .14s ease;
+    }
+
+    button.primary {
+      border-color: transparent;
+      background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+      color: #ffffff;
+      font-weight: 650;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, .25);
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent), var(--line));
+      background: rgba(255, 255, 255, .44);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.58;
+    }
+
+    .status {
+      min-height: 20px;
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    .status.error { color: var(--danger); }
+
+    .empty {
+      padding: 34px 20px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 640px) {
+      main { padding: 10px; }
+      header { display: grid; }
+      .toolbar { align-items: stretch; }
+      .status { width: 100%; margin-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="shell" aria-labelledby="paper-selector-title">
+      <header>
+        <h1 id="paper-selector-title">Paper selector</h1>
+        <div class="count" id="count"></div>
+      </header>
+      <form id="form">
+        <div class="list" id="list"></div>
+        <div class="toolbar">
+          <button type="submit" class="primary" id="parse">Parse</button>
+          <button type="button" id="select-all">All</button>
+          <button type="button" id="clear">Clear</button>
+          <div class="status" id="status"></div>
+        </div>
+      </form>
+    </section>
+  </main>
+  <script>
+    const list = document.getElementById("list");
+    const count = document.getElementById("count");
+    const form = document.getElementById("form");
+    const parseButton = document.getElementById("parse");
+    const selectAllButton = document.getElementById("select-all");
+    const clearButton = document.getElementById("clear");
+    const statusNode = document.getElementById("status");
+    let rpcId = 1;
+    const pending = new Map();
+    let data = unwrapToolOutput(window.openai?.toolOutput || {});
+
+    function unwrapToolOutput(value) {
+      if (value?.result && typeof value.result === "object" && !Array.isArray(value.result)) {
+        return value.result;
+      }
+      return value || {};
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;",
+      })[ch]);
+    }
+
+    function setStatus(message, kind = "") {
+      statusNode.textContent = message || "";
+      statusNode.className = kind ? `status ${kind}` : "status";
+    }
+
+    function compactMeta(paper) {
+      const bits = [];
+      if (paper.source) bits.push(paper.source);
+      if (paper.year) bits.push(paper.year);
+      if (paper.paper_id) bits.push(paper.paper_id);
+      if (paper.doi) bits.push(paper.doi);
+      if (!paper.parse_ready && paper.reason) bits.push(paper.reason);
+      return bits.join(" | ");
+    }
+
+    function render() {
+      const papers = Array.isArray(data.papers) ? data.papers : [];
+      const ready = papers.filter((paper) => paper.parse_ready !== false);
+      count.textContent = `${ready.length}/${papers.length} ready`;
+      parseButton.disabled = ready.length === 0;
+      selectAllButton.disabled = ready.length === 0;
+      clearButton.disabled = ready.length === 0;
+
+      if (!papers.length) {
+        list.innerHTML = '<div class="empty">No papers available.</div>';
+        return;
+      }
+
+      list.innerHTML = papers.map((paper) => {
+        const index = Number(paper.index);
+        const disabled = paper.parse_ready === false || !Number.isFinite(index);
+        return `
+          <label class="paper${disabled ? " disabled" : ""}">
+            <input type="checkbox" name="paper" value="${escapeHtml(index)}" ${disabled ? "disabled" : ""}>
+            <span>
+              <span class="title">${escapeHtml(index)}. ${escapeHtml(paper.title || "Untitled")}</span>
+              <span class="meta">${escapeHtml(compactMeta(paper))}</span>
+            </span>
+          </label>
+        `;
+      }).join("");
+    }
+
+    function selectedIndices() {
+      return Array.from(document.querySelectorAll('input[name="paper"]:checked')).map((item) => item.value);
+    }
+
+    function rpcRequest(method, params) {
+      const id = rpcId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+        window.setTimeout(() => {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          reject(new Error("Timed out waiting for host response."));
+        }, 120000);
+      });
+    }
+
+    async function callTool(name, args) {
+      if (window.openai?.callTool) {
+        return window.openai.callTool(name, args);
+      }
+      return rpcRequest("tools/call", { name, arguments: args });
+    }
+
+    function structured(result) {
+      return result?.structuredContent || result?.structured_content || result;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const selected = selectedIndices();
+      if (!selected.length) {
+        setStatus("Select at least one paper.", "error");
+        return;
+      }
+
+      parseButton.disabled = true;
+      setStatus("Parsing...");
+      try {
+        const result = await callTool("parse_selected_papers", {
+          selection_token: data.selection_token || "",
+          selected_indices: selected.join(","),
+          save_path: data.save_path || "~/Desktop/papers",
+          use_scihub: !!data.use_scihub,
+          mode: data.mode || "auto",
+          backend: data.backend || "",
+          force: !!data.force,
+        });
+        const body = structured(result);
+        const parsed = body?.parsed ?? 0;
+        const failed = body?.failed ?? 0;
+        const skipped = body?.skipped ?? 0;
+        setStatus(`Done. parsed=${parsed}, failed=${failed}, skipped=${skipped}`);
+      } catch (error) {
+        setStatus(error?.message || String(error), "error");
+      } finally {
+        parseButton.disabled = false;
+      }
+    });
+
+    selectAllButton.addEventListener("click", () => {
+      document.querySelectorAll('input[name="paper"]:not(:disabled)').forEach((item) => {
+        item.checked = true;
+      });
+      setStatus("");
+    });
+
+    clearButton.addEventListener("click", () => {
+      document.querySelectorAll('input[name="paper"]').forEach((item) => {
+        item.checked = false;
+      });
+      setStatus("");
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.source !== window.parent) return;
+      const message = event.data;
+      if (!message || message.jsonrpc !== "2.0") return;
+
+      if (message.id && pending.has(message.id)) {
+        const waiter = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) {
+          waiter.reject(new Error(message.error.message || "Host returned an error."));
+        } else {
+          waiter.resolve(message.result);
+        }
+        return;
+      }
+
+      if (message.method === "ui/notifications/tool-result") {
+        const next = message.params?.structuredContent;
+        if (next && typeof next === "object") {
+          data = unwrapToolOutput(next);
+          render();
+        }
+      }
+    }, { passive: true });
+
+    window.addEventListener("openai:set_globals", () => {
+      if (window.openai?.toolOutput) {
+        data = unwrapToolOutput(window.openai.toolOutput);
+        render();
+      }
+    }, { passive: true });
+
+    render();
+  </script>
+</body>
+</html>"""
+
+MINERU_KEY_WIDGET_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #eef3f7;
+      --glass: rgba(255, 255, 255, .70);
+      --glass-strong: rgba(255, 255, 255, .86);
+      --input: rgba(255, 255, 255, .52);
+      --text: #111827;
+      --muted: #667085;
+      --line: rgba(15, 23, 42, .13);
+      --accent: #0f766e;
+      --accent-strong: #0b5f59;
+      --danger: #b42318;
+      --shadow: 0 24px 70px rgba(15, 23, 42, .18);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --glass: rgba(22, 27, 34, .70);
+        --glass-strong: rgba(31, 37, 46, .86);
+        --input: rgba(15, 23, 42, .34);
+        --text: #f8fafc;
+        --muted: #aeb7c5;
+        --line: rgba(226, 232, 240, .14);
+        --accent: #2dd4bf;
+        --accent-strong: #5eead4;
+        --danger: #f97066;
+        --shadow: 0 28px 80px rgba(0, 0, 0, .38);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #dbeafe 28%));
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    main {
+      min-height: 100vh;
+      padding: 18px;
+      display: grid;
+      place-items: start center;
+    }
+
+    .panel {
+      width: min(100%, 590px);
+      background: linear-gradient(180deg, var(--glass-strong), var(--glass));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(22px) saturate(150%);
+      -webkit-backdrop-filter: blur(22px) saturate(150%);
+    }
+
+    h1 {
+      margin: 0 0 7px;
+      font-size: 19px;
+      font-weight: 700;
+    }
+
+    p {
+      margin: 0 0 18px;
+      color: var(--muted);
+      max-width: 52ch;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 14px;
+      color: var(--text);
+      font-weight: 650;
+    }
+
+    input {
+      min-height: 42px;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--input);
+      color: var(--text);
+      padding: 9px 12px;
+      font: inherit;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .32);
+    }
+
+    input:focus {
+      border-color: color-mix(in srgb, var(--accent), var(--line));
+      outline: 3px solid color-mix(in srgb, var(--accent), transparent 74%);
+      outline-offset: 0;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    button {
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+      color: #fff;
+      padding: 8px 14px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, .25);
+      transition: transform .14s ease, filter .14s ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      filter: brightness(1.04);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.58;
+    }
+
+    .status {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+
+    .status.error { color: var(--danger); }
+
+    @media (max-width: 560px) {
+      main { padding: 10px; }
+      .panel { padding: 16px; }
+      .row { align-items: stretch; }
+      .status { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <form class="panel" id="form">
+      <h1 id="title">Configure MinerU API key</h1>
+      <p id="message">Enter your MinerU API key to enable official extract parsing.</p>
+      <label>
+        MinerU API key
+        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste API key">
+      </label>
+      <div class="row">
+        <button id="save" type="submit">Save key</button>
+        <span class="status" id="status"></span>
+      </div>
+    </form>
+  </main>
+  <script>
+    const form = document.getElementById("form");
+    const input = document.getElementById("api-key");
+    const button = document.getElementById("save");
+    const message = document.getElementById("message");
+    const statusNode = document.getElementById("status");
+    let rpcId = 1;
+    const pending = new Map();
+    let data = window.openai?.toolOutput || {};
+
+    function setStatus(text, kind = "") {
+      statusNode.textContent = text || "";
+      statusNode.className = kind ? `status ${kind}` : "status";
+    }
+
+    function render() {
+      if (data.message) message.textContent = data.message;
+      if (data.env_file_path) {
+        input.setAttribute("aria-description", `Will save to ${data.env_file_path}`);
+      }
+    }
+
+    function rpcRequest(method, params) {
+      const id = rpcId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        window.parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+        window.setTimeout(() => {
+          if (!pending.has(id)) return;
+          pending.delete(id);
+          reject(new Error("Timed out waiting for host response."));
+        }, 60000);
+      });
+    }
+
+    async function callTool(name, args) {
+      if (window.openai?.callTool) {
+        return window.openai.callTool(name, args);
+      }
+      return rpcRequest("tools/call", { name, arguments: args });
+    }
+
+    function structured(result) {
+      return result?.structuredContent || result?.structured_content || result;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (!value) {
+        setStatus("Paste a MinerU API key first.", "error");
+        return;
+      }
+
+      button.disabled = true;
+      setStatus("Saving...");
+      try {
+        const result = await callTool("configure_mineru_api_key", {
+          api_key: value,
+        });
+        const body = structured(result);
+        input.value = "";
+        setStatus(body?.message || "Saved.");
+      } catch (error) {
+        setStatus(error?.message || String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.source !== window.parent) return;
+      const payload = event.data;
+      if (!payload || payload.jsonrpc !== "2.0") return;
+
+      if (payload.id && pending.has(payload.id)) {
+        const waiter = pending.get(payload.id);
+        pending.delete(payload.id);
+        if (payload.error) {
+          waiter.reject(new Error(payload.error.message || "Host returned an error."));
+        } else {
+          waiter.resolve(payload.result);
+        }
+        return;
+      }
+
+      if (payload.method === "ui/notifications/tool-result") {
+        const next = payload.params?.structuredContent;
+        if (next && typeof next === "object") {
+          data = next;
+          render();
+        }
+      }
+    }, { passive: true });
+
+    window.addEventListener("openai:set_globals", () => {
+      if (window.openai?.toolOutput) {
+        data = window.openai.toolOutput;
+        render();
+      }
+    }, { passive: true });
+
+    render();
+  </script>
+</body>
+</html>"""
 
 # Instances of searchers
 arxiv_searcher = ArxivSearcher()
@@ -111,11 +1144,11 @@ def _env_flag_enabled(name: str, default: str = "false") -> bool:
 
 
 def _custom_save_paths_allowed() -> bool:
-    return _env_flag_enabled(ALLOW_CUSTOM_SAVE_PATH_ENV)
+    return _env_flag_enabled(ALLOW_CUSTOM_SAVE_PATH_ENV, default="true")
 
 
 def _invalid_mcp_save_path(save_path: str) -> Optional[Dict[str, Any]]:
-    """Return a structured error when MCP callers try to override ~/Desktop/papers."""
+    """Return a structured error when custom MCP save paths are explicitly disabled."""
     requested = resolve_save_path(save_path)
     default = resolve_save_path(DEFAULT_SAVE_PATH)
     if requested == default or _custom_save_paths_allowed():
@@ -124,8 +1157,9 @@ def _invalid_mcp_save_path(save_path: str) -> Optional[Dict[str, Any]]:
     return {
         "status": "invalid_save_path",
         "message": (
-            f"MCP save_path overrides are disabled. Omit save_path to use {DEFAULT_SAVE_PATH}, "
-            f"or set PAPER_SEARCH_MCP_{ALLOW_CUSTOM_SAVE_PATH_ENV}=true to allow custom directories."
+            f"MCP save_path overrides are disabled by PAPER_SEARCH_MCP_{ALLOW_CUSTOM_SAVE_PATH_ENV}=false. "
+            f"Omit save_path to use {DEFAULT_SAVE_PATH}, remove the override, or set "
+            f"PAPER_SEARCH_MCP_{ALLOW_CUSTOM_SAVE_PATH_ENV}=true to allow custom directories."
         ),
         "requested_save_path": requested,
         "default_save_path": default,
@@ -169,6 +1203,25 @@ ALL_SOURCES = [
     "unpaywall",
 ]
 
+FAST_SOURCES = [
+    "arxiv",
+    "semantic",
+    "openalex",
+    "crossref",
+    "pubmed",
+    "pmc",
+    "europepmc",
+]
+
+DEEP_SOURCES = list(ALL_SOURCES)
+
+SEARCH_PROFILES: Dict[str, List[str]] = {
+    "fast": FAST_SOURCES,
+    "default": FAST_SOURCES,
+    "deep": DEEP_SOURCES,
+    "all": ALL_SOURCES,
+}
+
 
 SOURCE_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     "arxiv": {"search": True, "download": True, "read": True, "notes": "Open API; reliable PDF/read."},
@@ -207,6 +1260,7 @@ if _ieee_api_key:
     from .academic_platforms.ieee import IEEESearcher
     ieee_searcher = IEEESearcher()
     ALL_SOURCES.append("ieee")
+    DEEP_SOURCES.append("ieee")
     SOURCE_CAPABILITIES["ieee"] = {
         "search": "skeleton",
         "download": "skeleton",
@@ -221,6 +1275,7 @@ if _acm_api_key:
     from .academic_platforms.acm import ACMSearcher
     acm_searcher = ACMSearcher()
     ALL_SOURCES.append("acm")
+    DEEP_SOURCES.append("acm")
     SOURCE_CAPABILITIES["acm"] = {
         "search": "skeleton",
         "download": "skeleton",
@@ -261,11 +1316,70 @@ for _searcher in [
 
 
 def _parse_sources(sources: str) -> List[str]:
-    if not sources or sources.strip().lower() == "all":
-        return ALL_SOURCES
+    value = (sources or "").strip().lower()
+    if not value:
+        value = get_env(SEARCH_PROFILE_ENV, "fast").strip().lower() or "fast"
 
-    normalized = [part.strip().lower() for part in sources.split(",") if part.strip()]
+    if value in SEARCH_PROFILES:
+        return [source for source in SEARCH_PROFILES[value] if source in ALL_SOURCES]
+
+    normalized = [part.strip().lower() for part in value.split(",") if part.strip()]
     return [source for source in normalized if source in ALL_SOURCES]
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = get_env(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = get_env(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _search_cache_key(query: str, max_results_per_source: int, sources: str, year: Optional[str]) -> str:
+    resolved_sources = ",".join(_parse_sources(sources))
+    return json.dumps(
+        {
+            "query": query,
+            "max_results_per_source": max_results_per_source,
+            "sources": resolved_sources,
+            "year": year or "",
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def _cached_search_result(cache_key: str) -> Optional[Dict[str, Any]]:
+    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)
+    if ttl <= 0:
+        return None
+    entry = _SEARCH_RESULT_CACHE.get(cache_key)
+    if not entry:
+        return None
+    if time.time() - float(entry.get("stored_at", 0)) > ttl:
+        _SEARCH_RESULT_CACHE.pop(cache_key, None)
+        return None
+    payload = copy.deepcopy(entry.get("payload") or {})
+    if payload:
+        payload["cache"] = {"hit": True, "ttl_seconds": ttl}
+    return payload
+
+
+def _store_search_result(cache_key: str, payload: Dict[str, Any]) -> None:
+    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)
+    if ttl <= 0:
+        return
+    _SEARCH_RESULT_CACHE[cache_key] = {"stored_at": time.time(), "payload": copy.deepcopy(payload)}
 
 
 def _paper_unique_key(paper: Dict[str, Any]) -> str:
@@ -294,6 +1408,40 @@ def _dedupe_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         deduped.append(paper)
 
     return deduped
+
+
+async def _search_source_with_timeout(
+    source: str,
+    operation: Any,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        if timeout_seconds > 0:
+            output = await asyncio.wait_for(operation, timeout=timeout_seconds)
+        else:
+            output = await operation
+        return {
+            "source": source,
+            "output": output or [],
+            "error": "",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    except asyncio.TimeoutError:
+        return {
+            "source": source,
+            "output": [],
+            "error": f"timed out after {timeout_seconds:g}s",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "timed_out": True,
+        }
+    except Exception as exc:
+        return {
+            "source": source,
+            "output": [],
+            "error": str(exc),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
 
 
 def _paper_field(paper: Dict[str, Any], field: str) -> str:
@@ -368,6 +1516,170 @@ def _paper_parse_candidate(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
         "parse_ready": parse_ready,
         "reason": reason,
     }
+
+
+def _paper_selection_app_meta() -> Dict[str, Any]:
+    return {
+        "tool": PAPER_SELECTION_WIDGET_TOOL,
+        "resource_uri": PAPER_SELECTION_WIDGET_URI,
+        "output_template": PAPER_SELECTION_WIDGET_URI,
+        "widget_accessible": True,
+        "ui": {
+            "resourceUri": PAPER_SELECTION_WIDGET_URI,
+            "visibility": ["model", "app"],
+        },
+        "openai/outputTemplate": PAPER_SELECTION_WIDGET_URI,
+        "openai/widgetAccessible": True,
+    }
+
+
+def _paper_selection_app_payload(
+    *,
+    selection_token: str,
+    papers: List[Dict[str, Any]],
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+    message: str = "",
+) -> Dict[str, Any]:
+    parse_ready_total = sum(1 for paper in papers if paper.get("parse_ready") is not False)
+    return {
+        "status": "ok",
+        "interaction": "mcp_app",
+        "selection_token": selection_token,
+        "papers": papers,
+        "total": len(papers),
+        "parse_ready_total": parse_ready_total,
+        "save_path": save_path or DEFAULT_SAVE_PATH,
+        "use_scihub": use_scihub,
+        "mode": mode or "auto",
+        "backend": backend or "",
+        "force": force,
+        "message": message or "Select papers in the checkbox UI, then parse selected papers.",
+        "_meta": _paper_selection_app_meta(),
+    }
+
+
+def _paper_selection_app_prompt(
+    *,
+    selection_token: str,
+    papers: List[Dict[str, Any]],
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "interaction": "mcp_app",
+        "instructions": (
+            f"If the MCP host supports Apps, call {PAPER_SELECTION_WIDGET_TOOL} "
+            "with this selection_token to render a checkbox UI."
+        ),
+        "render_tool": PAPER_SELECTION_WIDGET_TOOL,
+        "resource_uri": PAPER_SELECTION_WIDGET_URI,
+        "selection_token": selection_token,
+        "save_path": save_path or DEFAULT_SAVE_PATH,
+        "use_scihub": use_scihub,
+        "mode": mode or "auto",
+        "backend": backend or "",
+        "force": force,
+        "papers": papers,
+        "total": len(papers),
+        "parse_ready_total": sum(1 for paper in papers if paper.get("parse_ready") is not False),
+    }
+
+
+def _mineru_api_key_configured() -> bool:
+    return bool(get_env("MINERU_API_KEY", "").strip())
+
+
+def _mineru_key_app_meta() -> Dict[str, Any]:
+    return {
+        "tool": MINERU_KEY_WIDGET_TOOL,
+        "resource_uri": MINERU_KEY_WIDGET_URI,
+        "output_template": MINERU_KEY_WIDGET_URI,
+        "widget_accessible": True,
+        "ui": {
+            "resourceUri": MINERU_KEY_WIDGET_URI,
+            "visibility": ["model", "app"],
+        },
+        "openai/outputTemplate": MINERU_KEY_WIDGET_URI,
+        "openai/widgetAccessible": True,
+    }
+
+
+def _mineru_key_setup_prompt(reason: str = "missing", message: str = "") -> Dict[str, Any]:
+    detail = message or (
+        "MinerU official extract parsing needs PAPER_SEARCH_MCP_MINERU_API_KEY. "
+        f"Open {MINERU_KEY_WIDGET_TOOL} to enter and save the key."
+    )
+    return {
+        "status": "mineru_api_key_required",
+        "interaction": "mcp_app",
+        "reason": reason,
+        "message": detail,
+        "render_tool": MINERU_KEY_WIDGET_TOOL,
+        "resource_uri": MINERU_KEY_WIDGET_URI,
+        "env_key": "PAPER_SEARCH_MCP_MINERU_API_KEY",
+        "env_file_path": str(env_file_path()),
+        "_meta": _mineru_key_app_meta(),
+    }
+
+
+def _is_mineru_api_key_error(message: str) -> bool:
+    lowered = message.lower()
+    needles = (
+        "mineru_api_key",
+        "api_key",
+        "api key",
+        "authorization",
+        "unauthorized",
+        "forbidden",
+        "401",
+        "403",
+        "invalid token",
+        "token expired",
+        "permission",
+    )
+    return any(needle in lowered for needle in needles)
+
+
+def _mineru_api_key_prompt_for_parse_result(parse_result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if parse_result.get("status") not in {"error", "invalid_save_path"}:
+        return None
+    message = str(parse_result.get("message") or "")
+    if not _mineru_api_key_configured():
+        return _mineru_key_setup_prompt("missing", "MinerU API key is not configured. Enter it to enable extract parsing.")
+    if _is_mineru_api_key_error(message):
+        return _mineru_key_setup_prompt("expired_or_invalid", "MinerU API key appears invalid or expired. Enter a new key.")
+    return None
+
+
+def _attach_mineru_key_prompt(parse_result: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = _mineru_api_key_prompt_for_parse_result(parse_result)
+    if prompt:
+        parse_result = {**parse_result, "mineru_api_key_prompt": prompt}
+    return parse_result
+
+
+def _first_mineru_key_prompt(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        prompt = value.get("mineru_api_key_prompt")
+        if isinstance(prompt, dict):
+            return prompt
+        for child in value.values():
+            found = _first_mineru_key_prompt(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_mineru_key_prompt(item)
+            if found:
+                return found
+    return None
 
 
 def _parse_selected_indices(selected_indices: Any, max_index: int) -> List[int]:
@@ -589,9 +1901,41 @@ async def _prompt_parse_saved_pdfs(
         "total": len(candidates),
         "parse_ready_total": len(selectable),
     }
+    fallback["app"] = _paper_selection_app_prompt(
+        selection_token=session["selection_token"],
+        papers=candidates,
+        save_path=save_path,
+        mode=mode,
+        backend=backend,
+        force=force,
+    )
 
     if not selectable:
         return {**fallback, "status": "no_parse_ready_pdfs"}
+
+    if len(candidates) <= AUTO_PARSE_SAVED_PDF_LIMIT:
+        selected_indices = [int(candidate["index"]) for candidate in selectable]
+        parse_result = await parse_selected_papers(
+            selection_token=session["selection_token"],
+            selected_indices=",".join(str(index) for index in selected_indices),
+            save_path=save_path,
+            use_scihub=False,
+            mode=mode,
+            backend=backend,
+            force=force,
+        )
+        return {
+            **parse_result,
+            "interaction": "auto_parse_saved_pdfs",
+            "selection_token": session["selection_token"],
+            "selected_indices": selected_indices,
+            "auto_parse_limit": AUTO_PARSE_SAVED_PDF_LIMIT,
+            "message": (
+                f"Saved {len(candidates)} PDF(s), which is at or below "
+                f"the auto-parse limit of {AUTO_PARSE_SAVED_PDF_LIMIT}. Parsed all saved PDFs."
+            ),
+        }
+
     if ctx is None:
         return fallback
 
@@ -684,7 +2028,7 @@ async def _after_saved_pdf(
         save_path=save_path,
         ctx=ctx,
     )
-    return {
+    response = {
         "status": "downloaded",
         "pdf_path": pdf_paths[0],
         "pdf_paths": pdf_paths,
@@ -694,6 +2038,9 @@ async def _after_saved_pdf(
         "title": title or Path(pdf_paths[0]).stem,
         "parse_prompt": parse_prompt,
     }
+    if isinstance(parse_prompt, dict) and isinstance(parse_prompt.get("app"), dict):
+        response["app"] = parse_prompt["app"]
+    return response
 
 
 async def _after_saved_pdfs(
@@ -840,6 +2187,17 @@ def _safe_filename(filename_hint: str, default: str = "paper") -> str:
     return safe[:120]
 
 
+def _looks_like_pdf_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or "\n" in text or "\r" in text:
+        return False
+    if os.path.exists(text):
+        return True
+    return text.lower().endswith(".pdf")
+
+
 async def _download_from_url(pdf_url: str, save_path: str, filename_hint: str = "paper") -> Optional[str]:
     if not pdf_url:
         return None
@@ -911,11 +2269,216 @@ async def _try_repository_fallback(doi: str, title: str, save_path: str) -> tupl
     return None, "; ".join(repository_errors)
 
 
+def _primary_downloaders() -> Dict[str, Any]:
+    return {
+        "arxiv": arxiv_searcher.download_pdf,
+        "biorxiv": biorxiv_searcher.download_pdf,
+        "medrxiv": medrxiv_searcher.download_pdf,
+        "iacr": iacr_searcher.download_pdf,
+        "semantic": semantic_searcher.download_pdf,
+        "pubmed": pubmed_searcher.download_pdf,
+        "crossref": crossref_searcher.download_pdf,
+        "pmc": pmc_searcher.download_pdf,
+        "core": core_searcher.download_pdf,
+        "europepmc": europepmc_searcher.download_pdf,
+        "citeseerx": citeseerx_searcher.download_pdf,
+        "doaj": doaj_searcher.download_pdf,
+        "base": base_searcher.download_pdf,
+        "zenodo": zenodo_searcher.download_pdf,
+        "hal": hal_searcher.download_pdf,
+        "ssrn": ssrn_searcher.download_pdf,
+    }
+
+
+async def _try_primary_download(
+    *,
+    source_name: str,
+    paper_id: str,
+    doi: str,
+    title: str,
+    save_path: str,
+) -> Dict[str, Any]:
+    downloader = _primary_downloaders().get(source_name)
+    if downloader is None:
+        return {
+            "method": "primary",
+            "path": None,
+            "error": f"Unsupported source '{source_name}' for primary download.",
+        }
+
+    try:
+        primary_result = await asyncio.to_thread(downloader, paper_id, save_path)
+    except Exception as exc:
+        logger.warning("Primary download failed for %s/%s: %s", source_name, paper_id, exc)
+        return {"method": "primary", "path": None, "error": str(exc)}
+
+    if _looks_like_pdf_path(primary_result):
+        if os.path.exists(primary_result):
+            record_download(
+                pdf_path=primary_result,
+                source=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                downloader=f"{source_name}.download_pdf",
+                legal_status="source_native_or_open_access",
+            )
+        return {
+            "method": "primary",
+            "path": primary_result,
+            "downloader": f"{source_name}.download_pdf",
+            "legal_status": "source_native_or_open_access",
+        }
+
+    return {"method": "primary", "path": None, "error": str(primary_result or "no PDF returned")}
+
+
+async def _try_repository_download(
+    *,
+    source_name: str,
+    paper_id: str,
+    doi: str,
+    title: str,
+    save_path: str,
+) -> Dict[str, Any]:
+    repository_result, repository_error = await _try_repository_fallback(doi, title, save_path)
+    if repository_result:
+        if os.path.exists(repository_result):
+            record_download(
+                pdf_path=repository_result,
+                source=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                downloader="repository_fallback",
+                legal_status="open_access_repository",
+            )
+        return {
+            "method": "repositories",
+            "path": repository_result,
+            "downloader": "repository_fallback",
+            "legal_status": "open_access_repository",
+        }
+    return {"method": "repositories", "path": None, "error": repository_error or "no repository PDF found"}
+
+
+async def _try_unpaywall_download(
+    *,
+    source_name: str,
+    paper_id: str,
+    doi: str,
+    title: str,
+    save_path: str,
+) -> Dict[str, Any]:
+    normalized_doi = (doi or "").strip()
+    if not normalized_doi:
+        return {"method": "unpaywall", "path": None, "error": "DOI not provided"}
+
+    try:
+        unpaywall_url = await asyncio.to_thread(unpaywall_resolver.resolve_best_pdf_url, normalized_doi)
+    except Exception as exc:
+        return {"method": "unpaywall", "path": None, "error": str(exc)}
+
+    if not unpaywall_url:
+        return {
+            "method": "unpaywall",
+            "path": None,
+            "error": "no OA URL found (or PAPER_SEARCH_MCP_UNPAYWALL_EMAIL/UNPAYWALL_EMAIL missing)",
+        }
+
+    unpaywall_result = await _download_from_url(unpaywall_url, save_path, f"unpaywall_{normalized_doi}")
+    if unpaywall_result:
+        if os.path.exists(unpaywall_result):
+            record_download(
+                pdf_path=unpaywall_result,
+                source=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                downloader="unpaywall",
+                legal_status="open_access_unpaywall",
+            )
+        return {
+            "method": "unpaywall",
+            "path": unpaywall_result,
+            "downloader": "unpaywall",
+            "legal_status": "open_access_unpaywall",
+        }
+    return {"method": "unpaywall", "path": None, "error": "resolved OA URL but download failed"}
+
+
+async def _race_oa_downloads(
+    *,
+    source_name: str,
+    paper_id: str,
+    doi: str,
+    title: str,
+    save_path: str,
+) -> tuple[Optional[Dict[str, Any]], List[str]]:
+    task_specs = [
+        (
+            "primary",
+            _try_primary_download(
+                source_name=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                save_path=save_path,
+            ),
+        ),
+        (
+            "repositories",
+            _try_repository_download(
+                source_name=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                save_path=save_path,
+            ),
+        ),
+        (
+            "unpaywall",
+            _try_unpaywall_download(
+                source_name=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                save_path=save_path,
+            ),
+        ),
+    ]
+    tasks = {asyncio.create_task(coro): name for name, coro in task_specs}
+    errors: List[str] = []
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                result = await completed
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            method = str(result.get("method") or tasks.get(completed) or "download")
+            path = result.get("path")
+            if _looks_like_pdf_path(path):
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return result, errors
+            if result.get("error"):
+                errors.append(f"{method}: {result['error']}")
+    finally:
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return None, errors
+
+
 @mcp.tool()
 async def search_papers(
     query: str,
     max_results_per_source: int = 5,
-    sources: str = "all",
+    sources: str = "",
     year: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Unified top-level search across all configured academic platforms.
@@ -929,7 +2492,12 @@ async def search_papers(
     Returns:
         Aggregated dictionary with per-source stats, errors, and deduplicated papers.
     """
+    started = time.perf_counter()
     selected_sources = _parse_sources(sources)
+    cache_key = _search_cache_key(query, max_results_per_source, sources, year)
+    cached = _cached_search_result(cache_key)
+    if cached is not None:
+        return cached
 
     if not selected_sources:
         return {
@@ -994,10 +2562,53 @@ async def search_papers(
                 task_map[source] = async_search(acm_searcher, query, max_results_per_source)
 
     source_names = list(task_map.keys())
-    source_outputs = await asyncio.gather(*task_map.values(), return_exceptions=True)
+    per_source_timeout = _env_float(SEARCH_SOURCE_TIMEOUT_ENV, 12.0, minimum=0.0)
+    overall_timeout = _env_float(SEARCH_TIMEOUT_ENV, 18.0, minimum=0.0)
+    source_tasks = [
+        asyncio.create_task(_search_source_with_timeout(source, task_map[source], per_source_timeout))
+        for source in source_names
+    ]
+    try:
+        if overall_timeout > 0:
+            source_outputs = await asyncio.wait_for(
+                asyncio.gather(*source_tasks, return_exceptions=True),
+                timeout=overall_timeout,
+            )
+        else:
+            source_outputs = await asyncio.gather(*source_tasks, return_exceptions=True)
+    except asyncio.TimeoutError:
+        source_outputs = []
+        for source, task in zip(source_names, source_tasks):
+            if task.done():
+                if task.cancelled():
+                    source_outputs.append(
+                        {
+                            "source": source,
+                            "output": [],
+                            "error": f"overall search timed out after {overall_timeout:g}s",
+                            "timed_out": True,
+                        }
+                    )
+                    continue
+                try:
+                    source_outputs.append(task.result())
+                except Exception as exc:
+                    source_outputs.append({"source": source, "output": [], "error": str(exc)})
+            else:
+                task.cancel()
+                source_outputs.append(
+                    {
+                        "source": source,
+                        "output": [],
+                        "error": f"overall search timed out after {overall_timeout:g}s",
+                        "timed_out": True,
+                    }
+                )
 
     source_results: Dict[str, int] = {}
     errors: Dict[str, str] = {}
+    source_timings: Dict[str, float] = {}
+    timed_out_sources: List[str] = []
     merged_papers: List[Dict[str, Any]] = []
 
     for source_name, output in zip(source_names, source_outputs):
@@ -1006,31 +2617,50 @@ async def search_papers(
             source_results[source_name] = 0
             continue
 
-        source_results[source_name] = len(output)
-        for paper in output:
+        if not isinstance(output, dict):
+            errors[source_name] = f"unexpected search result: {output!r}"
+            source_results[source_name] = 0
+            continue
+
+        papers = output.get("output", []) or []
+        source_results[source_name] = len(papers)
+        if output.get("error"):
+            errors[source_name] = str(output["error"])
+        if output.get("timed_out"):
+            timed_out_sources.append(source_name)
+        if "elapsed_seconds" in output:
+            source_timings[source_name] = float(output["elapsed_seconds"])
+
+        for paper in papers:
             if not paper.get("source"):
                 paper["source"] = source_name
             merged_papers.append(paper)
 
     deduped_papers = _dedupe_papers(merged_papers)
 
-    return {
+    result = {
         "query": query,
         "sources_requested": sources,
         "sources_used": source_names,
         "source_results": source_results,
         "errors": errors,
+        "timed_out_sources": timed_out_sources,
+        "source_timings": source_timings,
         "papers": deduped_papers,
         "total": len(deduped_papers),
         "raw_total": len(merged_papers),
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "cache": {"hit": False, "ttl_seconds": _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)},
     }
+    _store_search_result(cache_key, result)
+    return result
 
 
 @mcp.tool()
 async def search_papers_for_parsing(
     query: str,
     max_results_per_source: int = 5,
-    sources: str = "all",
+    sources: str = "",
     year: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Search papers, persist a numbered selection session, and return parse candidates.
@@ -1066,7 +2696,7 @@ async def search_papers_for_parsing(
     candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(papers)]
     parse_ready_total = sum(1 for candidate in candidates if candidate["parse_ready"])
 
-    return {
+    result = {
         "status": "ok",
         "selection_token": session["selection_token"],
         "query": query,
@@ -1084,13 +2714,231 @@ async def search_papers_for_parsing(
         "parse_ready_total": parse_ready_total,
         "raw_total": search_result.get("raw_total", len(candidates)),
     }
+    result["app"] = _paper_selection_app_prompt(
+        selection_token=session["selection_token"],
+        papers=candidates,
+    )
+    return result
+
+
+@mcp.resource(
+    PAPER_SELECTION_WIDGET_URI,
+    name="Paper Selection Widget",
+    mime_type="text/html;profile=mcp-app",
+    meta={
+        "ui": {
+            "prefersBorder": True,
+            "csp": {
+                "connectDomains": [],
+                "resourceDomains": [],
+            },
+        },
+        "openai/widgetDescription": "Checkbox selector for choosing saved or searched papers to parse with MinerU.",
+        "openai/widgetPrefersBorder": True,
+        "openai/widgetCSP": {
+            "connect_domains": [],
+            "resource_domains": [],
+        },
+    },
+)
+async def paper_selection_widget() -> str:
+    """Return the checkbox UI used by MCP Apps-capable hosts."""
+    return PAPER_SELECTION_WIDGET_HTML
+
+
+@mcp.tool(
+    name=PAPER_SELECTION_WIDGET_TOOL,
+    meta={
+        "ui": {"resourceUri": PAPER_SELECTION_WIDGET_URI, "visibility": ["model", "app"]},
+        "openai/outputTemplate": PAPER_SELECTION_WIDGET_URI,
+        "openai/widgetAccessible": True,
+        "openai/toolInvocation/invoking": "Opening paper selector...",
+        "openai/toolInvocation/invoked": "Paper selector ready.",
+    },
+    structured_output=True,
+)
+async def render_paper_selection_app(
+    selection_token: str,
+    papers: Optional[List[Dict[str, Any]]] = None,
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Render a checkbox paper selector for MCP Apps-capable hosts.
+
+    If papers are omitted, the tool loads candidates from the saved selection
+    session identified by selection_token.
+    """
+    candidates = papers if isinstance(papers, list) else []
+    if not candidates:
+        session = await asyncio.to_thread(cache_get_search_session, selection_token)
+        stored_papers = session.get("papers", []) if session else []
+        if not isinstance(stored_papers, list):
+            stored_papers = []
+        candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(stored_papers)]
+    return _paper_selection_app_payload(
+        selection_token=selection_token,
+        papers=candidates,
+        save_path=save_path,
+        use_scihub=use_scihub,
+        mode=mode,
+        backend=backend,
+        force=force,
+    )
+
+
+@mcp.tool(name=LOCAL_PAPER_SELECTION_TOOL, structured_output=True)
+async def open_paper_selection_page(
+    selection_token: str,
+    papers: Optional[List[Dict[str, Any]]] = None,
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+    open_browser: bool = True,
+) -> Dict[str, Any]:
+    """Open a local browser checkbox selector for clients without MCP Apps UI.
+
+    This fallback renders a normal localhost HTML page, so it works even when
+    the chat host cannot display MCP Apps widgets in the conversation.
+    """
+    candidates = papers if isinstance(papers, list) else []
+    if not candidates:
+        session = await asyncio.to_thread(cache_get_search_session, selection_token)
+        stored_papers = session.get("papers", []) if session else []
+        if not isinstance(stored_papers, list):
+            stored_papers = []
+        candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(stored_papers)]
+
+    page = _create_local_selection_page(
+        selection_token=selection_token,
+        papers=candidates,
+        save_path=save_path,
+        use_scihub=use_scihub,
+        mode=mode,
+        backend=backend,
+        force=force,
+    )
+    opened = False
+    if open_browser:
+        opened = await asyncio.to_thread(webbrowser.open, page["url"])
+
+    return {
+        "status": "ok",
+        "interaction": "local_browser_checkbox",
+        "selection_token": selection_token,
+        "url": page["url"],
+        "page_id": page["page_id"],
+        "opened": opened,
+        "papers": candidates,
+        "total": len(candidates),
+        "parse_ready_total": sum(1 for paper in candidates if paper.get("parse_ready") is not False),
+        "message": "Open the URL to select papers with checkboxes and parse them from the browser page.",
+    }
+
+
+@mcp.resource(
+    MINERU_KEY_WIDGET_URI,
+    name="MinerU API Key Setup Widget",
+    mime_type="text/html;profile=mcp-app",
+    meta={
+        "ui": {
+            "prefersBorder": True,
+            "csp": {
+                "connectDomains": [],
+                "resourceDomains": [],
+            },
+        },
+        "openai/widgetDescription": "Form for saving PAPER_SEARCH_MCP_MINERU_API_KEY to the project .env file.",
+        "openai/widgetPrefersBorder": True,
+        "openai/widgetCSP": {
+            "connect_domains": [],
+            "resource_domains": [],
+        },
+    },
+)
+async def mineru_api_key_setup_widget() -> str:
+    """Return the MinerU API key setup UI for MCP Apps-capable hosts."""
+    return MINERU_KEY_WIDGET_HTML
+
+
+@mcp.tool(
+    name=MINERU_KEY_WIDGET_TOOL,
+    meta={
+        "ui": {"resourceUri": MINERU_KEY_WIDGET_URI, "visibility": ["model", "app"]},
+        "openai/outputTemplate": MINERU_KEY_WIDGET_URI,
+        "openai/widgetAccessible": True,
+        "openai/toolInvocation/invoking": "Opening MinerU setup...",
+        "openai/toolInvocation/invoked": "MinerU setup ready.",
+    },
+    structured_output=True,
+)
+async def render_mineru_api_key_setup_app(reason: str = "missing", message: str = "") -> Dict[str, Any]:
+    """Render a MinerU API key setup form for MCP Apps-capable hosts."""
+    prompt = _mineru_key_setup_prompt(reason=reason, message=message)
+    return {
+        **prompt,
+        "configured": _mineru_api_key_configured(),
+    }
+
+
+@mcp.tool(name=MINERU_KEY_CONFIG_TOOL, structured_output=True)
+async def configure_mineru_api_key(api_key: str) -> Dict[str, Any]:
+    """Persist PAPER_SEARCH_MCP_MINERU_API_KEY to the project .env file."""
+    value = api_key.strip()
+    if not value:
+        return {
+            "status": "invalid_api_key",
+            "message": "MinerU API key cannot be empty.",
+            "env_key": "PAPER_SEARCH_MCP_MINERU_API_KEY",
+        }
+
+    target = await asyncio.to_thread(set_env_value, "MINERU_API_KEY", value)
+    return {
+        "status": "ok",
+        "message": "MinerU API key saved. New parse requests will use the updated key.",
+        "env_key": "PAPER_SEARCH_MCP_MINERU_API_KEY",
+        "env_file_path": str(target),
+        "configured": True,
+    }
+
+
+@mcp.tool(
+    meta={
+        "ui": {"resourceUri": MINERU_KEY_WIDGET_URI, "visibility": ["model", "app"]},
+        "openai/outputTemplate": MINERU_KEY_WIDGET_URI,
+        "openai/widgetAccessible": True,
+    },
+    structured_output=True,
+)
+async def mineru_setup_status() -> Dict[str, Any]:
+    """Return MinerU API key setup status and an Apps prompt when configuration is missing."""
+    configured = _mineru_api_key_configured()
+    if configured:
+        return {
+            "status": "ok",
+            "configured": True,
+            "env_key": "PAPER_SEARCH_MCP_MINERU_API_KEY",
+            "env_file_path": str(env_file_path()),
+            "message": "MinerU API key is configured.",
+        }
+    return {
+        **_mineru_key_setup_prompt(
+            "missing",
+            "MinerU API key is not configured. Enter it to enable official extract parsing.",
+        ),
+        "configured": False,
+    }
 
 
 @mcp.tool()
 async def search_papers_with_elicitation(
     query: str,
     max_results_per_source: int = 5,
-    sources: str = "all",
+    sources: str = "",
     year: Optional[str] = None,
     save_path: str = DEFAULT_SAVE_PATH,
     use_scihub: bool = False,
@@ -1249,19 +3097,15 @@ async def parse_selected_papers(
             "total": len(papers),
         }
 
-    results: List[Dict[str, Any]] = []
-    for index in indices:
+    async def _run_selected(index: int) -> Dict[str, Any]:
         paper = papers[index - 1]
         if not isinstance(paper, dict):
-            results.append(
-                {
-                    "index": index,
-                    "status": "skipped",
-                    "message": "Stored search result is not a paper dictionary.",
-                }
-            )
-            continue
-        result = await _download_and_parse_session_paper(
+            return {
+                "index": index,
+                "status": "skipped",
+                "message": "Stored search result is not a paper dictionary.",
+            }
+        return await _download_and_parse_session_paper(
             paper=paper,
             index=index,
             save_path=save_path,
@@ -1270,14 +3114,22 @@ async def parse_selected_papers(
             backend=backend,
             force=force,
         )
-        results.append(result)
+
+    concurrency = _env_int(PARSE_CONCURRENCY_ENV, 3, minimum=1)
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _limited(index: int) -> Dict[str, Any]:
+        async with semaphore:
+            return await _run_selected(index)
+
+    results = await asyncio.gather(*[_limited(index) for index in indices])
 
     parsed = sum(1 for result in results if result.get("status") in {"ok", "cached"})
     skipped = sum(1 for result in results if result.get("status") == "skipped")
     failed = len(results) - parsed - skipped
     status = "ok" if failed == 0 else "partial" if parsed else "failed"
 
-    return {
+    summary = {
         "status": status,
         "selection_token": selection_token,
         "query": session.get("query", ""),
@@ -1287,7 +3139,12 @@ async def parse_selected_papers(
         "parsed": parsed,
         "failed": failed,
         "skipped": skipped,
+        "parse_concurrency": concurrency,
     }
+    prompt = _first_mineru_key_prompt(results)
+    if prompt:
+        summary["mineru_api_key_prompt"] = prompt
+    return summary
 
 
 @mcp.tool()
@@ -1986,90 +3843,15 @@ async def _download_with_fallback_path(
     save_path = resolve_save_path(save_path)
     source_name = source.strip().lower()
 
-    primary_downloaders = {
-        "arxiv": arxiv_searcher.download_pdf,
-        "biorxiv": biorxiv_searcher.download_pdf,
-        "medrxiv": medrxiv_searcher.download_pdf,
-        "iacr": iacr_searcher.download_pdf,
-        "semantic": semantic_searcher.download_pdf,
-        "pubmed": pubmed_searcher.download_pdf,
-        "crossref": crossref_searcher.download_pdf,
-        "pmc": pmc_searcher.download_pdf,
-        "core": core_searcher.download_pdf,
-        "europepmc": europepmc_searcher.download_pdf,
-        "citeseerx": citeseerx_searcher.download_pdf,
-        "doaj": doaj_searcher.download_pdf,
-        "base": base_searcher.download_pdf,
-        "zenodo": zenodo_searcher.download_pdf,
-        "hal": hal_searcher.download_pdf,
-        "ssrn": ssrn_searcher.download_pdf,
-    }
-
-    attempt_errors: List[str] = []
-    primary_error = ""
-    if source_name in primary_downloaders:
-        try:
-            primary_result = await asyncio.to_thread(primary_downloaders[source_name], paper_id, save_path)
-            if isinstance(primary_result, str) and os.path.exists(primary_result):
-                record_download(
-                    pdf_path=primary_result,
-                    source=source_name,
-                    paper_id=paper_id,
-                    doi=doi,
-                    title=title,
-                    downloader=f"{source_name}.download_pdf",
-                    legal_status="source_native_or_open_access",
-                )
-                return primary_result
-            if isinstance(primary_result, str) and primary_result:
-                primary_error = primary_result
-        except Exception as exc:
-            primary_error = str(exc)
-            logger.warning("Primary download failed for %s/%s: %s", source_name, paper_id, exc)
-    else:
-        primary_error = f"Unsupported source '{source_name}' for primary download."
-
-    if primary_error:
-        attempt_errors.append(f"primary: {primary_error}")
-
-    repository_result, repository_error = await _try_repository_fallback(doi, title, save_path)
-    if repository_result:
-        if os.path.exists(repository_result):
-            record_download(
-                pdf_path=repository_result,
-                source=source_name,
-                paper_id=paper_id,
-                doi=doi,
-                title=title,
-                downloader="repository_fallback",
-                legal_status="open_access_repository",
-            )
-        return repository_result
-    if repository_error:
-        attempt_errors.append(f"repositories: {repository_error}")
-
-    normalized_doi = (doi or "").strip()
-    if normalized_doi:
-        unpaywall_url = await asyncio.to_thread(unpaywall_resolver.resolve_best_pdf_url, normalized_doi)
-        if unpaywall_url:
-            unpaywall_result = await _download_from_url(unpaywall_url, save_path, f"unpaywall_{normalized_doi}")
-            if unpaywall_result:
-                if os.path.exists(unpaywall_result):
-                    record_download(
-                        pdf_path=unpaywall_result,
-                        source=source_name,
-                        paper_id=paper_id,
-                        doi=doi,
-                        title=title,
-                        downloader="unpaywall",
-                        legal_status="open_access_unpaywall",
-                    )
-                return unpaywall_result
-            attempt_errors.append("unpaywall: resolved OA URL but download failed")
-        else:
-            attempt_errors.append("unpaywall: no OA URL found (or PAPER_SEARCH_MCP_UNPAYWALL_EMAIL/UNPAYWALL_EMAIL missing)")
-    else:
-        attempt_errors.append("unpaywall: DOI not provided")
+    oa_result, attempt_errors = await _race_oa_downloads(
+        source_name=source_name,
+        paper_id=paper_id,
+        doi=doi,
+        title=title,
+        save_path=save_path,
+    )
+    if oa_result and isinstance(oa_result.get("path"), str):
+        return oa_result["path"]
 
     if not use_scihub:
         return "Download failed after OA fallback chain. Details: " + " | ".join(attempt_errors)
@@ -2269,10 +4051,10 @@ async def parse_pdf_with_mineru(
 ) -> Dict[str, Any]:
     """Parse a local PDF into cached Markdown, content_list JSON, manifest, and assets.
 
-    The parser tries MinerU according to configuration and falls back to pypdf in
-    auto mode so the chain remains usable without a running MinerU service.
+    In auto mode, the parser uses the configured MinerU API key first and only
+    falls back to pypdf if official extract parsing is unavailable.
     """
-    return await asyncio.to_thread(
+    result = await asyncio.to_thread(
         run_parse_pdf_with_mineru,
         pdf_path,
         paper_key_hint=paper_key,
@@ -2284,6 +4066,7 @@ async def parse_pdf_with_mineru(
         backend=backend,
         force=force,
     )
+    return _attach_mineru_key_prompt(result)
 
 
 @mcp.tool()
@@ -2331,13 +4114,30 @@ async def parse_downloaded_paper(
         backend=backend,
         force=force,
     )
-    return {"status": parse_result.get("status", "ok"), "pdf_path": pdf_path, "parse": parse_result}
+    result = {"status": parse_result.get("status", "ok"), "pdf_path": pdf_path, "parse": parse_result}
+    prompt = _first_mineru_key_prompt(parse_result)
+    if prompt:
+        result["mineru_api_key_prompt"] = prompt
+    return result
 
 
 @mcp.tool()
 async def mineru_health_check(mode: str = "auto", backend: str = "") -> Dict[str, Any]:
-    """Check MinerU local API/CLI availability and pypdf fallback status."""
-    return await asyncio.to_thread(run_mineru_health_check, mode=mode, backend=backend)
+    """Check MinerU API key setup and pypdf fallback status.
+
+    Local API and CLI are checked only when explicitly requested via mode.
+    """
+    result = await asyncio.to_thread(run_mineru_health_check, mode=mode, backend=backend)
+    extract_api = result.get("extract_api", {}) if isinstance(result, dict) else {}
+    if not extract_api.get("ok"):
+        result = {
+            **result,
+            "mineru_api_key_prompt": _mineru_key_setup_prompt(
+                "missing",
+                "MinerU API key is not configured. Enter it to enable official extract parsing.",
+            ),
+        }
+    return result
 
 
 @mcp.tool()
@@ -2374,9 +4174,15 @@ async def delete_parsed_cache(paper_key: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def cleanup_redundant_cache_artifacts(apply: bool = False) -> Dict[str, Any]:
+    """Remove historical heavyweight cache duplicates; dry-run unless apply is true."""
+    return await asyncio.to_thread(cleanup_redundant_artifacts, None, dry_run=not apply)
+
+
+@mcp.tool()
 async def get_parsed_paths(paper_key: str) -> Dict[str, str]:
-    """Return filesystem paths for cached metadata, PDF, Markdown, JSON, and assets."""
-    return await asyncio.to_thread(get_cached_paths, paper_key)
+    """Return filesystem paths for metadata plus resolved Markdown, JSON, and assets."""
+    return await asyncio.to_thread(resolved_parsed_paths, paper_key)
 
 
 @mcp.tool()
@@ -3141,6 +4947,24 @@ if acm_searcher is not None:
 
 
 def main():
+    transport = get_env("TRANSPORT", "stdio").strip().lower() or "stdio"
+    if transport in {"http", "streamable_http", "streamable-http"}:
+        _configure_http_transport_from_env()
+        logger.info(
+            "Starting paper-search MCP over streamable HTTP at http://%s:%s%s",
+            mcp.settings.host,
+            mcp.settings.port,
+            mcp.settings.streamable_http_path,
+        )
+        mcp.run(transport="streamable-http")
+        return
+    if transport == "sse":
+        _configure_http_transport_from_env()
+        logger.info("Starting paper-search MCP over SSE at http://%s:%s/sse", mcp.settings.host, mcp.settings.port)
+        mcp.run(transport="sse")
+        return
+    if transport != "stdio":
+        logger.warning("Unknown PAPER_SEARCH_MCP_TRANSPORT=%r; falling back to stdio", transport)
     mcp.run(transport="stdio")
 
 

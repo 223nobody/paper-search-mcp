@@ -1,5 +1,7 @@
 import unittest
 import asyncio
+import tempfile
+from pathlib import Path
 from unittest.mock import patch, AsyncMock
 
 from paper_search_mcp import server
@@ -21,22 +23,27 @@ class TestDownloadWithFallback(unittest.TestCase):
             )
             self.assertIn("OA fallback chain", result)
 
-    def test_repository_fallback_before_scihub(self):
-        with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
-             patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=("/tmp/repo.pdf", ""))), \
-             patch("paper_search_mcp.server.SciHubFetcher.download_pdf", side_effect=AssertionError("Sci-Hub should not be called")):
-            result = asyncio.run(
-                server.download_with_fallback(
-                    source="arxiv",
-                    paper_id="1234.5678",
-                    doi="10.1000/test",
-                    title="test",
-                    use_scihub=True,
+    def test_repository_fallback_wins_oa_race_before_scihub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_pdf = Path(tmp) / "repo.pdf"
+            repo_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
+                 patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=(str(repo_pdf), ""))), \
+                 patch.object(server.unpaywall_resolver, "resolve_best_pdf_url", return_value=None), \
+                 patch("paper_search_mcp.server.SciHubFetcher.download_pdf", side_effect=AssertionError("Sci-Hub should not be called")):
+                result = asyncio.run(
+                    server._download_with_fallback_path(
+                        source="arxiv",
+                        paper_id="1234.5678",
+                        doi="10.1000/test",
+                        title="test",
+                        save_path=tmp,
+                        use_scihub=True,
+                    )
                 )
-            )
-            self.assertEqual(result, "/tmp/repo.pdf")
+            self.assertEqual(result, str(repo_pdf))
 
-    def test_unpaywall_fallback_after_repositories(self):
+    def test_unpaywall_fallback_can_win_oa_race(self):
         with patch.object(server.arxiv_searcher, "download_pdf", side_effect=Exception("primary failed")), \
              patch("paper_search_mcp.server._try_repository_fallback", new=AsyncMock(return_value=(None, "repo failed"))), \
              patch.object(server.unpaywall_resolver, "resolve_best_pdf_url", return_value="https://example.org/oa.pdf"), \

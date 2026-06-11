@@ -1,4 +1,4 @@
-<h2 align="center">Paper Search MCP</h1>
+<h1 align="center">Paper Search MCP</h1>
 
 A Model Context Protocol (MCP) server for searching and downloading academic papers from multiple sources. The project follows a free-first strategy: prioritize open and public data sources, support optional API keys when they improve stability or coverage, and keep source-specific connectors extensible for advanced users.
 
@@ -59,8 +59,8 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - **Optional API-Key Enhancement**: Sources like Semantic Scholar can work better with a user-provided API key, but are not intended to force paid usage.
 - **Discovery + Retrieval Workflow**: Google Scholar and Crossref can be used for discovery and DOI backfilling, while open repositories and publisher links are used for lawful full-text resolution where available.
 - **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub. Sci-Hub fallback is opt-in.
-- **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into cached `full.md`, `content_list.json`, `manifest.json`, and extracted assets. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `auto` mode first uses MinerU official extract API, then local API/CLI, and finally `pypdf`.
-- **Saved-PDF Parse Prompt**: Every MCP tool path that saves a PDF returns a parse prompt. Clients with MCP Elicitation can render a native multi-select/checkbox UI; clients without it receive a backend `selection_token` and numbered fallback list.
+- **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into `full.md`, `content_list.json`, `manifest.json`, and extracted assets beside the source PDF. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `auto` mode first uses MinerU official extract API, then local API/CLI, and finally `pypdf`.
+- **Saved-PDF Auto Parsing + Selection UI**: When MCP download/read tools save PDFs, batches of 10 or fewer PDFs are parsed automatically with MinerU. Larger batches return a selection prompt; MCP Apps-capable clients can render a liquid-glass checkbox UI, while plain clients receive a backend `selection_token` and numbered fallback list.
 - **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
 - **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
 
@@ -70,14 +70,18 @@ The project now separates discovery/download from parsing. A typical agent workf
 
 1. Use `search_papers` or `paper-search search` to discover candidate papers.
 2. Use source-native download or `download_with_fallback` to obtain a PDF.
-3. Parse the PDF with MinerU. This writes a same-name result zip beside the PDF
-   (for example `example.pdf` -> `example.zip`) and keeps a reusable cache copy:
+3. Parse the PDF with MinerU. This writes parsed artifacts beside the PDF
+   (`example_mineru/full.md`, `content_list.json`, `manifest.json`, `assets/`)
+   and a same-name result zip (`example.pdf` -> `example.zip`). The project
+   cache keeps only lightweight metadata and indexes, not a duplicate PDF or
+   duplicate parsed content:
 
 ```bash
 paper-search parse ~/Desktop/example.pdf --paper-key example --mode auto
 ```
 
-4. Reuse parsed artifacts from cache:
+4. Reuse parsed artifacts by paper key. The cache commands resolve back to the
+   PDF-side `*_mineru` directory when it exists:
 
 ```bash
 paper-search cache list
@@ -90,6 +94,11 @@ Parser configuration:
 
 ```dotenv
 PAPER_SEARCH_MCP_CACHE_DIR=.paper_search_cache
+PAPER_SEARCH_MCP_SEARCH_PROFILE=fast
+PAPER_SEARCH_MCP_SEARCH_TIMEOUT_SECONDS=18
+PAPER_SEARCH_MCP_SEARCH_SOURCE_TIMEOUT_SECONDS=12
+PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS=300
+PAPER_SEARCH_MCP_PARSE_CONCURRENCY=3
 PAPER_SEARCH_MCP_MINERU_MODE=auto
 PAPER_SEARCH_MCP_MINERU_BASE_URL=http://127.0.0.1:8000
 PAPER_SEARCH_MCP_MINERU_BACKEND=pipeline
@@ -100,23 +109,47 @@ PAPER_SEARCH_MCP_MINERU_LANGUAGE=ch
 PAPER_SEARCH_MCP_MINERU_IS_OCR=false
 PAPER_SEARCH_MCP_MINERU_ENABLE_FORMULA=true
 PAPER_SEARCH_MCP_MINERU_ENABLE_TABLE=true
+PAPER_SEARCH_MCP_MINERU_AUTO_ORDER=extract,local_api,cli,pypdf
+PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true
 ```
 
 Set `PAPER_SEARCH_MCP_MINERU_MODE=extract` to force MinerU official extract
 API only. In `auto` mode, the extract API is tried first when an API key is
 present; if it fails, the chain continues to local MinerU API/CLI and `pypdf`.
+Use `PAPER_SEARCH_MCP_MINERU_AUTO_ORDER` to tune that order, for example
+`local_api,extract,cli,pypdf` when you keep a local MinerU server warm.
 
-### MCP elicitation selection and numbered fallback
+Search defaults to the `fast` profile instead of every connector. Pass
+`sources=deep` or `sources=all` when you want the slower long-tail sources.
+`PAPER_SEARCH_MCP_SEARCH_TIMEOUT_SECONDS`,
+`PAPER_SEARCH_MCP_SEARCH_SOURCE_TIMEOUT_SECONDS`, and
+`PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS` control aggregate timeouts,
+per-source timeouts, and short-lived query caching.
+`PAPER_SEARCH_MCP_PARSE_CONCURRENCY` controls selected-paper parse concurrency.
+Set `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=false` to skip same-name zip generation
+during large batch parsing.
+
+### MCP auto parsing, selection UI, and numbered fallback
 
 MCP clients with elicitation support, such as VS Code Copilot Agent Mode, can
 use `search_papers_with_elicitation` to show a native multi-select form after
 searching. The server creates a search session, asks the client to collect the
 selected papers, then runs `parse_selected_papers` automatically.
 
-The same interaction is also triggered after any MCP download/read tool saves a
-PDF. For example, `download_arxiv` now returns `pdf_path`, `pdf_paths`, and
-`parse_prompt`. The `parse_prompt` is either an accepted elicitation parse
-result or a numbered fallback payload with `selection_token`.
+Download/read tools use a saved-PDF policy:
+
+- If one tool call saves **10 PDFs or fewer**, the server automatically parses
+  all saved parse-ready PDFs with MinerU. The returned `parse_prompt` has
+  `interaction: "auto_parse_saved_pdfs"` and includes the `parse_selected_papers`
+  summary.
+- If one tool call saves **more than 10 PDFs**, the server returns a selection
+  prompt instead of parsing immediately. MCP Apps-capable clients can render
+  `ui://paper-search/paper-selection.html` with `render_paper_selection_app`.
+  Plain clients receive a numbered `papers` list and `selection_token`.
+
+For example, `download_arxiv` returns `pdf_path`, `pdf_paths`, and
+`parse_prompt`. Small single-paper downloads parse automatically; large batches
+use the selection flow.
 
 Example MCP flow:
 
@@ -141,6 +174,12 @@ backend fallback workflow:
 2. Present the returned numbered `papers` list to the user.
 3. Ask the user to choose indices such as `1,3,5`, `2-4`, or `all`.
 4. Call `parse_selected_papers` with the returned `selection_token`.
+
+For hosts without MCP Apps or elicitation UI, `open_paper_selection_page` can
+open a localhost checkbox page in the system browser. That page calls
+`parse_selected_papers` after the user submits the selection. The MCP server
+cannot force a Codex/host built-in browser; it can only return the URL or ask
+the operating system to open it.
 
 Fallback MCP flow:
 
@@ -171,8 +210,9 @@ Then parse selected entries:
 
 Search sessions are stored under `.paper_search_cache/sessions/`. Use
 `list_search_sessions`, `get_search_session`, and `delete_search_session` to
-inspect or clean them. Each parsed PDF still writes a same-name result zip next
-to the downloaded PDF and keeps reusable artifacts in the parsed-paper cache.
+inspect or clean them. Parsed-paper cache entries store metadata/status and
+point to the PDF-side `*_mineru` artifacts to avoid duplicate PDFs and duplicate
+parsed content in `.paper_search_cache`.
 
 ## Source Strategy
 
@@ -605,6 +645,13 @@ PAPER_SEARCH_MCP_ACM_API_KEY=
 To use a custom path: `export PAPER_SEARCH_MCP_ENV_FILE=/absolute/path/to/.env`
 
 > Legacy variable names without the `PAPER_SEARCH_MCP_` prefix (e.g. `CORE_API_KEY`, `UNPAYWALL_EMAIL`) are still supported for backward compatibility.
+
+MinerU key setup helpers:
+
+- `mineru_setup_status` reports whether `PAPER_SEARCH_MCP_MINERU_API_KEY` is configured.
+- If the key is missing, expired, or rejected by the extract API, parse and health-check results may include `mineru_api_key_prompt`.
+- MCP Apps-capable clients can render `render_mineru_api_key_setup_app`, backed by `ui://paper-search/mineru-api-key.html`. The widget saves the key by calling `configure_mineru_api_key`, which writes `PAPER_SEARCH_MCP_MINERU_API_KEY` into the active `.env` file.
+- The MinerU key widget and paper-selection widget use the same restrained liquid-glass visual style. Whether a host displays them inline is controlled by the MCP host; non-Apps hosts can still use tool results and numbered fallback flows.
 
 ---
 

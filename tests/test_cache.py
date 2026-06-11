@@ -48,6 +48,83 @@ class TestPaperCache(unittest.TestCase):
             self.assertEqual(len(hits), 1)
             self.assertEqual(hits[0]["block_id"], "b1")
 
+    def test_read_parsed_prefers_visible_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            metadata = cache.record_download(
+                pdf_path=str(pdf),
+                paper_key_hint="visible-paper",
+                source="local",
+                title="Visible Paper",
+                cache_dir=tmp,
+            )
+            visible = cache.visible_artifact_paths(pdf)
+            cache.write_json(visible["content_list"], [{"id": "v1", "text": "visible content"}])
+            Path(visible["full_md"]).write_text("visible markdown", encoding="utf-8")
+            cache.write_json(visible["manifest"], {"parser": "mineru", "backend": "visible"})
+
+            cached = cache.get_cached_paths(metadata["paper_key"], cache_dir=tmp)
+            cache.write_json(cached["content_list"], [{"id": "c1", "text": "cached content"}])
+            Path(cached["full_md"]).write_text("cached markdown", encoding="utf-8")
+
+            self.assertEqual(cache.read_parsed("visible-paper", "markdown", cache_dir=tmp), "visible markdown")
+            self.assertEqual(cache.read_parsed("visible-paper", "json", cache_dir=tmp)[0]["id"], "v1")
+            self.assertEqual(cache.read_parsed("visible-paper", "manifest", cache_dir=tmp)["backend"], "visible")
+            resolved_paths = cache.read_parsed("visible-paper", "paths", cache_dir=tmp)
+            self.assertEqual(resolved_paths["pdf_path"], str(pdf.resolve()))
+            self.assertEqual(resolved_paths["full_md"], visible["full_md"])
+
+    def test_cleanup_redundant_artifacts_removes_only_safe_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            metadata = cache.record_download(
+                pdf_path=str(pdf),
+                paper_key_hint="cleanup-paper",
+                source="local",
+                title="Cleanup Paper",
+                cache_dir=tmp,
+            )
+
+            visible = cache.visible_artifact_paths(pdf)
+            Path(visible["export_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(visible["full_md"]).write_text("visible markdown", encoding="utf-8")
+            cache.write_json(visible["content_list"], [{"id": "v1", "text": "visible content"}])
+            cache.write_json(visible["manifest"], {"parser": "mineru", "backend": "visible"})
+            Path(visible["assets_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(visible["assets_dir"], "figure.png").write_bytes(b"visible")
+
+            cached = cache.get_cached_paths(metadata["paper_key"], cache_dir=tmp)
+            Path(cached["source_pdf"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(cached["source_pdf"]).write_bytes(pdf.read_bytes())
+            Path(cached["mineru_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(cached["full_md"]).write_text("cached markdown", encoding="utf-8")
+            cache.write_json(cached["content_list"], [{"id": "c1", "text": "cached content"}])
+            cache.write_json(cached["manifest"], {"parser": "mineru", "backend": "cached"})
+            Path(cached["assets_dir"]).mkdir(parents=True, exist_ok=True)
+            Path(cached["assets_dir"], "figure.png").write_bytes(b"cached")
+            raw_dir = Path(cached["mineru_dir"]) / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            Path(raw_dir, "origin.pdf").write_bytes(b"raw")
+
+            dry_run = cache.cleanup_redundant_artifacts(cache_dir=tmp)
+            self.assertEqual(dry_run["status"], "dry_run")
+            self.assertGreaterEqual(dry_run["removed_total"], 5)
+            self.assertTrue(Path(cached["source_pdf"]).exists())
+            self.assertTrue(raw_dir.exists())
+
+            applied = cache.cleanup_redundant_artifacts(cache_dir=tmp, dry_run=False)
+            self.assertEqual(applied["status"], "ok")
+            self.assertGreater(applied["bytes_deleted"], 0)
+            self.assertFalse(Path(cached["source_pdf"]).exists())
+            self.assertFalse(Path(cached["full_md"]).exists())
+            self.assertFalse(Path(cached["content_list"]).exists())
+            self.assertFalse(Path(cached["assets_dir"]).exists())
+            self.assertFalse(raw_dir.exists())
+            self.assertTrue(Path(visible["full_md"]).exists())
+            self.assertTrue(Path(visible["content_list"]).exists())
+
     def test_search_session_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = cache.create_search_session(

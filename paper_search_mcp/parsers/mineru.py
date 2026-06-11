@@ -3,23 +3,26 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from ..cache import (
-    copy_pdf_to_cache,
     get_cached_paths,
     paper_dir,
     paper_key,
     read_json,
     record_download,
+    resolved_parsed_paths,
     sha256_file,
     utc_now,
+    visible_artifact_paths,
     write_json,
 )
 from ..config import get_env
@@ -59,7 +62,7 @@ class ParseResult:
 
 
 class MinerUParser:
-    """MinerU adapter with a pypdf fallback for environments without MinerU."""
+    """MinerU adapter using the official extract API by default."""
 
     def __init__(
         self,
@@ -87,6 +90,7 @@ class MinerUParser:
         self.extract_enable_formula = self._env_bool("MINERU_ENABLE_FORMULA", True)
         self.extract_enable_table = self._env_bool("MINERU_ENABLE_TABLE", True)
         self.extract_page_ranges = get_env("MINERU_PAGE_RANGES", "")
+        self.export_zip = self._env_bool("MINERU_EXPORT_ZIP", True)
         self.extract_extra_formats = [
             value.strip()
             for value in get_env("MINERU_EXTRA_FORMATS", "").split(",")
@@ -119,31 +123,33 @@ class MinerUParser:
         directory = paper_dir(key, self.cache_dir)
         mineru_dir = directory / "mineru"
         paths = get_cached_paths(key, self.cache_dir)
-        result_zip_path = pdf.with_suffix(".zip")
+        visible_paths = visible_artifact_paths(pdf)
+        result_zip_path = Path(visible_paths["result_zip"])
 
-        cached_md = Path(paths["full_md"])
-        cached_manifest = Path(paths["manifest"])
+        parsed_paths = resolved_parsed_paths(key, self.cache_dir)
+        cached_md = Path(parsed_paths["full_md"])
+        cached_manifest = Path(parsed_paths["manifest"])
         if not force and cached_md.exists() and cached_manifest.exists():
-            exported_zip = self._export_result_zip(key, result_zip_path)
             result = ParseResult(
                 paper_key=key,
                 status="cached",
                 parser=read_json(cached_manifest, {}).get("parser", "mineru"),
                 backend=read_json(cached_manifest, {}).get("backend", self.backend),
                 mode=read_json(cached_manifest, {}).get("mode", self.mode),
-                full_md_path=paths["full_md"],
-                content_list_path=paths["content_list"],
-                manifest_path=paths["manifest"],
-                assets_dir=paths["assets_dir"],
-                result_zip_path=str(exported_zip),
+                full_md_path=visible_paths["full_md"],
+                content_list_path=visible_paths["content_list"],
+                manifest_path=visible_paths["manifest"],
+                assets_dir=visible_paths["assets_dir"],
+                result_zip_path=visible_paths["result_zip"],
                 message="Using existing parsed cache.",
             )
-            write_json(directory / "status.json", result.to_dict())
-            return result.to_dict()
+            result_dict = result.to_dict()
+            write_json(directory / "status.json", result_dict)
+            self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
+            return result_dict
 
-        cached_pdf = copy_pdf_to_cache(pdf, key, self.cache_dir)
         record_download(
-            pdf_path=str(cached_pdf),
+            pdf_path=str(pdf),
             paper_key_hint=key,
             source=source,
             paper_id=paper_id,
@@ -155,29 +161,28 @@ class MinerUParser:
         )
 
         mineru_dir.mkdir(parents=True, exist_ok=True)
-        (mineru_dir / "assets").mkdir(parents=True, exist_ok=True)
 
         errors: List[str] = []
         modes = self._mode_order()
         for mode in modes:
             try:
                 if mode == "local_api":
-                    payload = self._parse_with_local_api(cached_pdf)
+                    payload = self._parse_with_local_api(pdf)
                 elif mode == "extract":
-                    payload = self._parse_with_extract_api(cached_pdf, upload_name=pdf.name)
+                    payload = self._parse_with_extract_api(pdf, upload_name=pdf.name)
                 elif mode == "cloud_api":
-                    payload = self._parse_with_cloud_api(cached_pdf, upload_name=pdf.name)
+                    payload = self._parse_with_cloud_api(pdf, upload_name=pdf.name)
                 elif mode == "cli":
-                    payload = self._parse_with_cli(cached_pdf, mineru_dir)
+                    payload = self._parse_with_cli(pdf, mineru_dir)
                 elif mode == "pypdf":
-                    payload = self._parse_with_pypdf(cached_pdf)
+                    payload = self._parse_with_pypdf(pdf)
                 else:
                     continue
 
                 self._write_artifacts(
                     payload=payload,
                     key=key,
-                    pdf_path=cached_pdf,
+                    pdf_path=pdf,
                     mineru_dir=mineru_dir,
                     mode=mode,
                     result_zip_path=result_zip_path,
@@ -188,16 +193,17 @@ class MinerUParser:
                     parser=payload.get("parser", "mineru" if mode != "pypdf" else "pypdf"),
                     backend=payload.get("backend", self.backend if mode != "pypdf" else "pypdf"),
                     mode=mode,
-                    full_md_path=paths["full_md"],
-                    content_list_path=paths["content_list"],
-                    manifest_path=paths["manifest"],
-                    assets_dir=paths["assets_dir"],
-                    result_zip_path=str(result_zip_path),
+                    full_md_path=visible_paths["full_md"],
+                    content_list_path=visible_paths["content_list"],
+                    manifest_path=visible_paths["manifest"],
+                    assets_dir=visible_paths["assets_dir"],
+                    result_zip_path=visible_paths["result_zip"],
                     message="; ".join(errors),
                 )
-                write_json(directory / "status.json", result.to_dict())
-                self._export_result_zip(key, result_zip_path)
-                return result.to_dict()
+                result_dict = result.to_dict()
+                write_json(directory / "status.json", result_dict)
+                self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
+                return result_dict
             except Exception as exc:
                 errors.append(f"{mode}: {exc}")
                 continue
@@ -208,24 +214,28 @@ class MinerUParser:
             parser="mineru",
             backend=self.backend,
             mode=self.mode,
-            full_md_path=paths["full_md"],
-            content_list_path=paths["content_list"],
-            manifest_path=paths["manifest"],
-            assets_dir=paths["assets_dir"],
-            result_zip_path=str(result_zip_path),
+            full_md_path=visible_paths["full_md"],
+            content_list_path=visible_paths["content_list"],
+            manifest_path=visible_paths["manifest"],
+            assets_dir=visible_paths["assets_dir"],
+            result_zip_path=visible_paths["result_zip"],
             message=" | ".join(errors) if errors else "No parser mode attempted.",
         )
-        write_json(directory / "status.json", result.to_dict())
-        return result.to_dict()
+        result_dict = result.to_dict()
+        write_json(directory / "status.json", result_dict)
+        self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
+        return result_dict
 
     def health_check(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "mode": self.mode,
             "base_url": self.base_url,
             "backend": self.backend,
+            "auto_order": self._mode_order(),
+            "export_zip": self.export_zip,
             "extract_api": {"ok": False, "message": "", "base_url": self.extract_base_url},
-            "local_api": {"ok": False, "message": ""},
-            "cli": {"ok": False, "message": ""},
+            "local_api": {"ok": False, "message": "not checked by default"},
+            "cli": {"ok": False, "message": "not checked by default"},
             "pypdf": {"ok": False, "message": ""},
         }
 
@@ -242,17 +252,20 @@ class MinerUParser:
                 "base_url": self.extract_base_url,
             }
 
-        try:
-            response = requests.get(f"{self.base_url}/health", timeout=5)
-            result["local_api"] = {"ok": response.status_code < 500, "message": str(response.status_code)}
-        except Exception as exc:
-            result["local_api"] = {"ok": False, "message": str(exc)}
+        mode_order = set(self._mode_order())
+        if self.mode == "local_api" or "local_api" in mode_order:
+            try:
+                response = requests.get(f"{self.base_url}/health", timeout=5)
+                result["local_api"] = {"ok": response.status_code < 500, "message": str(response.status_code)}
+            except Exception as exc:
+                result["local_api"] = {"ok": False, "message": str(exc)}
 
-        command = shutil.which("mineru")
-        if command:
-            result["cli"] = {"ok": True, "message": command}
-        else:
-            result["cli"] = {"ok": False, "message": "mineru command not found on PATH"}
+        if self.mode == "cli" or "cli" in mode_order:
+            command = shutil.which("mineru")
+            if command:
+                result["cli"] = {"ok": True, "message": command}
+            else:
+                result["cli"] = {"ok": False, "message": "mineru command not found on PATH"}
 
         try:
             import pypdf  # noqa: F401
@@ -265,9 +278,18 @@ class MinerUParser:
 
     def _mode_order(self) -> List[str]:
         if self.mode == "auto":
-            if self.api_key:
-                return ["extract", "local_api", "cli", "pypdf"]
-            return ["local_api", "cli", "pypdf"]
+            configured = get_env("MINERU_AUTO_ORDER", "").strip()
+            if configured:
+                modes = [mode.strip().lower() for mode in configured.split(",") if mode.strip()]
+            elif self.api_key:
+                modes = ["extract", "local_api", "cli", "pypdf"]
+            else:
+                modes = ["local_api", "cli", "pypdf"]
+            deduped: List[str] = []
+            for mode in modes:
+                if mode in SUPPORTED_MODES and mode != "auto" and mode not in deduped:
+                    deduped.append(mode)
+            return deduped or ["pypdf"]
         return [self.mode]
 
     def _headers(self) -> Dict[str, str]:
@@ -454,16 +476,21 @@ class MinerUParser:
         if not command:
             raise FileNotFoundError("mineru command not found on PATH")
 
-        raw_dir = mineru_dir / "raw_cli"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir = Path(tempfile.mkdtemp(prefix="mineru_cli_"))
         cmd = [command, "-p", str(pdf_path), "-o", str(raw_dir)]
         if self.backend:
             cmd.extend(["-b", self.backend])
-        completed = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, check=False)
-        if completed.returncode != 0:
-            raise RuntimeError((completed.stderr or completed.stdout or "mineru CLI failed").strip())
+        try:
+            completed = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, check=False)
+            if completed.returncode != 0:
+                raise RuntimeError((completed.stderr or completed.stdout or "mineru CLI failed").strip())
 
-        return self._collect_files_from_dir(raw_dir, parser="mineru", mode="cli")
+            payload = self._collect_files_from_dir(raw_dir, parser="mineru", mode="cli")
+            payload["raw_dir_temporary"] = True
+            return payload
+        except Exception:
+            shutil.rmtree(raw_dir, ignore_errors=True)
+            raise
 
     def _parse_with_pypdf(self, pdf_path: Path) -> Dict[str, Any]:
         from pypdf import PdfReader
@@ -578,41 +605,50 @@ class MinerUParser:
         result_zip_path: Path,
     ) -> None:
         paths = get_cached_paths(key, self.cache_dir)
-        assets_dir = Path(paths["assets_dir"])
+        visible_paths = visible_artifact_paths(pdf_path)
+        assets_dir = Path(visible_paths["assets_dir"])
         assets_dir.mkdir(parents=True, exist_ok=True)
-        raw_dir = mineru_dir / "raw"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        stale_raw_dir = mineru_dir / "raw"
+        if stale_raw_dir.exists():
+            shutil.rmtree(stale_raw_dir)
 
         if payload.get("zip_bytes"):
-            zip_path = raw_dir / "mineru_result.zip"
-            zip_path.write_bytes(payload["zip_bytes"])
-            extracted = raw_dir / "zip"
-            if extracted.exists():
-                shutil.rmtree(extracted)
-            extracted.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(zip_path) as archive:
-                self._safe_extract_zip(archive, extracted)
-            api_raw = payload.get("raw", {})
-            collected = self._collect_files_from_dir(extracted, parser="mineru", mode=mode)
-            payload = {
-                **payload,
-                **collected,
-                "raw": {
-                    "api": api_raw,
-                    "archive": collected.get("raw", {}),
-                },
-            }
+            # The MinerU result zip is an intermediate transport artifact. Keep
+            # the normalized outputs only, so cache/export directories do not
+            # grow a redundant mineru/raw folder.
+            with tempfile.TemporaryDirectory(prefix="mineru_extract_") as tmp:
+                extracted = Path(tmp) / "zip"
+                extracted.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(BytesIO(payload["zip_bytes"])) as archive:
+                    self._safe_extract_zip(archive, extracted)
+                api_raw = payload.get("raw", {})
+                collected = self._collect_files_from_dir(extracted, parser="mineru", mode=mode)
+                self._copy_assets_from_raw(extracted, assets_dir)
+                collected.pop("raw_dir", None)
+                payload = {
+                    **payload,
+                    **collected,
+                    "raw": {
+                        "api": api_raw,
+                        "archive": collected.get("raw", {}),
+                    },
+                }
 
         raw_dir_value = payload.get("raw_dir")
         if raw_dir_value:
-            self._copy_assets_from_raw(Path(raw_dir_value), assets_dir)
+            raw_dir_path = Path(raw_dir_value)
+            try:
+                self._copy_assets_from_raw(raw_dir_path, assets_dir)
+            finally:
+                if payload.get("raw_dir_temporary"):
+                    shutil.rmtree(raw_dir_path, ignore_errors=True)
 
         markdown = payload.get("markdown") or self._markdown_from_content_list(payload.get("content_list", []))
         markdown = self._clean_text(markdown)
         content_list = self._normalize_content_list(payload.get("content_list") or [], markdown)
 
-        Path(paths["full_md"]).write_text(markdown or "", encoding="utf-8")
-        write_json(paths["content_list"], content_list)
+        Path(visible_paths["full_md"]).write_text(markdown or "", encoding="utf-8")
+        write_json(visible_paths["content_list"], content_list)
 
         manifest = {
             "paper_key": key,
@@ -622,37 +658,101 @@ class MinerUParser:
             "created_at": utc_now(),
             "source_pdf": str(pdf_path),
             "pdf_sha256": sha256_file(pdf_path),
-            "full_md_path": paths["full_md"],
-            "content_list_path": paths["content_list"],
-            "assets_dir": paths["assets_dir"],
+            "full_md_path": visible_paths["full_md"],
+            "content_list_path": visible_paths["content_list"],
+            "assets_dir": visible_paths["assets_dir"],
             "result_zip_path": str(result_zip_path),
+            "cache_manifest_path": paths["manifest"],
             "raw": payload.get("raw", {}),
         }
-        write_json(paths["manifest"], manifest)
+        write_json(visible_paths["manifest"], manifest)
+        cache_manifest = dict(manifest)
+        cache_manifest.update(
+            {
+                "visible_full_md_path": visible_paths["full_md"],
+                "visible_content_list_path": visible_paths["content_list"],
+                "visible_manifest_path": visible_paths["manifest"],
+                "visible_assets_dir": visible_paths["assets_dir"],
+            }
+        )
+        write_json(paths["manifest"], cache_manifest)
 
-    def _export_result_zip(self, key: str, output_zip: Path) -> Path:
+    def _export_visible_artifacts(self, *, key: str, visible_paths: Dict[str, str], result: Dict[str, Any]) -> Path:
         paths = get_cached_paths(key, self.cache_dir)
-        output_zip = output_zip.expanduser().resolve()
+        parsed_paths = resolved_parsed_paths(key, self.cache_dir)
+        export_dir = Path(visible_paths["export_dir"])
+        export_dir.mkdir(parents=True, exist_ok=True)
+        parse_succeeded = result.get("status") in {"ok", "cached"}
+
+        if not parse_succeeded:
+            for stale_file in ("full_md", "content_list", "manifest"):
+                target = Path(visible_paths[stale_file])
+                if target.exists():
+                    target.unlink()
+            stale_assets = Path(visible_paths["assets_dir"])
+            if stale_assets.exists():
+                shutil.rmtree(stale_assets)
+
+        file_entries = [(Path(paths["metadata"]), Path(visible_paths["metadata"]))]
+        if parse_succeeded:
+            file_entries.extend(
+                [
+                    (Path(parsed_paths["full_md"]), Path(visible_paths["full_md"])),
+                    (Path(parsed_paths["content_list"]), Path(visible_paths["content_list"])),
+                    (Path(parsed_paths["manifest"]), Path(visible_paths["manifest"])),
+                ]
+            )
+        for source, target in file_entries:
+            if source.exists() and source.is_file() and source.resolve() != target.resolve():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+        parsed_assets = Path(parsed_paths["assets_dir"])
+        visible_assets = Path(visible_paths["assets_dir"])
+        if (
+            parse_succeeded
+            and parsed_assets.exists()
+            and parsed_assets.is_dir()
+            and parsed_assets.resolve() != visible_assets.resolve()
+        ):
+            if visible_assets.exists():
+                shutil.rmtree(visible_assets)
+            shutil.copytree(parsed_assets, visible_assets)
+
+        visible_result = dict(result)
+        visible_result.update(
+            {
+                "full_md_path": visible_paths["full_md"],
+                "content_list_path": visible_paths["content_list"],
+                "manifest_path": visible_paths["manifest"],
+                "assets_dir": visible_paths["assets_dir"],
+                "result_zip_path": visible_paths["result_zip"],
+            }
+        )
+        write_json(visible_paths["status"], visible_result)
+        write_json(paths["status"], visible_result)
+
+        output_zip = Path(visible_paths["result_zip"]).expanduser().resolve()
+        if not self.export_zip:
+            if output_zip.exists():
+                output_zip.unlink()
+            return output_zip
+
+        return self._export_result_zip_from_visible(visible_paths)
+
+    @staticmethod
+    def _export_result_zip_from_visible(visible_paths: Dict[str, str]) -> Path:
+        output_zip = Path(visible_paths["result_zip"]).expanduser().resolve()
         output_zip.parent.mkdir(parents=True, exist_ok=True)
 
-        manifest_path = Path(paths["manifest"])
-        manifest = read_json(manifest_path, {}) or {}
-        if isinstance(manifest, dict):
-            manifest["result_zip_path"] = str(output_zip)
-            write_json(manifest_path, manifest)
-
         file_entries = [
-            ("full.md", Path(paths["full_md"])),
-            ("content_list.json", Path(paths["content_list"])),
-            ("manifest.json", Path(paths["manifest"])),
-            ("metadata.json", Path(paths["metadata"])),
-            ("status.json", Path(paths["status"])),
+            ("full.md", Path(visible_paths["full_md"])),
+            ("content_list.json", Path(visible_paths["content_list"])),
+            ("manifest.json", Path(visible_paths["manifest"])),
+            ("metadata.json", Path(visible_paths["metadata"])),
+            ("status.json", Path(visible_paths["status"])),
         ]
-        directory_entries = [
-            ("assets", Path(paths["assets_dir"])),
-            ("raw", Path(paths["mineru_dir"]) / "raw"),
-            ("raw_cli", Path(paths["mineru_dir"]) / "raw_cli"),
-        ]
+        directory_entries = [("assets", Path(visible_paths["assets_dir"]))]
 
         with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for arcname, path in file_entries:
