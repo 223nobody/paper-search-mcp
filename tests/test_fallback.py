@@ -83,6 +83,9 @@ class TestRepositoryFallbackNumericPaperId(unittest.TestCase):
     def test_numeric_paper_id_does_not_crash(self):
         class FakePaper:
             pdf_url = "https://example.org/oa.pdf"
+            title = "some title"
+            doi = ""
+            url = ""
             paper_id = 12345  # int, not str — caused 'int' object has no attribute 'strip'
 
         fake_searcher = type(
@@ -101,6 +104,35 @@ class TestRepositoryFallbackNumericPaperId(unittest.TestCase):
             )
             self.assertEqual(result, "/tmp/ok.pdf")
             self.assertEqual(err, "")
+
+    def test_repository_fallback_rejects_mismatched_title(self):
+        class FakePaper:
+            pdf_url = "https://example.org/wrong.pdf"
+            paper_id = "PMID:1"
+            title = "A Completely Different Biomedical Article"
+            doi = ""
+            url = ""
+
+        fake_searcher = type("S", (), {"search": staticmethod(lambda q, max_results=3: [FakePaper()])})
+
+        with patch.object(server, "openaire_searcher", fake_searcher), patch.object(
+            server, "core_searcher", fake_searcher
+        ), patch.object(server, "europepmc_searcher", fake_searcher), patch.object(
+            server, "pmc_searcher", fake_searcher
+        ), patch(
+            "paper_search_mcp.server._download_from_url",
+            new=AsyncMock(side_effect=AssertionError("mismatched repository result should not download")),
+        ):
+            result, err = asyncio.run(
+                server._try_repository_fallback(
+                    doi="",
+                    title="SkillCraft: Can LLM Agents Learn to Use Tools Skillfully?",
+                    save_path="/tmp",
+                )
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("did not match", err)
 
 
 if __name__ == "__main__":

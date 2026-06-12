@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 import shutil
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +33,18 @@ def papers_root(cache_dir: Optional[str] = None) -> Path:
 
 def sessions_root(cache_dir: Optional[str] = None) -> Path:
     root = cache_root(cache_dir) / "sessions"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def jobs_root(cache_dir: Optional[str] = None) -> Path:
+    root = cache_root(cache_dir) / "jobs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def mineru_batches_root(cache_dir: Optional[str] = None) -> Path:
+    root = cache_root(cache_dir) / "mineru_batches"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -211,6 +225,88 @@ def record_download(
     return payload
 
 
+def download_health_path(cache_dir: Optional[str] = None) -> Path:
+    return cache_root(cache_dir) / "download_health.json"
+
+
+def record_download_health(
+    *,
+    method: str,
+    source: str = "",
+    ok: bool,
+    elapsed_seconds: float = 0.0,
+    error: str = "",
+    cache_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    method_name = safe_slug(method or "download", default="download")
+    source_name = safe_slug(source or "global", default="global")
+    path = download_health_path(cache_dir)
+    payload = read_json(path, {}) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    methods = payload.setdefault("methods", {})
+    key = f"{source_name}:{method_name}"
+    entry = methods.get(key, {})
+    if not isinstance(entry, dict):
+        entry = {}
+
+    attempts = int(entry.get("attempts") or 0) + 1
+    successes = int(entry.get("successes") or 0) + (1 if ok else 0)
+    failures = int(entry.get("failures") or 0) + (0 if ok else 1)
+    total_elapsed = float(entry.get("total_elapsed_seconds") or 0.0) + max(0.0, float(elapsed_seconds or 0.0))
+    entry.update(
+        {
+            "method": method_name,
+            "source": source_name,
+            "attempts": attempts,
+            "successes": successes,
+            "failures": failures,
+            "success_rate": round(successes / attempts, 4) if attempts else 0,
+            "avg_elapsed_seconds": round(total_elapsed / attempts, 4) if attempts else 0,
+            "total_elapsed_seconds": round(total_elapsed, 4),
+            "last_status": "ok" if ok else "error",
+            "last_error": "" if ok else str(error or ""),
+            "updated_at": utc_now(),
+        }
+    )
+    methods[key] = entry
+    payload["updated_at"] = utc_now()
+    write_json(path, payload)
+    return entry
+
+
+def get_download_health(cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    payload = read_json(download_health_path(cache_dir), {}) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("methods", {})
+    payload["path"] = str(download_health_path(cache_dir))
+    return payload
+
+
+def rank_download_methods(
+    methods: List[str],
+    *,
+    source: str = "",
+    cache_dir: Optional[str] = None,
+) -> List[str]:
+    health = get_download_health(cache_dir)
+    stats = health.get("methods", {}) if isinstance(health, dict) else {}
+    source_name = safe_slug(source or "global", default="global")
+
+    def score(method: str) -> tuple[float, int]:
+        key = f"{source_name}:{safe_slug(method, default='download')}"
+        entry = stats.get(key, {}) if isinstance(stats, dict) else {}
+        attempts = int(entry.get("attempts") or 0) if isinstance(entry, dict) else 0
+        if attempts <= 0:
+            return (0.5, 0)
+        success_rate = float(entry.get("success_rate") or 0.0)
+        avg_elapsed = float(entry.get("avg_elapsed_seconds") or 0.0)
+        return (success_rate - min(avg_elapsed / 120.0, 0.25), -attempts)
+
+    return sorted(methods, key=score, reverse=True)
+
+
 def list_parsed(cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     root = papers_root(cache_dir)
     entries: List[Dict[str, Any]] = []
@@ -302,6 +398,254 @@ def list_assets(key: str, asset_type: str = "all", cache_dir: Optional[str] = No
     return assets
 
 
+def parsed_index_path(cache_dir: Optional[str] = None) -> Path:
+    return cache_root(cache_dir) / "parsed_index.sqlite3"
+
+
+def _connect_parsed_index(cache_dir: Optional[str] = None) -> sqlite3.Connection:
+    path = parsed_index_path(cache_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _ensure_parsed_index(connection: sqlite3.Connection) -> bool:
+    try:
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS parsed_blocks USING fts5(
+                paper_key UNINDEXED,
+                block_id UNINDEXED,
+                type UNINDEXED,
+                page UNINDEXED,
+                ord UNINDEXED,
+                text,
+                title,
+                doi,
+                source
+            )
+            """
+        )
+        connection.commit()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _parsed_block_text(item: Dict[str, Any]) -> str:
+    for name in ("text", "markdown", "content"):
+        value = item.get(name)
+        if value:
+            return str(value)
+    return ""
+
+
+def _fts_query(query: str) -> str:
+    tokens = re.findall(r"[\w]+|[\u4e00-\u9fff]+", query, flags=re.UNICODE)
+    if not tokens:
+        escaped = query.replace('"', '""')
+        return f'"{escaped}"'
+    return " ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def _snippet_from_text(text: str, query: str, radius: int = 160) -> str:
+    if not text:
+        return ""
+    needle = query.strip().lower()
+    haystack = text.lower()
+    index = haystack.find(needle) if needle else -1
+    if index < 0:
+        return text[: radius * 2].strip()
+    start = max(0, index - radius)
+    end = min(len(text), index + len(query) + radius)
+    return text[start:end].strip()
+
+
+def index_parsed_paper(key: str, cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Index one parsed paper into a lightweight SQLite FTS table."""
+    with closing(_connect_parsed_index(cache_dir)) as connection:
+        if not _ensure_parsed_index(connection):
+            return {
+                "status": "unavailable",
+                "paper_key": key,
+                "indexed": 0,
+                "index_path": str(parsed_index_path(cache_dir)),
+                "message": "SQLite FTS5 is not available.",
+            }
+
+        metadata = read_parsed(key, "metadata", cache_dir)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = read_parsed(key, "json", cache_dir)
+        rows: List[Dict[str, Any]] = []
+        if isinstance(content, list):
+            for index, item in enumerate(content):
+                if not isinstance(item, dict):
+                    continue
+                text = _parsed_block_text(item)
+                if not text:
+                    continue
+                rows.append(
+                    {
+                        "paper_key": key,
+                        "block_id": str(item.get("id", "")),
+                        "type": str(item.get("type", "")),
+                        "page": str(item.get("page", "")),
+                        "ord": str(item.get("order", index)),
+                        "text": text,
+                        "title": str(metadata.get("title", "")),
+                        "doi": str(metadata.get("doi", "")),
+                        "source": str(metadata.get("source", "")),
+                    }
+                )
+
+        if not rows:
+            markdown = read_parsed(key, "markdown", cache_dir)
+            if isinstance(markdown, str) and markdown.strip():
+                rows.append(
+                    {
+                        "paper_key": key,
+                        "block_id": "",
+                        "type": "markdown",
+                        "page": "",
+                        "ord": "0",
+                        "text": markdown,
+                        "title": str(metadata.get("title", "")),
+                        "doi": str(metadata.get("doi", "")),
+                        "source": str(metadata.get("source", "")),
+                    }
+                )
+
+        connection.execute("DELETE FROM parsed_blocks WHERE paper_key = ?", (key,))
+        if rows:
+            connection.executemany(
+                """
+                INSERT INTO parsed_blocks
+                    (paper_key, block_id, type, page, ord, text, title, doi, source)
+                VALUES
+                    (:paper_key, :block_id, :type, :page, :ord, :text, :title, :doi, :source)
+                """,
+                rows,
+            )
+        connection.commit()
+
+    return {
+        "status": "ok",
+        "paper_key": key,
+        "indexed": len(rows),
+        "index_path": str(parsed_index_path(cache_dir)),
+    }
+
+
+def rebuild_parsed_index(cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    with closing(_connect_parsed_index(cache_dir)) as connection:
+        if not _ensure_parsed_index(connection):
+            return {
+                "status": "unavailable",
+                "indexed": 0,
+                "papers": 0,
+                "index_path": str(parsed_index_path(cache_dir)),
+                "message": "SQLite FTS5 is not available.",
+            }
+        connection.execute("DELETE FROM parsed_blocks")
+        connection.commit()
+
+    indexed = 0
+    papers = 0
+    errors: Dict[str, str] = {}
+    for entry in list_parsed(cache_dir):
+        key = str(entry.get("paper_key") or "")
+        if not key or not entry.get("parsed"):
+            continue
+        papers += 1
+        try:
+            result = index_parsed_paper(key, cache_dir)
+            indexed += int(result.get("indexed") or 0)
+        except Exception as exc:
+            errors[key] = str(exc)
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "indexed": indexed,
+        "papers": papers,
+        "errors": errors,
+        "index_path": str(parsed_index_path(cache_dir)),
+    }
+
+
+def search_parsed_index(
+    query: str,
+    paper_key: str = "",
+    max_results: int = 20,
+    cache_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    needle = query.strip()
+    if not needle:
+        return []
+
+    try:
+        with closing(_connect_parsed_index(cache_dir)) as connection:
+            if not _ensure_parsed_index(connection):
+                raise sqlite3.OperationalError("SQLite FTS5 is not available")
+
+            where = "parsed_blocks MATCH ?"
+            params: List[Any] = [_fts_query(needle)]
+            if paper_key:
+                where += " AND paper_key = ?"
+                params.append(safe_slug(paper_key))
+            params.append(max(1, int(max_results)))
+            rows = connection.execute(
+                f"""
+                SELECT
+                    paper_key,
+                    block_id,
+                    type,
+                    page,
+                    ord,
+                    text,
+                    snippet(parsed_blocks, 5, '', '', '...', 32) AS snippet,
+                    bm25(parsed_blocks) AS rank
+                FROM parsed_blocks
+                WHERE {where}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+    except sqlite3.Error:
+        if paper_key:
+            return search_parsed(paper_key, query, max_results, cache_dir)
+        hits: List[Dict[str, Any]] = []
+        for entry in list_parsed(cache_dir):
+            key = str(entry.get("paper_key") or "")
+            if not key or not entry.get("parsed"):
+                continue
+            for hit in search_parsed(key, query, max_results - len(hits), cache_dir):
+                hit["paper_key"] = key
+                hits.append(hit)
+                if len(hits) >= max_results:
+                    return hits
+        return hits
+
+    hits = []
+    for row in rows:
+        text = str(row["text"] or "")
+        snippet = str(row["snippet"] or "").strip() or _snippet_from_text(text, query)
+        hits.append(
+            {
+                "paper_key": row["paper_key"],
+                "block_id": row["block_id"],
+                "type": row["type"],
+                "page": row["page"],
+                "order": row["ord"],
+                "snippet": snippet,
+                "rank": row["rank"],
+            }
+        )
+    return hits
+
+
 def search_parsed(key: str, query: str, max_results: int = 20, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     needle = query.strip().lower()
     if not needle:
@@ -359,6 +703,13 @@ def delete_cache(key: str, cache_dir: Optional[str] = None) -> bool:
     directory = papers_root(cache_dir) / safe_slug(key)
     if not directory.exists():
         return False
+    try:
+        with closing(_connect_parsed_index(cache_dir)) as connection:
+            if _ensure_parsed_index(connection):
+                connection.execute("DELETE FROM parsed_blocks WHERE paper_key = ?", (safe_slug(key),))
+                connection.commit()
+    except sqlite3.Error:
+        pass
     shutil.rmtree(directory)
     return True
 
@@ -579,3 +930,49 @@ def delete_search_session(selection_token: str, cache_dir: Optional[str] = None)
         return False
     path.unlink()
     return True
+
+
+def _parse_job_path(job_id: str, cache_dir: Optional[str] = None) -> Path:
+    return jobs_root(cache_dir) / f"{safe_slug(job_id, default='parse_job')}.json"
+
+
+def write_parse_job(job_id: str, payload: Dict[str, Any], cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    stored = dict(payload)
+    stored["job_id"] = job_id
+    stored["updated_at"] = stored.get("updated_at") or utc_now()
+    write_json(_parse_job_path(job_id, cache_dir), stored)
+    return stored
+
+
+def read_parse_job(job_id: str, cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    payload = read_json(_parse_job_path(job_id, cache_dir), {}) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def list_parse_job_records(cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for path in sorted(jobs_root(cache_dir).glob("*.json")):
+        payload = read_json(path, {}) or {}
+        if not isinstance(payload, dict):
+            continue
+        payload.setdefault("job_id", path.stem)
+        records.append(payload)
+    records.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return records
+
+
+def mineru_batch_path(batch_key: str, cache_dir: Optional[str] = None) -> Path:
+    return mineru_batches_root(cache_dir) / f"{safe_slug(batch_key, default='mineru_batch')}.json"
+
+
+def read_mineru_batch(batch_key: str, cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    payload = read_json(mineru_batch_path(batch_key, cache_dir), {}) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_mineru_batch(batch_key: str, payload: Dict[str, Any], cache_dir: Optional[str] = None) -> Dict[str, Any]:
+    stored = dict(payload)
+    stored["batch_key"] = batch_key
+    stored["updated_at"] = utc_now()
+    write_json(mineru_batch_path(batch_key, cache_dir), stored)
+    return stored

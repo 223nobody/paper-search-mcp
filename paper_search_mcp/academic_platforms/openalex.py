@@ -104,9 +104,13 @@ class OpenAlexSearcher(PaperSource):
                 pdf_url = ""
 
                 primary_location = item.get("primary_location")
+                venue = ""
                 if primary_location:
                     url = primary_location.get("landing_page_url", "")
                     pdf_url = primary_location.get("pdf_url", "")
+                    source_info = primary_location.get("source") or {}
+                    if isinstance(source_info, dict):
+                        venue = source_info.get("display_name", "")
 
                 if not url:
                     url = item.get("id", "")
@@ -145,6 +149,11 @@ class OpenAlexSearcher(PaperSource):
                         categories=concepts[:5],  # Keep top 5 concepts to reduce size
                         doi=doi,
                         citations=item.get("cited_by_count", 0),
+                        extra={
+                            "venue": venue,
+                            "publication_date": pub_date_str or "",
+                            "openalex_id": item.get("id", ""),
+                        },
                     )
                 )
 

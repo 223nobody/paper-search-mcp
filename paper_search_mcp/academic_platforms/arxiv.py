@@ -59,6 +59,8 @@ class ArxivSearcher(PaperSource):
                 for link in entry.links:
                     if link.get('title') == 'doi':
                         doi = doi or extract_doi(link.href)
+                primary_category = entry.get("arxiv_primary_category", {}).get("term", "")
+                journal_ref = entry.get("arxiv_journal_ref", "") or entry.get("journal_ref", "")
 
                 papers.append(Paper(
                     paper_id=entry.id.split('/')[-1],
@@ -72,7 +74,11 @@ class ArxivSearcher(PaperSource):
                     source='arxiv',
                     categories=[tag.term for tag in entry.tags],
                     keywords=[],
-                    doi=doi
+                    doi=doi,
+                    extra={
+                        "primary_category": primary_category,
+                        "journal_ref": journal_ref,
+                    }
                 ))
             except Exception as e:
                 print(f"Error parsing arXiv entry: {e}")
@@ -80,7 +86,8 @@ class ArxivSearcher(PaperSource):
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         pdf_url = f"https://arxiv.org/pdf/{paper_id}.pdf"
-        response = requests.get(pdf_url)
+        response = requests.get(pdf_url, timeout=30)
+        response.raise_for_status()
         os.makedirs(save_path, exist_ok=True)
         output_file = f"{save_path}/{paper_id}.pdf"
         with open(output_file, 'wb') as f:

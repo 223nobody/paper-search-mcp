@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -15,20 +18,28 @@ import requests
 
 from ..cache import (
     get_cached_paths,
+    index_parsed_paper,
+    mineru_batches_root,
     paper_dir,
     paper_key,
     read_json,
+    read_mineru_batch,
     record_download,
     resolved_parsed_paths,
     sha256_file,
     utc_now,
     visible_artifact_paths,
     write_json,
+    write_mineru_batch,
 )
 from ..config import get_env
 
 
 SUPPORTED_MODES = {"auto", "extract", "local_api", "cloud_api", "cli", "pypdf"}
+
+
+def sha256_file_from_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
 
 @dataclass
@@ -90,12 +101,13 @@ class MinerUParser:
         self.extract_enable_formula = self._env_bool("MINERU_ENABLE_FORMULA", True)
         self.extract_enable_table = self._env_bool("MINERU_ENABLE_TABLE", True)
         self.extract_page_ranges = get_env("MINERU_PAGE_RANGES", "")
-        self.export_zip = self._env_bool("MINERU_EXPORT_ZIP", True)
+        self.export_zip = self._env_bool("MINERU_EXPORT_ZIP", False)
         self.extract_extra_formats = [
             value.strip()
             for value in get_env("MINERU_EXTRA_FORMATS", "").split(",")
             if value.strip()
         ]
+        self._ensure_extract_oss_no_proxy()
 
     def parse_pdf(
         self,
@@ -146,6 +158,7 @@ class MinerUParser:
             result_dict = result.to_dict()
             write_json(directory / "status.json", result_dict)
             self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
+            self._attach_index_status(key, visible_paths, result_dict)
             return result_dict
 
         record_download(
@@ -203,6 +216,7 @@ class MinerUParser:
                 result_dict = result.to_dict()
                 write_json(directory / "status.json", result_dict)
                 self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
+                self._attach_index_status(key, visible_paths, result_dict)
                 return result_dict
             except Exception as exc:
                 errors.append(f"{mode}: {exc}")
@@ -225,6 +239,135 @@ class MinerUParser:
         write_json(directory / "status.json", result_dict)
         self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result_dict)
         return result_dict
+
+    def parse_pdfs(self, items: List[Any], *, force: bool = False) -> List[Dict[str, Any]]:
+        """Parse multiple PDFs, using MinerU extract batch when it is the first viable mode."""
+        normalized = self._normalize_parse_items(items)
+        if not normalized:
+            return []
+
+        if len(normalized) < 2 or not self._batch_extract_enabled():
+            return [self.parse_pdf(**item, force=force) for item in normalized]
+
+        cached_results: Dict[int, Dict[str, Any]] = {}
+        pending: List[Dict[str, Any]] = []
+        for index, item in enumerate(normalized):
+            pdf = Path(item["pdf_path"]).expanduser().resolve()
+            key = paper_key(
+                paper_key_hint=item.get("paper_key_hint", ""),
+                doi=item.get("doi", ""),
+                source=item.get("source", ""),
+                paper_id=item.get("paper_id", ""),
+                title=item.get("title", ""),
+                pdf_path=str(pdf),
+            )
+            parsed_paths = resolved_parsed_paths(key, self.cache_dir)
+            if not force and Path(parsed_paths["full_md"]).exists() and Path(parsed_paths["manifest"]).exists():
+                cached_results[index] = self.parse_pdf(**item, force=False)
+                continue
+
+            pending.append({**item, "index": index, "pdf": pdf, "paper_key": key})
+
+        batch_results: Dict[int, Dict[str, Any]] = {}
+        if pending:
+            batch_key = self._batch_key(pending)
+            reusable_payloads, pending_for_extract, batch_manifest = self._load_reusable_batch_payloads(
+                batch_key,
+                pending,
+                force=force,
+            )
+            try:
+                if pending_for_extract:
+                    payloads, failures = self._parse_with_extract_api_batch(
+                        pending_for_extract,
+                        batch_key=batch_key,
+                        manifest=batch_manifest,
+                    )
+                else:
+                    payloads, failures = {}, {}
+                payloads.update(reusable_payloads)
+            except Exception as exc:
+                payloads, failures = dict(reusable_payloads), {
+                    str(item["paper_key"]): f"batch extract failed: {exc}" for item in pending_for_extract
+                }
+
+            for item in pending:
+                index = int(item["index"])
+                key = str(item["paper_key"])
+                payload = payloads.get(key)
+                if not payload:
+                    batch_results[index] = self.parse_pdf(
+                        item["pdf_path"],
+                        paper_key_hint=item.get("paper_key_hint", ""),
+                        source=item.get("source", ""),
+                        paper_id=item.get("paper_id", ""),
+                        doi=item.get("doi", ""),
+                        title=item.get("title", ""),
+                        force=force,
+                    )
+                    if failures.get(key):
+                        message = str(batch_results[index].get("message") or "")
+                        prefix = f"extract_batch: {failures[key]}"
+                        batch_results[index]["message"] = f"{prefix}; {message}" if message else prefix
+                    continue
+
+                pdf = Path(item["pdf"]).expanduser().resolve()
+                record_download(
+                    pdf_path=str(pdf),
+                    paper_key_hint=key,
+                    source=item.get("source", ""),
+                    paper_id=item.get("paper_id", ""),
+                    doi=item.get("doi", ""),
+                    title=item.get("title", ""),
+                    downloader="parser-input",
+                    legal_status="user_provided_or_previously_downloaded",
+                    cache_dir=self.cache_dir,
+                )
+                directory = paper_dir(key, self.cache_dir)
+                mineru_dir = directory / "mineru"
+                mineru_dir.mkdir(parents=True, exist_ok=True)
+                visible_paths = visible_artifact_paths(pdf)
+                result_zip_path = Path(visible_paths["result_zip"])
+                try:
+                    self._write_artifacts(
+                        payload=payload,
+                        key=key,
+                        pdf_path=pdf,
+                        mineru_dir=mineru_dir,
+                        mode="extract",
+                        result_zip_path=result_zip_path,
+                    )
+                    result = ParseResult(
+                        paper_key=key,
+                        status="ok",
+                        parser=payload.get("parser", "mineru"),
+                        backend=payload.get("backend", self.extract_model_version),
+                        mode="extract",
+                        full_md_path=visible_paths["full_md"],
+                        content_list_path=visible_paths["content_list"],
+                        manifest_path=visible_paths["manifest"],
+                        assets_dir=visible_paths["assets_dir"],
+                        result_zip_path=visible_paths["result_zip"],
+                    ).to_dict()
+                    write_json(directory / "status.json", result)
+                    self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result)
+                    self._attach_index_status(key, visible_paths, result)
+                    batch_results[index] = result
+                except Exception as exc:
+                    fallback = self.parse_pdf(
+                        item["pdf_path"],
+                        paper_key_hint=item.get("paper_key_hint", ""),
+                        source=item.get("source", ""),
+                        paper_id=item.get("paper_id", ""),
+                        doi=item.get("doi", ""),
+                        title=item.get("title", ""),
+                        force=True,
+                    )
+                    message = str(fallback.get("message") or "")
+                    fallback["message"] = f"extract_batch_write: {exc}; {message}" if message else f"extract_batch_write: {exc}"
+                    batch_results[index] = fallback
+
+        return [cached_results.get(index) or batch_results[index] for index in range(len(normalized))]
 
     def health_check(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -292,6 +435,97 @@ class MinerUParser:
             return deduped or ["pypdf"]
         return [self.mode]
 
+    def _batch_extract_enabled(self) -> bool:
+        if not self.api_key:
+            return False
+        order = self._mode_order()
+        return bool(order and order[0] in {"extract", "cloud_api"})
+
+    def _batch_key(self, entries: List[Dict[str, Any]]) -> str:
+        parts = [
+            self.extract_model_version,
+            self.extract_language,
+            str(self.extract_is_ocr),
+            str(self.extract_enable_formula),
+            str(self.extract_enable_table),
+            self.extract_page_ranges,
+        ]
+        for entry in sorted(entries, key=lambda item: str(item.get("paper_key") or "")):
+            pdf = Path(entry["pdf"]).expanduser().resolve()
+            parts.append(f"{entry.get('paper_key')}:{sha256_file(pdf)}")
+        return "mineru_batch_" + self._safe_data_id("_".join(parts))[:48] + "_" + sha256_file_from_text("|".join(parts))[:12]
+
+    def _batch_zip_path(self, batch_key: str, paper_key_value: str) -> Path:
+        directory = mineru_batches_root(self.cache_dir) / self._safe_data_id(batch_key)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{self._safe_data_id(paper_key_value)}.zip"
+
+    def _load_reusable_batch_payloads(
+        self,
+        batch_key: str,
+        entries: List[Dict[str, Any]],
+        *,
+        force: bool,
+    ) -> tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        manifest = read_mineru_batch(batch_key, self.cache_dir)
+        files = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        if force or not isinstance(files, dict):
+            return {}, entries, manifest if isinstance(manifest, dict) else {}
+
+        reusable: Dict[str, Dict[str, Any]] = {}
+        pending: List[Dict[str, Any]] = []
+        for entry in entries:
+            key = str(entry["paper_key"])
+            record = files.get(key, {})
+            zip_path = Path(str(record.get("zip_path") or ""))
+            if record.get("status") == "downloaded" and zip_path.exists():
+                reusable[key] = {
+                    "parser": "mineru",
+                    "backend": self.extract_model_version,
+                    "mode": "extract",
+                    "zip_bytes": zip_path.read_bytes(),
+                    "raw": {
+                        "batch_key": batch_key,
+                        "batch_id": manifest.get("batch_id", ""),
+                        "data_id": record.get("data_id", ""),
+                        "extract_result": record.get("extract_result", {}),
+                        "zip_url": record.get("zip_url", ""),
+                        "reused_cached_batch_zip": True,
+                    },
+                }
+            else:
+                pending.append(entry)
+        return reusable, pending, manifest if isinstance(manifest, dict) else {}
+
+    def _write_batch_manifest(self, batch_key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        return write_mineru_batch(batch_key, manifest, self.cache_dir)
+
+    @staticmethod
+    def _normalize_parse_items(items: List[Any]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, (str, Path)):
+                raw: Dict[str, Any] = {"pdf_path": str(item)}
+            elif isinstance(item, dict):
+                raw = dict(item)
+            else:
+                raise TypeError(f"Unsupported parse batch item: {item!r}")
+
+            pdf_path = str(raw.get("pdf_path") or raw.get("path") or "").strip()
+            if not pdf_path:
+                raise ValueError("Batch parse item is missing pdf_path")
+            normalized.append(
+                {
+                    "pdf_path": pdf_path,
+                    "paper_key_hint": str(raw.get("paper_key") or raw.get("paper_key_hint") or ""),
+                    "source": str(raw.get("source") or ""),
+                    "paper_id": str(raw.get("paper_id") or ""),
+                    "doi": str(raw.get("doi") or ""),
+                    "title": str(raw.get("title") or ""),
+                }
+            )
+        return normalized
+
     def _headers(self) -> Dict[str, str]:
         headers = {"Accept": "application/json, application/zip, */*"}
         if self.api_key:
@@ -312,6 +546,39 @@ class MinerUParser:
         if value in {"0", "false", "no", "n", "off"}:
             return False
         return default
+
+    def _ensure_extract_oss_no_proxy(self) -> None:
+        """Bypass local/system proxies for MinerU's Aliyun OSS upload URLs."""
+        if not self._env_bool("MINERU_OSS_NO_PROXY", True):
+            return
+
+        hosts = [
+            value.strip()
+            for value in get_env(
+                "MINERU_OSS_NO_PROXY_HOSTS",
+                ".aliyuncs.com,mineru.oss-cn-shanghai.aliyuncs.com",
+            ).split(",")
+            if value.strip()
+        ]
+        if not hosts:
+            return
+
+        merged: List[str] = []
+        seen: set[str] = set()
+        for key in ("NO_PROXY", "no_proxy"):
+            for value in os.environ.get(key, "").split(","):
+                value = value.strip()
+                if value and value.lower() not in seen:
+                    merged.append(value)
+                    seen.add(value.lower())
+        for host in hosts:
+            if host.lower() not in seen:
+                merged.append(host)
+                seen.add(host.lower())
+
+        value = ",".join(merged)
+        os.environ["NO_PROXY"] = value
+        os.environ["no_proxy"] = value
 
     def _parse_with_local_api(self, pdf_path: Path) -> Dict[str, Any]:
         endpoint = f"{self.base_url}/file_parse"
@@ -402,6 +669,186 @@ class MinerUParser:
             },
         }
 
+    def _parse_with_extract_api_batch(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        batch_key: str = "",
+        manifest: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+        if not self.api_key:
+            raise ValueError("PAPER_SEARCH_MCP_MINERU_API_KEY is required for extract mode")
+
+        batch_entries: List[Dict[str, Any]] = []
+        used_data_ids: set[str] = set()
+        for index, entry in enumerate(entries, start=1):
+            pdf = Path(entry["pdf"]).expanduser().resolve()
+            if not pdf.exists():
+                raise FileNotFoundError(f"PDF not found: {pdf}")
+            upload_name = pdf.name
+            public_stem = Path(upload_name).stem or pdf.stem
+            data_id = self._safe_data_id(f"{public_stem}_{sha256_file(pdf)[:12]}")
+            if data_id in used_data_ids:
+                data_id = self._safe_data_id(f"{data_id}_{index}")
+            used_data_ids.add(data_id)
+            file_payload: Dict[str, Any] = {
+                "name": upload_name,
+                "data_id": data_id,
+                "is_ocr": self.extract_is_ocr,
+            }
+            if self.extract_page_ranges:
+                file_payload["page_ranges"] = self.extract_page_ranges
+            batch_entries.append({**entry, "pdf": pdf, "data_id": data_id, "file_payload": file_payload})
+
+        batch_key = batch_key or self._batch_key(batch_entries)
+        manifest = dict(manifest or {})
+        manifest.update(
+            {
+                "batch_key": batch_key,
+                "status": "submitting",
+                "model_version": self.extract_model_version,
+                "language": self.extract_language,
+                "created_at": manifest.get("created_at") or utc_now(),
+                "files": manifest.get("files") if isinstance(manifest.get("files"), dict) else {},
+            }
+        )
+        for entry in batch_entries:
+            key = str(entry["paper_key"])
+            manifest["files"][key] = {
+                **manifest["files"].get(key, {}),
+                "paper_key": key,
+                "pdf_path": str(entry["pdf"]),
+                "pdf_sha256": sha256_file(entry["pdf"]),
+                "data_id": entry["data_id"],
+                "status": "queued",
+            }
+        self._write_batch_manifest(batch_key, manifest)
+
+        payload: Dict[str, Any] = {
+            "files": [entry["file_payload"] for entry in batch_entries],
+            "model_version": self.extract_model_version,
+            "enable_formula": self.extract_enable_formula,
+            "enable_table": self.extract_enable_table,
+            "language": self.extract_language,
+        }
+        if self.extract_extra_formats:
+            payload["extra_formats"] = self.extract_extra_formats
+
+        upload_info = self._post_extract_json("/file-urls/batch", payload)
+        batch_id = str(upload_info.get("batch_id") or "").strip()
+        file_urls = upload_info.get("file_urls") or []
+        if not batch_id or not isinstance(file_urls, list) or len(file_urls) < len(batch_entries):
+            raise RuntimeError("MinerU extract did not return enough batch upload URLs")
+
+        manifest["batch_id"] = batch_id
+        manifest["status"] = "uploading"
+        for entry in batch_entries:
+            manifest["files"][str(entry["paper_key"])]["status"] = "uploading"
+        self._write_batch_manifest(batch_key, manifest)
+
+        def upload_one(entry: Dict[str, Any], upload_url_value: Any) -> None:
+            upload_url = self._extract_upload_url(upload_url_value)
+            with Path(entry["pdf"]).open("rb") as fh:
+                response = requests.put(upload_url, data=fh, timeout=self.timeout)
+            response.raise_for_status()
+
+        upload_workers = self._batch_worker_count("MINERU_UPLOAD_CONCURRENCY", len(batch_entries))
+        with ThreadPoolExecutor(max_workers=upload_workers) as executor:
+            futures = [
+                executor.submit(upload_one, entry, file_urls[index])
+                for index, entry in enumerate(batch_entries)
+            ]
+            for future in as_completed(futures):
+                future.result()
+
+        manifest["status"] = "polling"
+        for entry in batch_entries:
+            file_record = manifest["files"][str(entry["paper_key"])]
+            file_record["status"] = "uploaded"
+        self._write_batch_manifest(batch_key, manifest)
+
+        done, failures = self._wait_for_extract_batch_all(
+            batch_id=batch_id,
+            data_ids=[entry["data_id"] for entry in batch_entries],
+        )
+
+        payloads: Dict[str, Dict[str, Any]] = {}
+        data_id_to_entry = {str(entry["data_id"]): entry for entry in batch_entries}
+        for data_id, result in done.items():
+            entry = data_id_to_entry.get(str(data_id))
+            if not entry:
+                continue
+            file_record = manifest["files"][str(entry["paper_key"])]
+            file_record["status"] = "done"
+            file_record["extract_result"] = result
+            file_record["zip_url"] = str(result.get("full_zip_url") or "")
+        for data_id, message in failures.items():
+            entry = data_id_to_entry.get(str(data_id))
+            if not entry:
+                continue
+            file_record = manifest["files"][str(entry["paper_key"])]
+            file_record["status"] = "failed"
+            file_record["error"] = message
+        self._write_batch_manifest(batch_key, manifest)
+
+        def download_zip(entry: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+            key = str(entry["paper_key"])
+            data_id = str(entry["data_id"])
+            extract_result = done[data_id]
+            zip_url = str(extract_result.get("full_zip_url") or "").strip()
+            if not zip_url:
+                raise RuntimeError("MinerU extract finished without full_zip_url")
+            zip_response = requests.get(zip_url, timeout=self.timeout)
+            zip_response.raise_for_status()
+            if not zip_response.content.startswith(b"PK"):
+                content_type = zip_response.headers.get("content-type", "")
+                raise RuntimeError(f"MinerU result URL did not return a zip file (content-type={content_type})")
+            zip_path = self._batch_zip_path(batch_key, key)
+            zip_path.write_bytes(zip_response.content)
+            return key, {
+                "parser": "mineru",
+                "backend": self.extract_model_version,
+                "mode": "extract",
+                "zip_bytes": zip_response.content,
+                "raw": {
+                    "batch_key": batch_key,
+                    "batch_id": batch_id,
+                    "data_id": data_id,
+                    "extract_result": extract_result,
+                    "zip_url": zip_url,
+                    "zip_path": str(zip_path),
+                    "batch_size": len(batch_entries),
+                },
+            }
+
+        download_entries = [entry for entry in batch_entries if entry["data_id"] in done]
+        download_workers = self._batch_worker_count("MINERU_DOWNLOAD_CONCURRENCY", len(download_entries))
+        with ThreadPoolExecutor(max_workers=download_workers) as executor:
+            future_map = {executor.submit(download_zip, entry): entry for entry in download_entries}
+            for future in as_completed(future_map):
+                entry = future_map[future]
+                try:
+                    key, result_payload = future.result()
+                    payloads[key] = result_payload
+                    file_record = manifest["files"][key]
+                    file_record["status"] = "downloaded"
+                    file_record["zip_path"] = result_payload["raw"].get("zip_path", "")
+                except Exception as exc:
+                    failures[str(entry["paper_key"])] = str(exc)
+                    file_record = manifest["files"][str(entry["paper_key"])]
+                    file_record["status"] = "failed"
+                    file_record["error"] = str(exc)
+
+        data_id_to_key = {str(entry["data_id"]): str(entry["paper_key"]) for entry in batch_entries}
+        keyed_failures = {
+            data_id_to_key.get(str(data_id), str(data_id)): message
+            for data_id, message in failures.items()
+        }
+        manifest["status"] = "ok" if not keyed_failures else "partial" if payloads else "failed"
+        manifest["failures"] = keyed_failures
+        self._write_batch_manifest(batch_key, manifest)
+        return payloads, keyed_failures
+
     def _post_extract_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         endpoint = f"{self.extract_base_url}{path}"
         response = requests.post(endpoint, headers=self._headers(), json=payload, timeout=self.timeout)
@@ -460,6 +907,61 @@ class MinerUParser:
             time.sleep(max(1.0, self.extract_poll_interval))
 
         raise TimeoutError(f"MinerU extract batch {batch_id} timed out; last_state={last_state or 'unknown'}")
+
+    def _wait_for_extract_batch_all(
+        self,
+        *,
+        batch_id: str,
+        data_ids: List[str],
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+        deadline = time.time() + self.timeout
+        pending = set(data_ids)
+        done: Dict[str, Dict[str, Any]] = {}
+        failures: Dict[str, str] = {}
+        last_state = ""
+
+        while pending and time.time() < deadline:
+            data = self._get_extract_json(f"/extract-results/batch/{batch_id}")
+            results = data.get("extract_result") or data.get("extract_results") or data.get("results") or []
+            if not isinstance(results, list):
+                raise RuntimeError(f"MinerU batch result is not a list: {data}")
+
+            by_id = {
+                str(item.get("data_id") or ""): item
+                for item in results
+                if isinstance(item, dict) and item.get("data_id")
+            }
+            for data_id in list(pending):
+                selected = by_id.get(data_id)
+                if not selected:
+                    continue
+                state = str(selected.get("state") or "").lower()
+                last_state = state or last_state
+                if state in {"done", "completed", "success", "succeeded"}:
+                    done[data_id] = selected
+                    pending.remove(data_id)
+                elif state in {"failed", "error"}:
+                    failures[data_id] = str(selected.get("err_msg") or "MinerU extract task failed")
+                    pending.remove(data_id)
+
+            if pending:
+                time.sleep(max(1.0, self.extract_poll_interval))
+
+        if pending:
+            for data_id in pending:
+                failures[data_id] = f"MinerU extract batch {batch_id} timed out; last_state={last_state or 'unknown'}"
+        return done, failures
+
+    @staticmethod
+    def _batch_worker_count(env_name: str, item_count: int) -> int:
+        if item_count <= 0:
+            return 1
+        raw = get_env(env_name, "").strip()
+        try:
+            configured = int(raw) if raw else min(4, item_count)
+        except ValueError:
+            configured = min(4, item_count)
+        return max(1, min(configured, item_count))
 
     @staticmethod
     def _select_extract_result(results: List[Dict[str, Any]], data_id: str) -> Dict[str, Any]:
@@ -740,6 +1242,15 @@ class MinerUParser:
 
         return self._export_result_zip_from_visible(visible_paths)
 
+    def _attach_index_status(self, key: str, visible_paths: Dict[str, str], result: Dict[str, Any]) -> None:
+        try:
+            result["index"] = index_parsed_paper(key, self.cache_dir)
+        except Exception as exc:
+            result["index"] = {"status": "error", "message": str(exc)}
+        paths = get_cached_paths(key, self.cache_dir)
+        write_json(paths["status"], result)
+        write_json(visible_paths["status"], result)
+
     @staticmethod
     def _export_result_zip_from_visible(visible_paths: Dict[str, str]) -> Path:
         output_zip = Path(visible_paths["result_zip"]).expanduser().resolve()
@@ -885,6 +1396,18 @@ def parse_pdf_with_mineru(
         title=title,
         force=force,
     )
+
+
+def parse_pdfs_with_mineru(
+    items: List[Any],
+    *,
+    mode: str = "auto",
+    backend: str = "",
+    cache_dir: str = "",
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    parser = MinerUParser(mode=mode, backend=backend, cache_dir=cache_dir)
+    return parser.parse_pdfs(items, force=force)
 
 
 def mineru_health_check(mode: str = "auto", backend: str = "", cache_dir: str = "") -> Dict[str, Any]:

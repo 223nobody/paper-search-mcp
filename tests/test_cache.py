@@ -48,6 +48,60 @@ class TestPaperCache(unittest.TestCase):
             self.assertEqual(len(hits), 1)
             self.assertEqual(hits[0]["block_id"], "b1")
 
+    def test_parsed_index_searches_across_papers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+            cache.record_download(
+                pdf_path=str(pdf),
+                paper_key_hint="indexed-paper",
+                source="local",
+                title="Indexed Paper",
+                cache_dir=tmp,
+            )
+            visible = cache.visible_artifact_paths(pdf)
+            cache.write_json(
+                visible["content_list"],
+                [
+                    {"id": "b1", "type": "paragraph", "text": "Graph retrieval benefits from FTS search."},
+                    {"id": "b2", "type": "paragraph", "text": "Another block."},
+                ],
+            )
+            Path(visible["full_md"]).write_text("Graph retrieval benefits from FTS search.", encoding="utf-8")
+            cache.write_json(visible["manifest"], {"parser": "mineru", "backend": "test"})
+
+            indexed = cache.index_parsed_paper("indexed-paper", cache_dir=tmp)
+            hits = cache.search_parsed_index("retrieval", max_results=5, cache_dir=tmp)
+
+            self.assertEqual(indexed["status"], "ok")
+            self.assertEqual(indexed["indexed"], 2)
+            self.assertEqual(hits[0]["paper_key"], "indexed-paper")
+            self.assertEqual(hits[0]["block_id"], "b1")
+
+    def test_download_health_records_and_ranks_methods(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache.record_download_health(method="primary", source="arxiv", ok=False, elapsed_seconds=10, cache_dir=tmp)
+            cache.record_download_health(method="unpaywall", source="arxiv", ok=True, elapsed_seconds=2, cache_dir=tmp)
+
+            health = cache.get_download_health(cache_dir=tmp)
+            ranked = cache.rank_download_methods(["primary", "unpaywall"], source="arxiv", cache_dir=tmp)
+
+            self.assertIn("arxiv:unpaywall", health["methods"])
+            self.assertEqual(ranked[0], "unpaywall")
+
+    def test_parse_job_and_mineru_batch_records_are_persistent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache.write_parse_job("job-1", {"status": "completed", "created_at": "2026-06-12"}, cache_dir=tmp)
+            cache.write_mineru_batch("batch-1", {"status": "partial", "files": {"paper": {"status": "downloaded"}}}, cache_dir=tmp)
+
+            job = cache.read_parse_job("job-1", cache_dir=tmp)
+            jobs = cache.list_parse_job_records(cache_dir=tmp)
+            batch = cache.read_mineru_batch("batch-1", cache_dir=tmp)
+
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(jobs[0]["job_id"], "job-1")
+            self.assertEqual(batch["files"]["paper"]["status"], "downloaded")
+
     def test_read_parsed_prefers_visible_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "paper.pdf"

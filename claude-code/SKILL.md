@@ -1,124 +1,120 @@
 ---
 name: paper-search
-description: Search, download, and read academic papers from 20+ sources (arXiv, PubMed, Semantic Scholar, CrossRef, etc). Use when the user asks to find papers, search for research, look up academic literature, download a paper PDF, or extract text from a paper.
+description: MCP-first academic paper workflow. Use when the user asks to find papers, search academic literature, download PDFs, parse papers with MinerU, inspect parsed paper caches, or build a small research corpus.
 ---
 
 # Paper Search
 
-Search, download, and read academic papers via the `paper-search` CLI.
+Use the `paper-search-mcp` MCP tools first. Do not open a terminal, activate
+`.venv`, or run `uv run` for normal paper search/download/parse requests when
+MCP tools are available.
 
-## CLI Usage
+The CLI is only a fallback when the MCP server/tools are unavailable or the
+user explicitly asks for command-line usage.
 
-All commands run via:
+## MCP-First Workflow
+
+For natural-language requests, prefer one high-level tool:
+
+- `paper_research_workflow(query, intent="search_download_parse", count=5, max_results_per_source=5, sources="", year=None, ranking_profile="", selection_mode="auto_top", selected_indices="", save_path="~/Desktop/papers", use_scihub=False, parse_mode="auto", backend="", force=False, parse_execution="background", download_concurrency=0)`
+
+This is the default entry point for requests like:
+
+- "Find recent papers about X"
+- "Download the top 5 papers about X"
+- "Find and parse papers about X"
+- "Build me a small corpus on X"
+
+Default behavior:
+
+1. Search with the configured fast profile unless sources are provided.
+2. Rank and persist a selection session.
+3. Download the top `count` papers unless the request is search-only or manual selection.
+4. If parsing is requested, submit a background parse job via MCP and return `parse_job.job_id`.
+5. Return PDF paths, parse prompt/session metadata, and the next MCP tool to call.
+
+Use `parse_execution="sync"` only when the user explicitly wants to wait in the
+current call. Otherwise keep `parse_execution="background"` so the MCP call
+returns quickly.
+
+Do not pass `save_path` unless the user explicitly requests a custom directory.
+The MCP default resolves to `~/Desktop/papers`.
+
+## Intent Mapping
+
+- Search only: call `paper_research_workflow(intent="search_only")`.
+- Search with user choice: call `paper_research_workflow(intent="search_only", selection_mode="manual")`, then use the returned checkbox App or numbered fallback.
+- Download top papers: call `paper_research_workflow(intent="search_download", count=<n>)`.
+- Download and parse top papers: call `paper_research_workflow(intent="search_download_parse", count=<n>, parse_execution="background")`.
+- Parse existing local PDFs: call `parse_pdf_with_mineru` or `parse_pdfs_with_mineru`; do not use the CLI.
+- Check parse progress: call `get_parse_job_status(job_id)`.
+- Read parsed results: call `list_parsed_papers`, `get_parsed_paper`, `search_parsed_papers`, `get_paper_assets`, or `get_parsed_paths`.
+
+## Selection UI
+
+For hosts with MCP Apps, use the returned `app` field or call:
+
+- `render_paper_selection_app(selection_token, ...)`
+
+For hosts without MCP Apps, show the returned `numbered_fallback` and pass the
+user's indices to:
+
+- `download_selected_papers(selection_token, selected_indices="1,3")`
+- `submit_parse_job(selection_token, selected_indices="all")`
+- `parse_selected_papers(selection_token, selected_indices="all")` only when synchronous parsing is desired.
+
+If a user asks to choose papers before downloading, do not auto-download. Return
+the selection UI/fallback first.
+
+## MinerU Setup
+
+Use MCP tools for configuration and health checks:
+
+- `mineru_setup_status()`
+- `render_mineru_api_key_setup_app(reason="missing")`
+- `configure_mineru_api_key(api_key)`
+- `mineru_health_check(mode="auto")`
+
+If parsing returns `mineru_api_key_prompt`, surface the MCP App/config prompt.
+Do not ask the user to edit shell profiles or activate a virtual environment.
+
+## Lower-Level MCP Tools
+
+Use these only when the high-level workflow is not specific enough:
+
+- `search_papers(query, max_results_per_source=5, sources="", year=None)`
+- `crawl_papers_for_selection(query, max_results_per_source=5, sources="", year=None, ranking_profile="")`
+- `search_papers_with_elicitation(query, max_results_per_source=5, sources="", year=None, save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
+- `search_papers_for_parsing(query, max_results_per_source=5, sources="", year=None)`
+- `download_selected_papers(selection_token, selected_indices="all", save_path="~/Desktop/papers", use_scihub=False, concurrency=0)`
+- `submit_parse_job(selection_token, selected_indices="all", save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
+- `get_parse_job_status(job_id)`
+- `list_parse_jobs()`
+- `cancel_parse_job(job_id)`
+- `parse_pdf_with_mineru(pdf_path, paper_key="", source="", paper_id="", doi="", title="", mode="auto", backend="", force=False)`
+- `parse_pdfs_with_mineru(pdf_paths, mode="auto", backend="", force=False)`
+
+## CLI Fallback Only
+
+Use the CLI only if MCP tools are unavailable or the user explicitly requests a
+terminal command.
+
+All CLI commands run via:
+
 ```bash
 uv run --directory <REPO_PATH> paper-search <command> [args]
 ```
 
-Replace `<REPO_PATH>` with the absolute path to your clone of this repository.
+Examples:
 
-### Search
 ```bash
-uv run --directory <REPO_PATH> paper-search search "<query>" -n <max_per_source> -s <sources> -y <year>
-```
-- `-n`: results per source (default: 5)
-- `-s`: comma-separated sources or "all" (default: all)
-- `-y`: year filter for Semantic Scholar (e.g. "2020", "2018-2022")
-
-For speed, prefer targeted sources (`-s arxiv,semantic,crossref`) over "all" unless broad coverage is needed.
-
-### Download PDF
-```bash
-uv run --directory <REPO_PATH> paper-search download <source> <paper_id> [-o ~/Desktop/papers]
-```
-
-### Read (extract text)
-```bash
-uv run --directory <REPO_PATH> paper-search read <source> <paper_id> [-o ~/Desktop/papers]
-```
-
-### Parse PDF (MinerU-first, pypdf fallback)
-```bash
+uv run --directory <REPO_PATH> paper-search search "<query>" -n 5 -s arxiv,semantic,openalex
 uv run --directory <REPO_PATH> paper-search parse <pdf_path> --paper-key <key> --mode auto
-```
-- `--mode auto`: with `PAPER_SEARCH_MCP_MINERU_API_KEY`, try MinerU official extract API first; then local MinerU API, MinerU CLI, and pypdf fallback
-- `--mode extract`: force MinerU official extract API only
-- `--mode pypdf`: force lightweight PDF text extraction
-- `--force`: re-parse even if cached
-- The parse command writes artifacts beside the PDF in `<pdf_stem>_mineru/` plus a same-name result zip, e.g. `paper.pdf` -> `paper_mineru/` and `paper.zip`
-- `.paper_search_cache` stores metadata/status/session indexes only; do not expect duplicate PDFs or duplicate parsed Markdown/assets there
-
-### MCP Elicitation Selection
-
-For MCP clients with elicitation support, prefer:
-
-- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
-
-This searches papers, asks the client to show a native multi-select form, then
-parses the selected papers with the MinerU pipeline. In VS Code Copilot Agent
-Mode this can appear as a multi-select control; the exact checkbox/dropdown
-appearance is controlled by the client.
-
-The same prompt is triggered after any MCP download/read tool saves a PDF. In
-elicitation-capable clients the server asks for selected PDFs immediately; in
-plain clients the tool result includes `parse_prompt.selection_token` plus a
-numbered paper list for `parse_selected_papers`.
-
-### MCP Numbered Selection Fallback
-
-If the MCP client cannot provide elicitation UI, use the backend session flow:
-
-1. Call MCP tool `search_papers_for_parsing`.
-2. Show the returned numbered `papers` list to the user.
-3. Ask the user to choose indices such as `1,3,5`, `2-4`, or `all`.
-4. Call MCP tool `parse_selected_papers` with the returned `selection_token` and selected indices.
-
-Useful MCP tools for this flow:
-- `search_papers_with_elicitation(query, max_results_per_source=5, sources="all", year=None, save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
-- `search_papers_for_parsing(query, max_results_per_source=5, sources="all", year=None)`
-- `parse_selected_papers(selection_token, selected_indices="all", save_path="~/Desktop/papers", use_scihub=False, mode="auto", backend="", force=False)`
-- `list_search_sessions()`
-- `get_search_session(selection_token)`
-- `delete_search_session(selection_token)`
-
-### Parsed Artifacts By Paper Key
-```bash
 uv run --directory <REPO_PATH> paper-search cache list
-uv run --directory <REPO_PATH> paper-search cache get <paper_key> -f markdown
-uv run --directory <REPO_PATH> paper-search cache search <paper_key> "<query>"
-uv run --directory <REPO_PATH> paper-search cache assets <paper_key>
-uv run --directory <REPO_PATH> paper-search cache paths <paper_key>
-```
-These commands resolve from the lightweight cache index back to the PDF-side `<pdf_stem>_mineru/` artifacts when available.
-
-### Parser Health
-```bash
-uv run --directory <REPO_PATH> paper-search mineru-health
 ```
 
-### List sources
-```bash
-uv run --directory <REPO_PATH> paper-search sources
-```
-
-## Output
-
-`search` and `download` return JSON. `read` returns plain text. Config warnings go to stderr and can be ignored.
-
-## Sources
-
-arxiv, pubmed, biorxiv, medrxiv, google_scholar, iacr, semantic, crossref, openalex, pmc, core, europepmc, dblp, openaire, citeseerx, doaj, base, zenodo, hal, ssrn, unpaywall
-
-Optional (env vars): ieee (`IEEE_API_KEY`), acm (`ACM_API_KEY`)
-
-## Workflow
-
-1. Search with targeted sources to find papers
-2. Present results as a table: title, authors, year, source, DOI/URL
-3. For MCP clients with elicitation support, use `search_papers_with_elicitation`
-4. For MCP clients without elicitation UI, use `search_papers_for_parsing`, ask for numbered selections, then call `parse_selected_papers`
-5. If the user wants a single PDF, use `download <source> <paper_id>` and report the saved path
-6. If the user wants agent-ready full text from a local file, use `parse <pdf_path>` and then `cache get <paper_key>`
-7. If MinerU API token is configured, prefer `--mode auto` or `--mode extract`; otherwise use `--mode pypdf` as a fallback
+Never activate `.venv` just to use the CLI fallback; `uv run --directory` is
+self-contained.
 
 ## Environment
 

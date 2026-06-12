@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, List
 
 from .config import get_env
@@ -35,14 +36,18 @@ from .academic_platforms.ssrn import SSRNSearcher
 from .cache import (
     cleanup_redundant_artifacts,
     delete_cache,
+    get_download_health,
+    index_parsed_paper,
     list_assets,
     list_parsed,
     read_parsed,
+    rebuild_parsed_index,
     record_download,
     resolved_parsed_paths,
     search_parsed,
+    search_parsed_index,
 )
-from .parsers.mineru import mineru_health_check, parse_pdf_with_mineru
+from .parsers.mineru import mineru_health_check, parse_pdf_with_mineru, parse_pdfs_with_mineru
 from .utils import DEFAULT_SAVE_PATH, resolve_save_path
 
 # ---------------------------------------------------------------------------
@@ -99,11 +104,24 @@ ALL_SOURCES = [
     "ssrn", "unpaywall",
 ]
 
+FAST_SOURCES = ["arxiv", "semantic", "openalex", "crossref", "pubmed", "pmc", "europepmc"]
+SEARCH_PROFILES = {
+    "fast": FAST_SOURCES,
+    "default": FAST_SOURCES,
+    "deep": ALL_SOURCES,
+    "all": ALL_SOURCES,
+}
+SEARCH_TIMEOUT_ENV = "SEARCH_TIMEOUT_SECONDS"
+SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
+
 
 def _parse_sources(sources: str) -> List[str]:
-    if not sources or sources.strip().lower() == "all":
-        return [s for s in ALL_SOURCES if s in SEARCHERS]
-    normalized = [p.strip().lower() for p in sources.split(",") if p.strip()]
+    value = (sources or "").strip().lower()
+    if not value:
+        value = get_env("SEARCH_PROFILE", "fast").strip().lower() or "fast"
+    if value in SEARCH_PROFILES:
+        return [source for source in SEARCH_PROFILES[value] if source in SEARCHERS]
+    normalized = [p.strip().lower() for p in value.split(",") if p.strip()]
     return [s for s in normalized if s in SEARCHERS]
 
 
@@ -141,54 +159,63 @@ async def _async_search(searcher: Any, query: str, max_results: int, **kwargs) -
     return [p.to_dict() for p in papers]
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = get_env(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+async def _search_source_with_timeout(
+    source: str,
+    operation: Any,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        if timeout_seconds > 0:
+            output = await asyncio.wait_for(operation, timeout=timeout_seconds)
+        else:
+            output = await operation
+        return {
+            "source": source,
+            "output": output or [],
+            "error": "",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+    except asyncio.TimeoutError:
+        return {
+            "source": source,
+            "output": [],
+            "error": f"timed out after {timeout_seconds:g}s",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "timed_out": True,
+        }
+    except Exception as exc:
+        return {
+            "source": source,
+            "output": [],
+            "error": str(exc),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
 async def cmd_search(args: argparse.Namespace) -> int:
-    _init_searchers()
-    selected = _parse_sources(args.sources)
-    if not selected:
-        print(json.dumps({"error": "No valid sources selected", "available": sorted(SEARCHERS.keys())}))
-        return 1
+    from . import server
 
-    tasks = {}
-    for src in selected:
-        searcher = SEARCHERS[src]
-        extra = {}
-        if src == "semantic" and args.year:
-            extra["year"] = args.year
-        tasks[src] = _async_search(searcher, args.query, args.max_results, **extra)
-
-    names = list(tasks.keys())
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-    merged: List[Dict[str, Any]] = []
-    errors: Dict[str, str] = {}
-    source_counts: Dict[str, int] = {}
-
-    for name, result in zip(names, results):
-        if isinstance(result, Exception):
-            errors[name] = str(result)
-            source_counts[name] = 0
-        else:
-            source_counts[name] = len(result)
-            for p in result:
-                if not p.get("source"):
-                    p["source"] = name
-                merged.append(p)
-
-    deduped = _dedupe(merged)
-
-    output = {
-        "query": args.query,
-        "sources_used": names,
-        "source_results": source_counts,
-        "errors": errors,
-        "total": len(deduped),
-        "papers": deduped,
-    }
-    print(json.dumps(output, indent=2, default=str))
+    output = await server.search_papers(
+        query=args.query,
+        max_results_per_source=args.max_results,
+        sources=args.sources,
+        year=args.year,
+    )
+    print(json.dumps(output, indent=2, ensure_ascii=False, default=str))
     return 0
 
 
@@ -261,6 +288,27 @@ async def cmd_parse(args: argparse.Namespace) -> int:
     return 0 if result.get("status") in {"ok", "cached"} else 1
 
 
+async def cmd_parse_batch(args: argparse.Namespace) -> int:
+    items = [{"pdf_path": path} for path in args.pdf_paths]
+    results = await asyncio.to_thread(
+        parse_pdfs_with_mineru,
+        items,
+        mode=args.mode,
+        backend=args.backend or "",
+        force=args.force,
+    )
+    parsed = sum(1 for result in results if result.get("status") in {"ok", "cached"})
+    payload = {
+        "status": "ok" if parsed == len(results) else "partial" if parsed else "failed",
+        "results": results,
+        "total": len(results),
+        "parsed": parsed,
+        "failed": len(results) - parsed,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0 if parsed == len(results) else 1
+
+
 async def cmd_mineru_health(args: argparse.Namespace) -> int:
     result = await asyncio.to_thread(mineru_health_check, mode=args.mode, backend=args.backend or "")
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -287,6 +335,22 @@ async def cmd_cache(args: argparse.Namespace) -> int:
     if action == "search":
         result = search_parsed(args.paper_key, args.query, args.max_results)
         print(json.dumps({"hits": result, "total": len(result)}, indent=2, ensure_ascii=False))
+        return 0
+    if action == "search-index":
+        result = search_parsed_index(args.query, args.paper_key or "", args.max_results)
+        print(json.dumps({"hits": result, "total": len(result)}, indent=2, ensure_ascii=False))
+        return 0
+    if action == "index":
+        result = index_parsed_paper(args.paper_key)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("status") == "ok" else 1
+    if action == "rebuild-index":
+        result = rebuild_parsed_index()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("status") in {"ok", "partial"} else 1
+    if action == "download-health":
+        result = get_download_health()
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     if action == "paths":
         result = resolved_parsed_paths(args.paper_key)
@@ -319,8 +383,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_search = sub.add_parser("search", help="Search for papers across academic platforms")
     p_search.add_argument("query", help="Search query")
     p_search.add_argument("-n", "--max-results", type=int, default=5, help="Max results per source (default: 5)")
-    p_search.add_argument("-s", "--sources", default="all",
-                          help="Comma-separated sources or 'all' (default: all)")
+    p_search.add_argument("-s", "--sources", default="",
+                          help="Comma-separated sources or profile fast/deep/all (default: PAPER_SEARCH_MCP_SEARCH_PROFILE or fast)")
     p_search.add_argument("-y", "--year", default=None,
                           help="Year filter for Semantic Scholar (e.g. '2020', '2018-2022')")
 
@@ -352,6 +416,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_parse.add_argument("--backend", default="", help="MinerU backend, e.g. pipeline/vlm/hybrid")
     p_parse.add_argument("--force", action="store_true", help="Re-parse even if cached")
 
+    # parse-batch
+    p_parse_batch = sub.add_parser("parse-batch", help="Parse multiple local PDFs, using MinerU extract batch when available")
+    p_parse_batch.add_argument("pdf_paths", nargs="+", help="Path(s) to local PDFs")
+    p_parse_batch.add_argument("--mode", default="auto", choices=["auto", "extract", "local_api", "cloud_api", "cli", "pypdf"],
+                               help="Parser mode (default: auto)")
+    p_parse_batch.add_argument("--backend", default="", help="MinerU backend, e.g. pipeline/vlm/hybrid")
+    p_parse_batch.add_argument("--force", action="store_true", help="Re-parse even if cached")
+
     # mineru-health
     p_health = sub.add_parser("mineru-health", help="Check MinerU API key setup and pypdf fallback")
     p_health.add_argument("--mode", default="auto", choices=["auto", "extract", "local_api", "cloud_api", "cli", "pypdf"])
@@ -375,6 +447,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_cache_search.add_argument("paper_key")
     p_cache_search.add_argument("query")
     p_cache_search.add_argument("-n", "--max-results", type=int, default=20)
+
+    p_cache_search_index = cache_sub.add_parser("search-index", help="Search the parsed-paper SQLite FTS index")
+    p_cache_search_index.add_argument("query")
+    p_cache_search_index.add_argument("--paper-key", default="", help="Optional paper key filter")
+    p_cache_search_index.add_argument("-n", "--max-results", type=int, default=20)
+
+    p_cache_index = cache_sub.add_parser("index", help="Index one parsed paper into SQLite FTS")
+    p_cache_index.add_argument("paper_key")
+
+    cache_sub.add_parser("rebuild-index", help="Rebuild the parsed-paper SQLite FTS index")
+    cache_sub.add_parser("download-health", help="Show persistent download fallback health stats")
 
     p_cache_paths = cache_sub.add_parser("paths", help="Show cache file paths")
     p_cache_paths.add_argument("paper_key")
@@ -401,6 +484,7 @@ def main() -> None:
         "read": cmd_read,
         "sources": cmd_sources,
         "parse": cmd_parse,
+        "parse-batch": cmd_parse_batch,
         "mineru-health": cmd_mineru_health,
         "cache": cmd_cache,
     }

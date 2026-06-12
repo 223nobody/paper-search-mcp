@@ -1,5 +1,6 @@
 # tests/test_server.py
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from pypdf import PdfWriter
 
 from paper_search_mcp import server
+from paper_search_mcp import cli
 
 class TestPaperSearchServer(unittest.TestCase):
     def test_all_sources_include_new_platforms(self):
@@ -32,6 +34,52 @@ class TestPaperSearchServer(unittest.TestCase):
 
         self.assertEqual(parsed, server.FAST_SOURCES)
 
+    def test_cli_parse_sources_defaults_to_fast_profile(self):
+        with patch.dict(os.environ, {"PAPER_SEARCH_MCP_SEARCH_PROFILE": "fast"}):
+            cli.SEARCHERS.clear()
+            cli._init_searchers()
+            parsed = cli._parse_sources("")
+
+        self.assertEqual(parsed, [source for source in cli.FAST_SOURCES if source in cli.SEARCHERS])
+        self.assertNotIn("google_scholar", parsed)
+
+    def test_cli_search_reuses_server_search_papers(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "query": "agent skill",
+                "sources": "arxiv,semantic",
+                "max_results": 7,
+                "year": "2026",
+            },
+        )()
+        payload = {
+            "query": "agent skill",
+            "sources_used": ["arxiv", "semantic"],
+            "source_results": {"arxiv": 1},
+            "errors": {},
+            "papers": [{"title": "Agent Skill Libraries"}],
+            "total": 1,
+        }
+
+        with patch(
+            "paper_search_mcp.server.search_papers",
+            new=AsyncMock(return_value=payload),
+        ) as search_mock, patch(
+            "builtins.print",
+        ) as print_mock:
+            exit_code = asyncio.run(cli.cmd_search(args))
+
+        self.assertEqual(exit_code, 0)
+        search_mock.assert_awaited_once_with(
+            query="agent skill",
+            max_results_per_source=7,
+            sources="arxiv,semantic",
+            year="2026",
+        )
+        self.assertEqual(json.loads(print_mock.call_args.args[0]), payload)
+
     def test_search_papers_uses_cache_for_repeated_query(self):
         async def fake_search_arxiv(query, max_results):
             return [{"title": "Cached Paper", "paper_id": "1", "source": "arxiv"}]
@@ -54,6 +102,33 @@ class TestPaperSearchServer(unittest.TestCase):
         self.assertTrue(second["cache"]["hit"])
         self.assertEqual(second["total"], 1)
         search_mock.assert_awaited_once()
+
+    def test_dedupe_papers_merges_sources_and_scores_pdf_results(self):
+        papers = [
+            {
+                "title": "Neural Retrieval Systems",
+                "authors": "A. Author",
+                "source": "semantic",
+                "paper_id": "s1",
+                "doi": "10.1000/retrieval",
+            },
+            {
+                "title": "Neural Retrieval Systems",
+                "authors": "A. Author",
+                "source": "arxiv",
+                "paper_id": "a1",
+                "doi": "10.1000/retrieval",
+                "pdf_url": "https://example.org/paper.pdf",
+            },
+        ]
+
+        deduped = server._dedupe_papers(papers, query="neural retrieval")
+
+        self.assertEqual(len(deduped), 1)
+        self.assertIn("semantic", deduped[0]["sources"])
+        self.assertIn("arxiv", deduped[0]["sources"])
+        self.assertGreater(deduped[0]["score"], 0)
+        self.assertEqual(deduped[0]["pdf_url"], "https://example.org/paper.pdf")
 
     def test_list_sources_exposes_capabilities(self):
         result = asyncio.run(server.list_sources())
@@ -81,6 +156,43 @@ class TestPaperSearchServer(unittest.TestCase):
                 )
             self.assertEqual(result["status"], "ok")
             self.assertTrue(Path(result["full_md_path"]).exists())
+
+    def test_download_from_url_streams_to_temp_then_final_pdf(self):
+        class FakeStreamResponse:
+            status_code = 200
+            headers = {"content-type": "application/pdf"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def aiter_bytes(self, chunk_size=0):
+                yield b"%PDF-1.4\n"
+                yield b"%%EOF"
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url):
+                return FakeStreamResponse()
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "paper_search_mcp.server.httpx.AsyncClient",
+            FakeClient,
+        ):
+            result = asyncio.run(server._download_from_url("https://example.org/paper.pdf", tmp, "streamed"))
+            self.assertTrue(result.endswith("streamed.pdf"))
+            self.assertTrue(Path(result).exists())
+            self.assertTrue(Path(result).read_bytes().startswith(b"%PDF"))
 
     def test_search_arxiv(self):
         """Test the search_arxiv tool returns 10 results."""

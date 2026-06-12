@@ -46,18 +46,31 @@ from .cache import (
     create_search_session as cache_create_search_session,
     delete_cache,
     delete_search_session as cache_delete_search_session,
+    get_download_health,
     get_search_session as cache_get_search_session,
+    index_parsed_paper,
     list_assets,
     list_parsed,
+    list_parse_job_records,
     list_search_sessions as cache_list_search_sessions,
+    rank_download_methods,
     read_parsed,
+    read_parse_job,
+    rebuild_parsed_index,
     record_download,
+    record_download_health,
     resolved_parsed_paths,
     search_parsed,
+    search_parsed_index,
+    sha256_file,
+    utc_now,
+    write_json,
+    write_parse_job,
 )
 from .parsers.mineru import (
     mineru_health_check as run_mineru_health_check,
     parse_pdf_with_mineru as run_parse_pdf_with_mineru,
+    parse_pdfs_with_mineru as run_parse_pdfs_with_mineru,
 )
 
 # from .academic_platforms.hub import SciHubSearcher
@@ -72,6 +85,7 @@ SEARCH_TIMEOUT_ENV = "SEARCH_TIMEOUT_SECONDS"
 SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
 SEARCH_CACHE_TTL_ENV = "SEARCH_CACHE_TTL_SECONDS"
 PARSE_CONCURRENCY_ENV = "PARSE_CONCURRENCY"
+DOWNLOAD_CONCURRENCY_ENV = "DOWNLOAD_CONCURRENCY"
 PAPER_SELECTION_WIDGET_URI = "ui://paper-search/paper-selection.html"
 PAPER_SELECTION_WIDGET_TOOL = "render_paper_selection_app"
 MINERU_KEY_WIDGET_URI = "ui://paper-search/mineru-api-key.html"
@@ -86,6 +100,8 @@ _LOCAL_SELECTION_THREAD: Optional[threading.Thread] = None
 _LOCAL_SELECTION_BASE_URL = ""
 _LOCAL_SELECTION_PAGES: Dict[str, Dict[str, Any]] = {}
 _SEARCH_RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
+_PARSE_JOBS: Dict[str, Dict[str, Any]] = {}
+_PARSE_JOB_LOCK = threading.Lock()
 
 
 def _split_env_csv(value: str) -> List[str]:
@@ -196,21 +212,34 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
     for paper in papers if isinstance(papers, list) else []:
         index = paper.get("index")
         disabled = paper.get("parse_ready") is False or not isinstance(index, int)
-        meta_bits = [
-            str(paper.get("source") or ""),
-            str(paper.get("year") or ""),
-            str(paper.get("paper_id") or ""),
-            str(paper.get("doi") or ""),
-            str(paper.get("reason") or ""),
-        ]
-        meta = " | ".join(bit for bit in meta_bits if bit)
+        published = str(paper.get("published_date") or paper.get("year") or "Not available")
+        venue = str(paper.get("publication_venue") or "Not available")
+        original_url = str(paper.get("original_url") or paper.get("url") or paper.get("pdf_url") or "")
+        doi = str(paper.get("doi") or "")
+        source = str(paper.get("source") or "unknown")
+        paper_id = str(paper.get("paper_id") or "")
+        link_html = (
+            '<a class="paper-link" href="{href}" target="_blank" rel="noopener noreferrer">{label}</a>'.format(
+                href=html_escape(original_url, quote=True),
+                label=html_escape(original_url),
+            )
+            if original_url
+            else '<span class="muted-value">Not available</span>'
+        )
         rows.append(
             """
             <label class="paper{disabled_class}">
-              <input type="checkbox" name="paper" value="{index}" {disabled}>
-              <span>
-                <span class="title">{index}. {title}</span>
-                <span class="meta">{meta}</span>
+              <input class="paper-check" type="checkbox" name="paper" value="{index}" {disabled}>
+              <span class="paper-body">
+                <span class="title"><span class="index">{index}.</span> {title}</span>
+                <span class="meta-grid">
+                  <span><b>Published</b><em>{published}</em></span>
+                  <span><b>Journal / Venue</b><em>{venue}</em></span>
+                  <span><b>Source</b><em>{source}</em></span>
+                  <span><b>Paper ID</b><em>{paper_id}</em></span>
+                  <span><b>DOI</b><em>{doi}</em></span>
+                  <span class="url-field"><b>Original URL</b><em>{link}</em></span>
+                </span>
               </span>
             </label>
             """.format(
@@ -218,7 +247,12 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
                 index=html_escape(str(index or "")),
                 disabled="disabled" if disabled else "",
                 title=html_escape(str(paper.get("title") or "Untitled")),
-                meta=html_escape(meta),
+                published=html_escape(published),
+                venue=html_escape(venue),
+                source=html_escape(source),
+                paper_id=html_escape(paper_id or "Not available"),
+                doi=html_escape(doi or "Not available"),
+                link=link_html,
             )
         )
 
@@ -244,23 +278,33 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Paper selector</title>
   <style>
-    :root {{ color-scheme: light dark; --bg: #eef3f7; --glass: rgba(255, 255, 255, .68); --glass-strong: rgba(255, 255, 255, .84); --text: #111827; --muted: #667085; --line: rgba(15, 23, 42, .13); --accent: #0f766e; --accent-strong: #0b5f59; --danger: #b42318; --disabled: rgba(148, 163, 184, .18); --shadow: 0 24px 70px rgba(15, 23, 42, .18); }}
-    @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0d1117; --glass: rgba(22, 27, 34, .70); --glass-strong: rgba(31, 37, 46, .84); --text: #f8fafc; --muted: #aeb7c5; --line: rgba(226, 232, 240, .14); --accent: #2dd4bf; --accent-strong: #5eead4; --danger: #f97066; --disabled: rgba(71, 85, 105, .28); --shadow: 0 28px 80px rgba(0, 0, 0, .38); }} }}
+    :root {{ color-scheme: light dark; --bg: #eaf0f3; --glass: rgba(255, 255, 255, .58); --glass-strong: rgba(255, 255, 255, .78); --paper: rgba(255, 255, 255, .48); --paper-hover: rgba(255, 255, 255, .68); --text: #13202f; --muted: #627086; --line: rgba(33, 52, 72, .14); --accent: #12766f; --accent-strong: #0c5f72; --ink: #203650; --danger: #a33a31; --disabled: rgba(145, 158, 171, .20); --shadow: 0 28px 90px rgba(49, 72, 95, .20); }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --bg: #0d1419; --glass: rgba(20, 29, 38, .66); --glass-strong: rgba(33, 45, 57, .78); --paper: rgba(24, 37, 49, .52); --paper-hover: rgba(35, 52, 67, .70); --text: #f4f7fb; --muted: #a8b5c4; --line: rgba(226, 232, 240, .14); --accent: #37c5b3; --accent-strong: #78c6e7; --ink: #dbeafe; --danger: #f97066; --disabled: rgba(71, 85, 105, .32); --shadow: 0 28px 80px rgba(0, 0, 0, .42); }} }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; background: linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #dbeafe 28%)); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 14px; line-height: 1.45; }}
-    main {{ min-height: 100vh; padding: 18px; display: grid; place-items: start center; }}
-    .shell {{ width: min(100%, 860px); margin: 0 auto; background: linear-gradient(180deg, var(--glass-strong), var(--glass)); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); backdrop-filter: blur(22px) saturate(150%); -webkit-backdrop-filter: blur(22px) saturate(150%); }}
-    header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 18px 20px 15px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, rgba(255, 255, 255, .18), transparent); }}
-    h1 {{ margin: 0; font-size: 18px; font-weight: 700; }}
+    body {{ margin: 0; background: radial-gradient(circle at 18% 0%, rgba(18, 118, 111, .14), transparent 32%), radial-gradient(circle at 78% 10%, rgba(58, 98, 143, .16), transparent 30%), linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #f5efe1 18%)); color: var(--text); font-family: "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif; font-size: 14px; line-height: 1.48; }}
+    main {{ min-height: 100vh; padding: 28px 18px; display: grid; place-items: start center; }}
+    .shell {{ width: min(75vw, 1440px); min-width: min(100%, 820px); margin: 0 auto; background: linear-gradient(180deg, var(--glass-strong), var(--glass)); border: 1px solid rgba(255,255,255,.56); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow); backdrop-filter: blur(26px) saturate(155%); -webkit-backdrop-filter: blur(26px) saturate(155%); }}
+    header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 22px 24px 18px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, rgba(255, 255, 255, .30), transparent); }}
+    h1 {{ margin: 0; font-size: 20px; font-weight: 720; color: var(--ink); }}
+    h1::after {{ content: "MinerU-ready literature workspace"; display: block; margin-top: 4px; color: var(--muted); font-size: 12px; font-weight: 500; }}
     .token {{ max-width: 46%; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; text-align: right; }}
-    .list {{ display: grid; max-height: 58vh; overflow: auto; padding: 6px 0; scrollbar-width: thin; }}
-    .paper {{ display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--line); transition: background .16s ease, border-color .16s ease; }}
-    .paper:hover {{ background: rgba(255, 255, 255, .22); }}
+    .list {{ display: grid; gap: 10px; max-height: 62vh; overflow: auto; padding: 14px; scrollbar-width: thin; }}
+    .paper {{ display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--paper); transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease; }}
+    .paper:hover {{ background: var(--paper-hover); border-color: color-mix(in srgb, var(--accent), var(--line) 65%); box-shadow: 0 12px 30px rgba(32, 54, 80, .10); transform: translateY(-1px); }}
     .paper.disabled {{ background: var(--disabled); color: var(--muted); }}
     input[type="checkbox"] {{ width: 17px; height: 17px; margin-top: 2px; accent-color: var(--accent); }}
-    .title {{ display: block; font-weight: 650; overflow-wrap: anywhere; }}
-    .meta {{ display: block; color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }}
-    .toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 14px 20px 16px; border-top: 1px solid var(--line); background: rgba(255, 255, 255, .12); }}
+    .paper-body {{ min-width: 0; }}
+    .index {{ color: var(--accent); font-weight: 760; }}
+    .title {{ display: block; color: var(--ink); font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }}
+    .meta-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin-top: 10px; color: var(--muted); font-size: 12px; }}
+    .meta-grid span {{ min-width: 0; }}
+    .meta-grid b {{ display: block; color: color-mix(in srgb, var(--ink), var(--muted) 42%); font-size: 10px; font-weight: 700; text-transform: uppercase; }}
+    .meta-grid em {{ display: block; font-style: normal; overflow-wrap: anywhere; }}
+    .url-field {{ grid-column: span 2; }}
+    .paper-link {{ color: var(--accent-strong); text-decoration: none; }}
+    .paper-link:hover {{ text-decoration: underline; }}
+    .muted-value {{ color: var(--muted); }}
+    .toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 14px 24px 16px; border-top: 1px solid var(--line); background: rgba(255, 255, 255, .18); }}
     button {{ min-height: 36px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255, 255, 255, .30); color: var(--text); padding: 8px 13px; font: inherit; font-weight: 600; cursor: pointer; box-shadow: inset 0 1px 0 rgba(255, 255, 255, .35); transition: transform .14s ease, border-color .14s ease, background .14s ease; }}
     button:hover:not(:disabled) {{ transform: translateY(-1px); border-color: color-mix(in srgb, var(--accent), var(--line)); background: rgba(255, 255, 255, .44); }}
     button.primary {{ background: linear-gradient(180deg, var(--accent-strong), var(--accent)); border-color: transparent; color: #fff; box-shadow: 0 10px 24px rgba(15, 118, 110, .25); }}
@@ -269,7 +313,8 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
     .status.error {{ color: var(--danger); }}
     pre {{ margin: 0; padding: 14px 20px; border-top: 1px solid var(--line); overflow: auto; max-height: 280px; background: rgba(15, 23, 42, .06); color: var(--text); }}
     .empty {{ padding: 34px 20px; color: var(--muted); text-align: center; }}
-    @media (max-width: 640px) {{ main {{ padding: 10px; }} header {{ display: grid; }} .token {{ max-width: none; text-align: left; }} .toolbar {{ align-items: stretch; }} .status {{ width: 100%; margin-left: 0; }} }}
+    @media (max-width: 1100px) {{ .shell {{ width: min(100%, 960px); min-width: 0; }} .meta-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+    @media (max-width: 640px) {{ main {{ padding: 10px; }} header {{ display: grid; }} .token {{ max-width: none; text-align: left; }} .toolbar {{ align-items: stretch; }} .status {{ width: 100%; margin-left: 0; }} .meta-grid {{ grid-template-columns: 1fr; }} .url-field {{ grid-column: auto; }} }}
   </style>
 </head>
 <body>
@@ -282,7 +327,7 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
       <form id="form" data-page="{data_json}">
         <div class="list">{body}</div>
         <div class="toolbar">
-          <button class="primary" id="parse" type="submit">Parse selected</button>
+          <button class="primary" id="parse" type="submit">Parse selected with MinerU</button>
           <button id="select-all" type="button">All</button>
           <button id="clear" type="button">Clear</button>
           <span class="status" id="status"></span>
@@ -323,7 +368,7 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
         return;
       }}
       parseButton.disabled = true;
-      setStatus("Parsing...");
+      setStatus("Submitting parse job...");
       resultNode.hidden = true;
       try {{
         const response = await fetch(`/api/parse-selection/${{encodeURIComponent(data.page_id)}}`, {{
@@ -334,7 +379,7 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
         const body = await response.json();
         resultNode.textContent = JSON.stringify(body, null, 2);
         resultNode.hidden = false;
-        setStatus(body.status ? `Done: ${{body.status}}` : "Done.");
+        setStatus(body.job_id ? `Submitted parse job ${{body.job_id}}.` : (body.status ? `Done: ${{body.status}}` : "Done."));
       }} catch (error) {{
         setStatus(error?.message || String(error), "error");
       }} finally {{
@@ -373,7 +418,7 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             selected_indices = str(payload.get("selected_indices") or "")
             result = asyncio.run(
-                parse_selected_papers(
+                submit_parse_job(
                     selection_token=page["selection_token"],
                     selected_indices=selected_indices,
                     save_path=page.get("save_path", DEFAULT_SAVE_PATH),
@@ -431,29 +476,35 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #eef3f7;
-      --glass: rgba(255, 255, 255, .68);
-      --glass-strong: rgba(255, 255, 255, .84);
-      --text: #111827;
-      --muted: #667085;
+      --bg: #eaf0f3;
+      --glass: rgba(255, 255, 255, .58);
+      --glass-strong: rgba(255, 255, 255, .78);
+      --paper: rgba(255, 255, 255, .48);
+      --paper-hover: rgba(255, 255, 255, .68);
+      --text: #13202f;
+      --muted: #627086;
       --line: rgba(15, 23, 42, .13);
-      --accent: #0f766e;
-      --accent-strong: #0b5f59;
-      --danger: #b42318;
+      --accent: #12766f;
+      --accent-strong: #0c5f72;
+      --ink: #203650;
+      --danger: #a33a31;
       --disabled: rgba(148, 163, 184, .18);
-      --shadow: 0 24px 70px rgba(15, 23, 42, .18);
+      --shadow: 0 28px 90px rgba(49, 72, 95, .20);
     }
 
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #0d1117;
-        --glass: rgba(22, 27, 34, .70);
-        --glass-strong: rgba(31, 37, 46, .84);
+        --glass: rgba(20, 29, 38, .66);
+        --glass-strong: rgba(33, 45, 57, .78);
+        --paper: rgba(24, 37, 49, .52);
+        --paper-hover: rgba(35, 52, 67, .70);
         --text: #f8fafc;
         --muted: #aeb7c5;
         --line: rgba(226, 232, 240, .14);
-        --accent: #2dd4bf;
-        --accent-strong: #5eead4;
+        --accent: #37c5b3;
+        --accent-strong: #78c6e7;
+        --ink: #dbeafe;
         --danger: #f97066;
         --disabled: rgba(71, 85, 105, .28);
         --shadow: 0 28px 80px rgba(0, 0, 0, .38);
@@ -464,28 +515,31 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
 
     body {
       margin: 0;
-      background: linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #dbeafe 28%));
+      background: radial-gradient(circle at 18% 0%, rgba(18, 118, 111, .14), transparent 32%),
+        radial-gradient(circle at 78% 10%, rgba(58, 98, 143, .16), transparent 30%),
+        linear-gradient(135deg, var(--bg), color-mix(in srgb, var(--bg), #f5efe1 18%));
       color: var(--text);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
       font-size: 14px;
       line-height: 1.45;
     }
 
     main {
       min-height: 100vh;
-      padding: 18px;
+      padding: 28px 18px;
     }
 
     .shell {
-      max-width: 820px;
+      width: min(75vw, 1440px);
+      min-width: min(100%, 820px);
       margin: 0 auto;
       background: linear-gradient(180deg, var(--glass-strong), var(--glass));
-      border: 1px solid var(--line);
+      border: 1px solid rgba(255,255,255,.56);
       border-radius: 8px;
       overflow: hidden;
       box-shadow: var(--shadow);
-      backdrop-filter: blur(22px) saturate(150%);
-      -webkit-backdrop-filter: blur(22px) saturate(150%);
+      backdrop-filter: blur(26px) saturate(155%);
+      -webkit-backdrop-filter: blur(26px) saturate(155%);
     }
 
     header {
@@ -493,15 +547,25 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       align-items: flex-start;
       justify-content: space-between;
       gap: 16px;
-      padding: 18px 20px 15px;
+      padding: 22px 24px 18px;
       border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(255, 255, 255, .18), transparent);
+      background: linear-gradient(180deg, rgba(255, 255, 255, .30), transparent);
     }
 
     h1 {
       margin: 0;
-      font-size: 18px;
-      font-weight: 700;
+      font-size: 20px;
+      font-weight: 720;
+      color: var(--ink);
+    }
+
+    h1::after {
+      content: "MinerU-ready literature workspace";
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
     }
 
     .count {
@@ -512,23 +576,30 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
 
     .list {
       display: grid;
-      max-height: 460px;
+      gap: 10px;
+      max-height: 62vh;
       overflow: auto;
-      padding: 6px 0;
+      padding: 14px;
       scrollbar-width: thin;
     }
 
     .paper {
       display: grid;
       grid-template-columns: 26px minmax(0, 1fr);
-      gap: 10px;
-      padding: 12px 20px;
-      border-bottom: 1px solid var(--line);
-      transition: background .16s ease, border-color .16s ease;
+      gap: 12px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--paper);
+      transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, transform .16s ease;
     }
 
-    .paper:last-child { border-bottom: 0; }
-    .paper:hover { background: rgba(255, 255, 255, .22); }
+    .paper:hover {
+      background: var(--paper-hover);
+      border-color: color-mix(in srgb, var(--accent), var(--line) 65%);
+      box-shadow: 0 12px 30px rgba(32, 54, 80, .10);
+      transform: translateY(-1px);
+    }
     .paper.disabled { background: var(--disabled); color: var(--muted); }
 
     input[type="checkbox"] {
@@ -538,26 +609,65 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       accent-color: var(--accent);
     }
 
-    .title {
-      overflow-wrap: anywhere;
-      font-weight: 600;
+    .paper-body { min-width: 0; }
+
+    .index {
+      color: var(--accent);
+      font-weight: 760;
     }
 
-    .meta {
-      margin-top: 3px;
+    .title {
+      display: block;
+      color: var(--ink);
+      font-size: 15px;
+      overflow-wrap: anywhere;
+      font-weight: 700;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px 14px;
+      margin-top: 10px;
       color: var(--muted);
       font-size: 12px;
+    }
+
+    .meta-grid span { min-width: 0; }
+
+    .meta-grid b {
+      display: block;
+      color: color-mix(in srgb, var(--ink), var(--muted) 42%);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .meta-grid em {
+      display: block;
+      font-style: normal;
       overflow-wrap: anywhere;
     }
+
+    .url-field { grid-column: span 2; }
+
+    .paper-link {
+      color: var(--accent-strong);
+      text-decoration: none;
+    }
+
+    .paper-link:hover { text-decoration: underline; }
+
+    .muted-value { color: var(--muted); }
 
     .toolbar {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       gap: 9px;
-      padding: 14px 20px 16px;
+      padding: 14px 24px 16px;
       border-top: 1px solid var(--line);
-      background: rgba(255, 255, 255, .12);
+      background: rgba(255, 255, 255, .18);
     }
 
     button {
@@ -609,11 +719,18 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       text-align: center;
     }
 
+    @media (max-width: 1100px) {
+      .shell { width: min(100%, 960px); min-width: 0; }
+      .meta-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
     @media (max-width: 640px) {
       main { padding: 10px; }
       header { display: grid; }
       .toolbar { align-items: stretch; }
       .status { width: 100%; margin-left: 0; }
+      .meta-grid { grid-template-columns: 1fr; }
+      .url-field { grid-column: auto; }
     }
   </style>
 </head>
@@ -627,7 +744,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       <form id="form">
         <div class="list" id="list"></div>
         <div class="toolbar">
-          <button type="submit" class="primary" id="parse">Parse</button>
+          <button type="submit" class="primary" id="parse">Parse selected with MinerU</button>
           <button type="button" id="select-all">All</button>
           <button type="button" id="clear">Clear</button>
           <div class="status" id="status"></div>
@@ -669,14 +786,25 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       statusNode.className = kind ? `status ${kind}` : "status";
     }
 
-    function compactMeta(paper) {
-      const bits = [];
-      if (paper.source) bits.push(paper.source);
-      if (paper.year) bits.push(paper.year);
-      if (paper.paper_id) bits.push(paper.paper_id);
-      if (paper.doi) bits.push(paper.doi);
-      if (!paper.parse_ready && paper.reason) bits.push(paper.reason);
-      return bits.join(" | ");
+    function fieldValue(value) {
+      const text = String(value ?? "").trim();
+      return text || "Not available";
+    }
+
+    function originalUrl(paper) {
+      return String(paper.original_url || paper.url || paper.pdf_url || "").trim();
+    }
+
+    function renderField(label, value, extraClass = "") {
+      return `<span class="${extraClass}"><b>${escapeHtml(label)}</b><em>${escapeHtml(fieldValue(value))}</em></span>`;
+    }
+
+    function renderUrlField(paper) {
+      const url = originalUrl(paper);
+      const body = url
+        ? `<a class="paper-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`
+        : '<span class="muted-value">Not available</span>';
+      return `<span class="url-field"><b>Original URL</b><em>${body}</em></span>`;
     }
 
     function render() {
@@ -698,9 +826,16 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
         return `
           <label class="paper${disabled ? " disabled" : ""}">
             <input type="checkbox" name="paper" value="${escapeHtml(index)}" ${disabled ? "disabled" : ""}>
-            <span>
-              <span class="title">${escapeHtml(index)}. ${escapeHtml(paper.title || "Untitled")}</span>
-              <span class="meta">${escapeHtml(compactMeta(paper))}</span>
+            <span class="paper-body">
+              <span class="title"><span class="index">${escapeHtml(index)}.</span> ${escapeHtml(paper.title || "Untitled")}</span>
+              <span class="meta-grid">
+                ${renderField("Published", paper.published_date || paper.year)}
+                ${renderField("Journal / Venue", paper.publication_venue)}
+                ${renderField("Source", paper.source || "unknown")}
+                ${renderField("Paper ID", paper.paper_id)}
+                ${renderField("DOI", paper.doi)}
+                ${renderUrlField(paper)}
+              </span>
             </span>
           </label>
         `;
@@ -744,9 +879,9 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       }
 
       parseButton.disabled = true;
-      setStatus("Parsing...");
+      setStatus("Submitting parse job...");
       try {
-        const result = await callTool("parse_selected_papers", {
+        const result = await callTool("submit_parse_job", {
           selection_token: data.selection_token || "",
           selected_indices: selected.join(","),
           save_path: data.save_path || "~/Desktop/papers",
@@ -756,10 +891,8 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
           force: !!data.force,
         });
         const body = structured(result);
-        const parsed = body?.parsed ?? 0;
-        const failed = body?.failed ?? 0;
-        const skipped = body?.skipped ?? 0;
-        setStatus(`Done. parsed=${parsed}, failed=${failed}, skipped=${skipped}`);
+        const jobId = body?.job_id || "";
+        setStatus(jobId ? `Submitted parse job ${jobId}.` : "Submitted parse job.");
       } catch (error) {
         setStatus(error?.message || String(error), "error");
       } finally {
@@ -1213,11 +1346,21 @@ FAST_SOURCES = [
     "europepmc",
 ]
 
+AGENT_SKILL_FAST_SOURCES = [
+    "arxiv",
+    "openalex",
+    "semantic",
+    "crossref",
+    "google_scholar",
+]
+
 DEEP_SOURCES = list(ALL_SOURCES)
 
 SEARCH_PROFILES: Dict[str, List[str]] = {
     "fast": FAST_SOURCES,
     "default": FAST_SOURCES,
+    "agent-skill-fast": AGENT_SKILL_FAST_SOURCES,
+    "agent_skill_fast": AGENT_SKILL_FAST_SOURCES,
     "deep": DEEP_SOURCES,
     "all": ALL_SOURCES,
 }
@@ -1382,31 +1525,250 @@ def _store_search_result(cache_key: str, payload: Dict[str, Any]) -> None:
     _SEARCH_RESULT_CACHE[cache_key] = {"stored_at": time.time(), "payload": copy.deepcopy(payload)}
 
 
+def _paper_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in value if item is not None)
+    return str(value)
+
+
+def _normalize_lookup_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _paper_value(value).strip().lower())
+
+
 def _paper_unique_key(paper: Dict[str, Any]) -> str:
-    doi = (paper.get("doi") or "").strip().lower()
+    doi = _normalize_lookup_text(paper.get("doi"))
     if doi:
         return f"doi:{doi}"
 
-    title = (paper.get("title") or "").strip().lower()
-    authors = (paper.get("authors") or "").strip().lower()
+    title = _normalize_lookup_text(paper.get("title"))
+    authors = _normalize_lookup_text(paper.get("authors"))
     if title:
         return f"title:{title}|authors:{authors}"
 
-    paper_id = (paper.get("paper_id") or "").strip().lower()
+    paper_id = _normalize_lookup_text(paper.get("paper_id"))
     return f"id:{paper_id}"
 
 
-def _dedupe_papers(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
-    seen: set[str] = set()
+def _paper_year_number(paper: Dict[str, Any]) -> int:
+    for name in ("year", "published_year", "publication_year", "published_date", "date"):
+        match = re.search(r"(19|20)\d{2}", _paper_value(paper.get(name)))
+        if match:
+            return int(match.group(0))
+    return 0
 
-    for paper in papers:
-        key = _paper_unique_key(paper)
-        if key in seen:
+
+def _paper_has_pdf_signal(paper: Dict[str, Any]) -> bool:
+    for name in ("pdf_url", "open_access_pdf", "local_pdf_path"):
+        if _paper_value(paper.get(name)).strip():
+            return True
+    url = _paper_value(paper.get("url")).lower()
+    return url.endswith(".pdf") or "/pdf" in url
+
+
+def _paper_citations(paper: Dict[str, Any]) -> int:
+    for name in ("citation_count", "citations", "num_citations"):
+        value = paper.get(name)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
             continue
-        seen.add(key)
-        deduped.append(paper)
+    return 0
 
+
+def _paper_score(paper: Dict[str, Any], query: str = "") -> float:
+    score = 0.0
+    title = _normalize_lookup_text(paper.get("title"))
+    query_terms = [term for term in re.findall(r"[\w]+", query.lower()) if len(term) > 2]
+    if query_terms and title:
+        matched = sum(1 for term in query_terms if term in title)
+        score += 3.0 * matched / max(1, len(query_terms))
+    if _paper_value(paper.get("doi")).strip():
+        score += 1.2
+    if _paper_has_pdf_signal(paper):
+        score += 2.0
+    source_count = len(paper.get("sources", [])) if isinstance(paper.get("sources"), list) else 0
+    score += min(source_count, 5) * 0.25
+    year = _paper_year_number(paper)
+    if year:
+        score += max(0.0, min(1.0, (year - 2018) / 8.0))
+    citations = _paper_citations(paper)
+    if citations:
+        score += min(1.5, citations / 200.0)
+    return round(score, 4)
+
+
+AGENT_SKILL_RANKING_PROFILE = "agent-skill"
+AGENT_SKILL_PROFILE_ALIASES = {AGENT_SKILL_RANKING_PROFILE, "agent_skill", "agentskill", "skill-agent"}
+AGENT_SKILL_BOOST_PHRASES = [
+    "agent skill",
+    "agent skills",
+    "agentic skill",
+    "skill library",
+    "skill libraries",
+    "skill retrieval",
+    "skill ecosystem",
+    "skill security",
+    "skill audit",
+    "skill revision",
+    "skillbench",
+    "skillsbench",
+    "skill.md",
+    "llm agent",
+    "llm agents",
+    "language agent",
+    "software agent",
+    "tool-using agent",
+    "tool using agent",
+]
+AGENT_SKILL_AGENT_TERMS = {"agent", "agents", "agentic", "llm", "language model", "tool"}
+AGENT_SKILL_SKILL_TERMS = {"skill", "skills", "capability", "capabilities", "library", "retrieval"}
+AGENT_SKILL_NEGATIVE_PHRASES = [
+    "human skill",
+    "human skills",
+    "motor skill",
+    "social skill",
+    "piano skill",
+    "clinical skill",
+    "surgical skill",
+    "teaching skill",
+    "workforce skill",
+]
+
+
+def _paper_profile_text(paper: Dict[str, Any]) -> str:
+    fields = [
+        paper.get("title"),
+        paper.get("abstract"),
+        paper.get("summary"),
+        paper.get("keywords"),
+        paper.get("categories"),
+        paper.get("venue"),
+    ]
+    return " ".join(_paper_value(field) for field in fields if field)
+
+
+def _agent_skill_profile_score(paper: Dict[str, Any]) -> float:
+    text = _normalize_lookup_text(_paper_profile_text(paper))
+    title = _normalize_lookup_text(paper.get("title"))
+    if not text:
+        return 0.0
+
+    score = 0.0
+    for phrase in AGENT_SKILL_BOOST_PHRASES:
+        if phrase in text:
+            score += 3.0
+            if phrase in title:
+                score += 1.5
+
+    has_agent = any(term in text for term in AGENT_SKILL_AGENT_TERMS)
+    has_skill = any(term in text for term in AGENT_SKILL_SKILL_TERMS)
+    if has_agent and has_skill:
+        score += 4.0
+    elif has_skill:
+        score += 0.5
+
+    for phrase in AGENT_SKILL_NEGATIVE_PHRASES:
+        if phrase in text:
+            score -= 4.0
+            if phrase in title:
+                score -= 2.0
+
+    if "multi-agent" in text or "multi agent" in text:
+        score += 1.0
+    if "benchmark" in text and has_agent and has_skill:
+        score += 1.0
+    return round(score, 4)
+
+
+def _ranking_profile_name(ranking_profile: str = "") -> str:
+    profile = (ranking_profile or "").strip().lower()
+    return AGENT_SKILL_RANKING_PROFILE if profile in AGENT_SKILL_PROFILE_ALIASES else profile
+
+
+def _rank_papers_for_profile(
+    papers: List[Dict[str, Any]],
+    *,
+    ranking_profile: str = "",
+    query: str = "",
+) -> List[Dict[str, Any]]:
+    profile = _ranking_profile_name(ranking_profile)
+    if not profile:
+        return list(papers)
+    if profile != AGENT_SKILL_RANKING_PROFILE:
+        return list(papers)
+
+    ranked: List[Dict[str, Any]] = []
+    for paper in papers:
+        item = dict(paper)
+        base_score = float(item.get("score") or _paper_score(item, query=query))
+        profile_score = _agent_skill_profile_score(item)
+        item["ranking_profile"] = AGENT_SKILL_RANKING_PROFILE
+        item["profile_score"] = round(profile_score, 4)
+        item["score"] = round(base_score + profile_score, 4)
+        ranked.append(item)
+    ranked.sort(key=lambda paper: (float(paper.get("score") or 0), float(paper.get("profile_score") or 0)), reverse=True)
+    return ranked
+
+
+def _merge_paper_record(base: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in incoming.items():
+        if key in {"source_records", "sources", "score", "score_reasons"}:
+            continue
+        if value not in (None, "", [], {}) and merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+
+    sources = list(merged.get("sources") or [])
+    for source in (_paper_value(base.get("source")).strip(), _paper_value(incoming.get("source")).strip()):
+        if source and source not in sources:
+            sources.append(source)
+    merged["sources"] = sources
+
+    records = list(merged.get("source_records") or [])
+    records.append(
+        {
+            "source": _paper_value(incoming.get("source")).strip(),
+            "paper_id": _paper_value(incoming.get("paper_id")).strip(),
+            "doi": _paper_value(incoming.get("doi")).strip(),
+            "pdf_url": _paper_value(incoming.get("pdf_url")).strip(),
+            "url": _paper_value(incoming.get("url")).strip(),
+        }
+    )
+    merged["source_records"] = records
+    return merged
+
+
+def _dedupe_papers(papers: List[Dict[str, Any]], query: str = "") -> List[Dict[str, Any]]:
+    by_key: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+        key = _paper_unique_key(paper)
+        if key not in by_key:
+            merged = dict(paper)
+            source = _paper_value(merged.get("source")).strip()
+            merged["sources"] = [source] if source else []
+            merged["source_records"] = [
+                {
+                    "source": source,
+                    "paper_id": _paper_value(merged.get("paper_id")).strip(),
+                    "doi": _paper_value(merged.get("doi")).strip(),
+                    "pdf_url": _paper_value(merged.get("pdf_url")).strip(),
+                    "url": _paper_value(merged.get("url")).strip(),
+                }
+            ]
+            by_key[key] = merged
+            order.append(key)
+        else:
+            by_key[key] = _merge_paper_record(by_key[key], paper)
+
+    deduped = [by_key[key] for key in order]
+    for paper in deduped:
+        paper["score"] = _paper_score(paper, query=query)
+    deduped.sort(key=lambda paper: float(paper.get("score") or 0), reverse=True)
     return deduped
 
 
@@ -1448,6 +1810,101 @@ def _paper_field(paper: Dict[str, Any], field: str) -> str:
     return str(paper.get(field) or "").strip()
 
 
+def _paper_extra_value(paper: Dict[str, Any], *fields: str) -> str:
+    extra = paper.get("extra")
+    if not isinstance(extra, dict):
+        return ""
+    for field in fields:
+        value = extra.get(field)
+        if value not in (None, "", [], {}):
+            return _paper_value(value).strip()
+    return ""
+
+
+GENERIC_PUBLICATION_VENUES = {
+    "arxiv",
+    "arxiv.org",
+    "arxiv preprint",
+    "arxiv preprints",
+    "preprint",
+    "preprints",
+}
+
+ARXIV_CATEGORY_VENUES = {
+    "cs.AI": "Artificial Intelligence",
+    "cs.AR": "Hardware Architecture",
+    "cs.CC": "Computational Complexity",
+    "cs.CE": "Computational Engineering, Finance, and Science",
+    "cs.CG": "Computational Geometry",
+    "cs.CL": "Computation and Language",
+    "cs.CR": "Cryptography and Security",
+    "cs.CV": "Computer Vision and Pattern Recognition",
+    "cs.CY": "Computers and Society",
+    "cs.DB": "Databases",
+    "cs.DC": "Distributed, Parallel, and Cluster Computing",
+    "cs.DL": "Digital Libraries",
+    "cs.DM": "Discrete Mathematics",
+    "cs.DS": "Data Structures and Algorithms",
+    "cs.ET": "Emerging Technologies",
+    "cs.FL": "Formal Languages and Automata Theory",
+    "cs.GL": "General Literature",
+    "cs.GR": "Graphics",
+    "cs.GT": "Computer Science and Game Theory",
+    "cs.HC": "Human-Computer Interaction",
+    "cs.IR": "Information Retrieval",
+    "cs.IT": "Information Theory",
+    "cs.LG": "Machine Learning",
+    "cs.LO": "Logic in Computer Science",
+    "cs.MA": "Multiagent Systems",
+    "cs.MM": "Multimedia",
+    "cs.MS": "Mathematical Software",
+    "cs.NA": "Numerical Analysis",
+    "cs.NE": "Neural and Evolutionary Computing",
+    "cs.NI": "Networking and Internet Architecture",
+    "cs.OH": "Other Computer Science",
+    "cs.OS": "Operating Systems",
+    "cs.PF": "Performance",
+    "cs.PL": "Programming Languages",
+    "cs.RO": "Robotics",
+    "cs.SC": "Symbolic Computation",
+    "cs.SD": "Sound",
+    "cs.SE": "Software Engineering",
+    "cs.SI": "Social and Information Networks",
+    "cs.SY": "Systems and Control",
+    "stat.ML": "Machine Learning",
+    "eess.IV": "Image and Video Processing",
+}
+
+
+def _is_generic_publication_venue(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value.strip().lower())
+    return normalized in GENERIC_PUBLICATION_VENUES
+
+
+def _arxiv_category_venue(paper: Dict[str, Any]) -> str:
+    extra = paper.get("extra") if isinstance(paper.get("extra"), dict) else {}
+    raw_values = [
+        paper.get("primary_category"),
+        paper.get("arxiv_primary_category"),
+        paper.get("categories"),
+        extra.get("primary_category"),
+        extra.get("arxiv_primary_category"),
+        extra.get("categories"),
+    ]
+    for raw in raw_values:
+        values = raw if isinstance(raw, (list, tuple, set)) else re.split(r"[;,]\s*", _paper_value(raw))
+        for value in values:
+            text = _paper_value(value).strip()
+            if not text:
+                continue
+            if ":" in text and text.lower().startswith("arxiv"):
+                text = text.split(":", 1)[1].strip()
+            mapped = ARXIV_CATEGORY_VENUES.get(text)
+            if mapped:
+                return mapped
+    return ""
+
+
 def _paper_doi(paper: Dict[str, Any]) -> str:
     explicit = _paper_field(paper, "doi")
     if explicit:
@@ -1458,6 +1915,91 @@ def _paper_doi(paper: Dict[str, Any]) -> str:
         if recovered:
             return recovered
     return ""
+
+
+ARXIV_ID_RE = re.compile(r"(?<![\w.])(\d{4}\.\d{4,5}(?:v\d+)?)(?![\w.])", re.IGNORECASE)
+ARXIV_DOI_RE = re.compile(r"10\.48550/arxiv\.([0-9]{4}\.[0-9]{4,5}(?:v\d+)?)", re.IGNORECASE)
+
+
+def _extract_arxiv_id(*values: Any) -> str:
+    for value in values:
+        text = _paper_value(value).strip()
+        if not text:
+            continue
+        doi_match = ARXIV_DOI_RE.search(text)
+        if doi_match:
+            return doi_match.group(1)
+        lowered = text.lower()
+        if "arxiv.org" in lowered:
+            match = ARXIV_ID_RE.search(text)
+            if match:
+                return match.group(1)
+        if ARXIV_ID_RE.fullmatch(text):
+            return text
+    return ""
+
+
+def _canonical_pdf_stem(
+    *,
+    source: str = "",
+    paper_id: str = "",
+    doi: str = "",
+    title: str = "",
+    pdf_url: str = "",
+    url: str = "",
+    fallback: str = "paper",
+) -> str:
+    arxiv_id = _extract_arxiv_id(paper_id, doi, pdf_url, url)
+    if arxiv_id:
+        return arxiv_id
+
+    normalized_doi = (doi or "").strip()
+    if normalized_doi:
+        return _safe_filename(normalized_doi.replace("/", "_"), default=fallback)
+
+    identifier = (paper_id or "").strip()
+    if identifier and not identifier.lower().startswith("gs_"):
+        return _safe_filename(identifier.replace("/", "_").replace("\\", "_"), default=fallback)
+
+    if title:
+        return _safe_filename(title, default=fallback)
+    return _safe_filename(fallback, default="paper")
+
+
+def _token_set(value: Any) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", _paper_value(value).lower()) if len(token) > 2}
+
+
+def _title_similarity(left: str, right: str) -> float:
+    left_tokens = _token_set(left)
+    right_tokens = _token_set(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _repository_paper_matches_request(paper: Any, *, doi: str, title: str) -> bool:
+    expected_doi = (doi or "").strip().lower()
+    paper_doi = _paper_value(getattr(paper, "doi", "")).strip().lower()
+    if expected_doi and paper_doi and paper_doi == expected_doi:
+        return True
+
+    expected_arxiv = _extract_arxiv_id(doi, title)
+    paper_arxiv = _extract_arxiv_id(
+        getattr(paper, "doi", ""),
+        getattr(paper, "paper_id", ""),
+        getattr(paper, "url", ""),
+        getattr(paper, "pdf_url", ""),
+    )
+    if expected_arxiv and paper_arxiv and expected_arxiv == paper_arxiv:
+        return True
+
+    if title:
+        paper_title = _paper_value(getattr(paper, "title", ""))
+        if _title_similarity(title, paper_title) >= 0.72:
+            return True
+
+    return not (expected_doi or title)
 
 
 def _paper_year(paper: Dict[str, Any]) -> str:
@@ -1471,6 +2013,55 @@ def _paper_year(paper: Dict[str, Any]) -> str:
     return ""
 
 
+def _paper_publication_date(paper: Dict[str, Any]) -> str:
+    for field in ("published_date", "publication_date", "published_at", "date", "year", "updated_date"):
+        value = _paper_field(paper, field)
+        if value:
+            return value
+    return _paper_extra_value(paper, "publication_date", "published_date", "date", "year")
+
+
+def _paper_publication_venue(paper: Dict[str, Any]) -> str:
+    for field in (
+        "journal",
+        "journal_ref",
+        "venue",
+        "publication_venue",
+        "container_title",
+        "container-title",
+        "publisher",
+    ):
+        value = _paper_field(paper, field)
+        if value and not _is_generic_publication_venue(value):
+            return value
+    extra_value = _paper_extra_value(
+        paper,
+        "journal",
+        "journal_title",
+        "journal_ref",
+        "venue",
+        "publication_venue",
+        "container_title",
+        "publisher",
+        "publication_info",
+    )
+    if extra_value and not _is_generic_publication_venue(extra_value):
+        return extra_value
+    return _arxiv_category_venue(paper)
+
+
+def _paper_original_url(paper: Dict[str, Any], *, url: str = "", doi: str = "", pdf_url: str = "") -> str:
+    for value in (url, _paper_field(paper, "original_url"), _paper_field(paper, "landing_page_url")):
+        if value:
+            return value
+    extra_url = _paper_extra_value(paper, "landing_page_url", "url", "openalex_id")
+    if extra_url:
+        return extra_url
+    if doi:
+        return f"https://doi.org/{doi}"
+    return pdf_url
+
+
 def _paper_parse_candidate(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
     source = _paper_field(paper, "source").lower()
     paper_id = _paper_field(paper, "paper_id")
@@ -1479,6 +2070,12 @@ def _paper_parse_candidate(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
     pdf_url = _paper_field(paper, "pdf_url")
     local_pdf_path = _paper_field(paper, "local_pdf_path") or _paper_field(paper, "pdf_path")
     url = _paper_field(paper, "url")
+    arxiv_id = _extract_arxiv_id(paper_id, doi, pdf_url, url)
+    if arxiv_id:
+        source = "arxiv"
+        paper_id = arxiv_id
+        if not pdf_url or "arxiv.org/abs/" in pdf_url.lower():
+            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
 
     download_capability = SOURCE_CAPABILITIES.get(source, {}).get("download")
     has_source_download = bool(source and paper_id and download_capability not in {False, None})
@@ -1507,12 +2104,24 @@ def _paper_parse_candidate(paper: Dict[str, Any], index: int) -> Dict[str, Any]:
         "title": title,
         "authors": _paper_field(paper, "authors"),
         "year": _paper_year(paper),
+        "published_date": _paper_publication_date(paper),
+        "publication_venue": _paper_publication_venue(paper),
         "source": source,
         "paper_id": paper_id,
         "doi": doi,
         "pdf_url": pdf_url,
         "local_pdf_path": local_pdf_path,
         "url": url,
+        "original_url": _paper_original_url(paper, url=url, doi=doi, pdf_url=pdf_url),
+        "canonical_pdf_stem": _canonical_pdf_stem(
+            source=source,
+            paper_id=paper_id,
+            doi=doi,
+            title=title,
+            pdf_url=pdf_url,
+            url=url,
+            fallback=f"paper_{index}",
+        ),
         "parse_ready": parse_ready,
         "reason": reason,
     }
@@ -1594,6 +2203,25 @@ def _paper_selection_app_prompt(
 
 def _mineru_api_key_configured() -> bool:
     return bool(get_env("MINERU_API_KEY", "").strip())
+
+
+def _mineru_batch_parse_enabled(mode: str = "auto") -> bool:
+    normalized_mode = (mode or "auto").strip().lower()
+    if normalized_mode not in {"auto", "extract", "cloud_api"}:
+        return False
+    if not _mineru_api_key_configured():
+        return False
+    if normalized_mode in {"extract", "cloud_api"}:
+        return True
+
+    if not _env_flag_enabled("MINERU_BATCH_PARSE", default="false"):
+        return False
+
+    configured = get_env("MINERU_AUTO_ORDER", "").strip().lower()
+    if configured:
+        first = next((part.strip() for part in configured.split(",") if part.strip()), "")
+        return first in {"extract", "cloud_api"}
+    return True
 
 
 def _mineru_key_app_meta() -> Dict[str, Any]:
@@ -1987,6 +2615,95 @@ async def _prompt_parse_saved_pdfs(
     }
 
 
+async def _parse_prompt_for_download_results(
+    *,
+    selection_token: str,
+    session: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    save_path: str,
+    use_scihub: bool,
+) -> Dict[str, Any]:
+    papers: List[Dict[str, Any]] = []
+    source_papers = session.get("papers", [])
+    if not isinstance(source_papers, list):
+        source_papers = []
+
+    for result in results:
+        if result.get("status") not in {"downloaded", "skipped_existing"}:
+            continue
+        pdf_path = str(result.get("pdf_path") or "").strip()
+        if not pdf_path:
+            continue
+        index = int(result.get("index") or 0)
+        original = source_papers[index - 1] if 1 <= index <= len(source_papers) and isinstance(source_papers[index - 1], dict) else {}
+        candidate = result.get("candidate") if isinstance(result.get("candidate"), dict) else _paper_parse_candidate(original, index)
+        papers.append(
+            {
+                "title": candidate.get("title") or Path(pdf_path).stem,
+                "authors": candidate.get("authors", ""),
+                "year": candidate.get("year", ""),
+                "published_date": candidate.get("published_date", ""),
+                "publication_venue": candidate.get("publication_venue", ""),
+                "source": candidate.get("source", ""),
+                "paper_id": candidate.get("paper_id", ""),
+                "doi": candidate.get("doi", ""),
+                "pdf_url": "",
+                "local_pdf_path": pdf_path,
+                "url": candidate.get("url", ""),
+                "original_url": candidate.get("original_url") or candidate.get("url", ""),
+            }
+        )
+
+    parse_session = await asyncio.to_thread(
+        cache_create_search_session,
+        session.get("query", ""),
+        session.get("sources", ""),
+        papers,
+        {
+            "interaction": "download_selected_papers_parse_prompt",
+            "trigger": "batch_download_completed",
+            "download_selection_token": selection_token,
+            "save_path": resolve_save_path(save_path),
+        },
+    )
+    candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(papers)]
+    selectable = [candidate for candidate in candidates if candidate.get("parse_ready")]
+    fallback = {
+        "status": "ok" if selectable else "no_parse_ready_pdfs",
+        "interaction": "backend_session_numbered_selection",
+        "selection_token": parse_session["selection_token"],
+        "download_selection_token": selection_token,
+        "instructions": (
+            "PDFs were downloaded. To parse them, call submit_parse_job for background parsing "
+            "or render_paper_selection_app for a checkbox UI."
+        ),
+        "papers": candidates,
+        "total": len(candidates),
+        "parse_ready_total": len(selectable),
+        "save_path": resolve_save_path(save_path),
+        "use_scihub": use_scihub,
+        "recommended_tool": "submit_parse_job" if len(candidates) <= AUTO_PARSE_SAVED_PDF_LIMIT else PAPER_SELECTION_WIDGET_TOOL,
+        "recommended_selected_indices": "all" if len(candidates) <= AUTO_PARSE_SAVED_PDF_LIMIT else "",
+    }
+    fallback["app"] = _paper_selection_app_prompt(
+        selection_token=parse_session["selection_token"],
+        papers=candidates,
+        save_path=save_path,
+        use_scihub=use_scihub,
+    )
+    if len(candidates) > AUTO_PARSE_SAVED_PDF_LIMIT:
+        fallback["message"] = (
+            f"Saved {len(candidates)} PDFs, which is above the auto-parse limit of "
+            f"{AUTO_PARSE_SAVED_PDF_LIMIT}. Use the checkbox UI or numbered indices to choose PDFs for MinerU."
+        )
+    else:
+        fallback["message"] = (
+            f"Saved {len(candidates)} PDFs. Submit a background parse job with selected_indices='all' "
+            "to parse them without blocking the download call."
+        )
+    return fallback
+
+
 async def _after_saved_pdf(
     result: Any,
     *,
@@ -2187,6 +2904,13 @@ def _safe_filename(filename_hint: str, default: str = "paper") -> str:
     return safe[:120]
 
 
+def _pdf_filename_from_hint(filename_hint: str, default: str = "paper") -> str:
+    stem = _safe_filename(filename_hint, default=default)
+    if stem.lower().endswith(".pdf"):
+        return stem
+    return f"{stem}.pdf"
+
+
 def _looks_like_pdf_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -2204,27 +2928,45 @@ async def _download_from_url(pdf_url: str, save_path: str, filename_hint: str = 
 
     save_path = resolve_save_path(save_path)
     os.makedirs(save_path, exist_ok=True)
-    output_name = f"{_safe_filename(filename_hint)}.pdf"
-    output_path = os.path.join(save_path, output_name)
+    output_name = _pdf_filename_from_hint(filename_hint)
+    output_path = Path(save_path) / output_name
+    temp_path = output_path.with_name(f".{output_path.name}.{secrets.token_hex(6)}.tmp")
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            response = await client.get(pdf_url)
+            async with client.stream("GET", pdf_url) as response:
+                if response.status_code >= 400:
+                    return None
 
-        if response.status_code >= 400 or not response.content:
+                content_type = (response.headers.get("content-type") or "").lower()
+                first_chunk = b""
+                total = 0
+                with temp_path.open("wb") as file_obj:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 256):
+                        if not chunk:
+                            continue
+                        if not first_chunk:
+                            first_chunk = chunk[:4096]
+                        total += len(chunk)
+                        file_obj.write(chunk)
+
+        if total <= 0:
+            temp_path.unlink(missing_ok=True)
             return None
 
-        content_type = (response.headers.get("content-type") or "").lower()
-        is_pdf = "pdf" in content_type or response.content.startswith(b"%PDF") or pdf_url.lower().endswith(".pdf")
+        is_pdf = "pdf" in content_type or first_chunk.startswith(b"%PDF") or pdf_url.lower().endswith(".pdf")
         if not is_pdf:
+            temp_path.unlink(missing_ok=True)
             logger.warning("Resolved URL is not a PDF candidate: %s (content-type=%s)", pdf_url, content_type)
             return None
 
-        with open(output_path, "wb") as file_obj:
-            file_obj.write(response.content)
-
-        return output_path
+        temp_path.replace(output_path)
+        return str(output_path)
     except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         logger.warning("Direct URL download failed for %s: %s", pdf_url, exc)
         return None
 
@@ -2256,13 +2998,25 @@ async def _try_repository_fallback(doi: str, title: str, save_path: str) -> tupl
                 continue
 
             for paper in papers:
+                if not _repository_paper_matches_request(paper, doi=doi, title=title):
+                    repository_errors.append(f"{repo_name}: candidate did not match requested DOI/title")
+                    continue
                 pdf_url = str(getattr(paper, "pdf_url", "") or "").strip()
                 if not pdf_url:
                     continue
 
                 raw_paper_id = getattr(paper, "paper_id", "")
                 paper_id = str(raw_paper_id or query).strip()
-                downloaded = await _download_from_url(pdf_url, save_path, f"{repo_name}_{paper_id}")
+                filename_hint = _canonical_pdf_stem(
+                    source=repo_name,
+                    paper_id=paper_id,
+                    doi=doi or _paper_value(getattr(paper, "doi", "")),
+                    title=title or _paper_value(getattr(paper, "title", "")),
+                    pdf_url=pdf_url,
+                    url=_paper_value(getattr(paper, "url", "")),
+                    fallback=f"{repo_name}_{paper_id}",
+                )
+                downloaded = await _download_from_url(pdf_url, save_path, filename_hint)
                 if downloaded:
                     return downloaded, ""
 
@@ -2415,39 +3169,60 @@ async def _race_oa_downloads(
     title: str,
     save_path: str,
 ) -> tuple[Optional[Dict[str, Any]], List[str]]:
-    task_specs = [
-        (
-            "primary",
-            _try_primary_download(
-                source_name=source_name,
-                paper_id=paper_id,
-                doi=doi,
-                title=title,
-                save_path=save_path,
-            ),
-        ),
-        (
-            "repositories",
-            _try_repository_download(
-                source_name=source_name,
-                paper_id=paper_id,
-                doi=doi,
-                title=title,
-                save_path=save_path,
-            ),
-        ),
-        (
-            "unpaywall",
-            _try_unpaywall_download(
-                source_name=source_name,
-                paper_id=paper_id,
-                doi=doi,
-                title=title,
-                save_path=save_path,
-            ),
-        ),
-    ]
-    tasks = {asyncio.create_task(coro): name for name, coro in task_specs}
+    method_names = rank_download_methods(["primary", "repositories", "unpaywall"], source=source_name)
+
+    async def _attempt(method: str) -> Dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            if method == "primary":
+                result = await _try_primary_download(
+                    source_name=source_name,
+                    paper_id=paper_id,
+                    doi=doi,
+                    title=title,
+                    save_path=save_path,
+                )
+            elif method == "repositories":
+                result = await _try_repository_download(
+                    source_name=source_name,
+                    paper_id=paper_id,
+                    doi=doi,
+                    title=title,
+                    save_path=save_path,
+                )
+            else:
+                result = await _try_unpaywall_download(
+                    source_name=source_name,
+                    paper_id=paper_id,
+                    doi=doi,
+                    title=title,
+                    save_path=save_path,
+                )
+            ok = _looks_like_pdf_path(result.get("path"))
+            elapsed = time.perf_counter() - started
+            await asyncio.to_thread(
+                record_download_health,
+                method=method,
+                source=source_name,
+                ok=ok,
+                elapsed_seconds=elapsed,
+                error=str(result.get("error") or ""),
+            )
+            result["elapsed_seconds"] = round(elapsed, 3)
+            return result
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            await asyncio.to_thread(
+                record_download_health,
+                method=method,
+                source=source_name,
+                ok=False,
+                elapsed_seconds=elapsed,
+                error=str(exc),
+            )
+            raise
+
+    tasks = {asyncio.create_task(_attempt(name)): name for name in method_names}
     errors: List[str] = []
     try:
         for completed in asyncio.as_completed(tasks):
@@ -2604,6 +3379,7 @@ async def search_papers(
                         "timed_out": True,
                     }
                 )
+        await asyncio.gather(*source_tasks, return_exceptions=True)
 
     source_results: Dict[str, int] = {}
     errors: Dict[str, str] = {}
@@ -2636,7 +3412,7 @@ async def search_papers(
                 paper["source"] = source_name
             merged_papers.append(paper)
 
-    deduped_papers = _dedupe_papers(merged_papers)
+    deduped_papers = _dedupe_papers(merged_papers, query=query)
 
     result = {
         "query": query,
@@ -2653,6 +3429,90 @@ async def search_papers(
         "cache": {"hit": False, "ttl_seconds": _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)},
     }
     _store_search_result(cache_key, result)
+    return result
+
+
+def _numbered_paper_fallback(candidates: List[Dict[str, Any]]) -> List[str]:
+    return [_elicitation_option_label(candidate) for candidate in candidates]
+
+
+async def _create_paper_selection_result(
+    *,
+    query: str,
+    max_results_per_source: int,
+    sources: str,
+    year: Optional[str],
+    search_result: Dict[str, Any],
+    interaction: str,
+    ranking_profile: str = "",
+    action_tool: str = "parse_selected_papers",
+    action_verb: str = "parse",
+) -> Dict[str, Any]:
+    papers = search_result.get("papers", [])
+    if not isinstance(papers, list):
+        papers = []
+
+    ranked_papers = _rank_papers_for_profile(
+        papers,
+        ranking_profile=ranking_profile,
+        query=query,
+    )
+    profile = _ranking_profile_name(ranking_profile)
+    session = await asyncio.to_thread(
+        cache_create_search_session,
+        query,
+        sources,
+        ranked_papers,
+        {
+            "year": year or "",
+            "max_results_per_source": max_results_per_source,
+            "sources_used": search_result.get("sources_used", []),
+            "source_results": search_result.get("source_results", {}),
+            "errors": search_result.get("errors", {}),
+            "interaction": interaction,
+            "ranking_profile": profile,
+        },
+    )
+    candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(ranked_papers)]
+    parse_ready_total = sum(1 for candidate in candidates if candidate["parse_ready"])
+    numbered_fallback = _numbered_paper_fallback(candidates)
+    action_description = (
+        f"call {action_tool}(selection_token=<token>, selected_indices='1,3,5') "
+        "or selected_indices='all'."
+    )
+
+    result = {
+        "status": "ok",
+        "selection_token": session["selection_token"],
+        "query": query,
+        "sources_requested": sources,
+        "sources_used": search_result.get("sources_used", []),
+        "source_results": search_result.get("source_results", {}),
+        "errors": search_result.get("errors", {}),
+        "ranking_profile": profile,
+        "instructions": (
+            f"Present the numbered papers to the user. To {action_verb} selected papers, "
+            f"{action_description}"
+        ),
+        "papers": candidates,
+        "numbered_fallback": numbered_fallback,
+        "fallback": {
+            "interaction": "backend_session_numbered_selection",
+            "selection_token": session["selection_token"],
+            "instructions": (
+                "If checkbox UI is unavailable, show numbered_fallback and pass the user's "
+                f"numbers to {action_tool}."
+            ),
+            "papers": numbered_fallback,
+        },
+        "total": len(candidates),
+        "parse_ready_total": parse_ready_total,
+        "raw_total": search_result.get("raw_total", len(candidates)),
+    }
+    result["app"] = _paper_selection_app_prompt(
+        selection_token=session["selection_token"],
+        papers=candidates,
+    )
     return result
 
 
@@ -2675,50 +3535,51 @@ async def search_papers_for_parsing(
         sources=sources,
         year=year,
     )
-    papers = search_result.get("papers", [])
-    if not isinstance(papers, list):
-        papers = []
-
-    session = await asyncio.to_thread(
-        cache_create_search_session,
-        query,
-        sources,
-        papers,
-        {
-            "year": year or "",
-            "max_results_per_source": max_results_per_source,
-            "sources_used": search_result.get("sources_used", []),
-            "source_results": search_result.get("source_results", {}),
-            "errors": search_result.get("errors", {}),
-            "interaction": "backend_session_numbered_selection",
-        },
+    return await _create_paper_selection_result(
+        query=query,
+        max_results_per_source=max_results_per_source,
+        sources=sources,
+        year=year,
+        search_result=search_result,
+        interaction="backend_session_numbered_selection",
+        action_tool="parse_selected_papers",
+        action_verb="parse",
     )
-    candidates = [_paper_parse_candidate(paper, index + 1) for index, paper in enumerate(papers)]
-    parse_ready_total = sum(1 for candidate in candidates if candidate["parse_ready"])
 
-    result = {
-        "status": "ok",
-        "selection_token": session["selection_token"],
-        "query": query,
-        "sources_requested": sources,
-        "sources_used": search_result.get("sources_used", []),
-        "source_results": search_result.get("source_results", {}),
-        "errors": search_result.get("errors", {}),
-        "instructions": (
-            "Present the numbered papers to the user. To parse selected papers, "
-            "call parse_selected_papers(selection_token=<token>, selected_indices='1,3,5') "
-            "or selected_indices='all'."
-        ),
-        "papers": candidates,
-        "total": len(candidates),
-        "parse_ready_total": parse_ready_total,
-        "raw_total": search_result.get("raw_total", len(candidates)),
-    }
-    result["app"] = _paper_selection_app_prompt(
-        selection_token=session["selection_token"],
-        papers=candidates,
+
+@mcp.tool()
+async def crawl_papers_for_selection(
+    query: str,
+    max_results_per_source: int = 5,
+    sources: str = "",
+    year: Optional[str] = None,
+    ranking_profile: str = "",
+) -> Dict[str, Any]:
+    """Search papers and persist a checkbox/numbered selection session without downloading or parsing.
+
+    Use ranking_profile='agent-skill' for LLM-agent skill/library/retrieval/security topics.
+    The response always includes a selection_token, MCP App checkbox prompt, and numbered_fallback.
+    """
+    effective_sources = sources
+    if not (effective_sources or "").strip() and _ranking_profile_name(ranking_profile) == AGENT_SKILL_RANKING_PROFILE:
+        effective_sources = "agent-skill-fast"
+    search_result = await search_papers(
+        query=query,
+        max_results_per_source=max_results_per_source,
+        sources=effective_sources,
+        year=year,
     )
-    return result
+    return await _create_paper_selection_result(
+        query=query,
+        max_results_per_source=max_results_per_source,
+        sources=effective_sources,
+        year=year,
+        search_result=search_result,
+        interaction="crawl_papers_for_selection",
+        ranking_profile=ranking_profile,
+        action_tool="download_selected_papers",
+        action_verb="download",
+    )
 
 
 @mcp.resource(
@@ -3097,7 +3958,7 @@ async def parse_selected_papers(
             "total": len(papers),
         }
 
-    async def _run_selected(index: int) -> Dict[str, Any]:
+    async def _resolve_selected(index: int) -> Dict[str, Any]:
         paper = papers[index - 1]
         if not isinstance(paper, dict):
             return {
@@ -3105,14 +3966,11 @@ async def parse_selected_papers(
                 "status": "skipped",
                 "message": "Stored search result is not a paper dictionary.",
             }
-        return await _download_and_parse_session_paper(
+        return await _resolve_session_paper_pdf(
             paper=paper,
             index=index,
             save_path=save_path,
             use_scihub=use_scihub,
-            mode=mode,
-            backend=backend,
-            force=force,
         )
 
     concurrency = _env_int(PARSE_CONCURRENCY_ENV, 3, minimum=1)
@@ -3120,9 +3978,70 @@ async def parse_selected_papers(
 
     async def _limited(index: int) -> Dict[str, Any]:
         async with semaphore:
-            return await _run_selected(index)
+            return await _resolve_selected(index)
 
-    results = await asyncio.gather(*[_limited(index) for index in indices])
+    resolved_results = await asyncio.gather(*[_limited(index) for index in indices])
+    ready_results = [result for result in resolved_results if result.get("status") == "ready"]
+    results_by_index: Dict[int, Dict[str, Any]] = {
+        int(result.get("index") or 0): result
+        for result in resolved_results
+        if result.get("status") != "ready"
+    }
+
+    batch_parse_used = len(ready_results) > 1 and _mineru_batch_parse_enabled(mode)
+    if ready_results:
+        parse_items = []
+        for resolved in ready_results:
+            candidate = resolved["candidate"]
+            parse_items.append(
+                {
+                    "pdf_path": resolved["pdf_path"],
+                    "source": candidate["source"],
+                    "paper_id": candidate["paper_id"],
+                    "doi": candidate["doi"],
+                    "title": candidate["title"],
+                }
+            )
+
+        if batch_parse_used:
+            parse_outputs = await asyncio.to_thread(
+                run_parse_pdfs_with_mineru,
+                parse_items,
+                mode=mode,
+                backend=backend,
+                force=force,
+            )
+        else:
+            parse_semaphore = asyncio.Semaphore(concurrency)
+
+            async def _parse_one(item: Dict[str, str]) -> Dict[str, Any]:
+                async with parse_semaphore:
+                    return await parse_pdf_with_mineru(
+                        pdf_path=item["pdf_path"],
+                        source=item["source"],
+                        paper_id=item["paper_id"],
+                        doi=item["doi"],
+                        title=item["title"],
+                        mode=mode,
+                        backend=backend,
+                        force=force,
+                    )
+
+            parse_outputs = await asyncio.gather(*[_parse_one(item) for item in parse_items])
+
+        for resolved, parse_result in zip(ready_results, parse_outputs):
+            candidate = resolved["candidate"]
+            parse_result = _attach_mineru_key_prompt(parse_result)
+            results_by_index[int(resolved["index"])] = {
+                "index": resolved["index"],
+                "status": parse_result.get("status", "unknown"),
+                "candidate": candidate,
+                "download_method": resolved["download_method"],
+                "pdf_path": resolved["pdf_path"],
+                "parse": parse_result,
+            }
+
+    results = [results_by_index.get(index, {"index": index, "status": "skipped"}) for index in indices]
 
     parsed = sum(1 for result in results if result.get("status") in {"ok", "cached"})
     skipped = sum(1 for result in results if result.get("status") == "skipped")
@@ -3140,11 +4059,190 @@ async def parse_selected_papers(
         "failed": failed,
         "skipped": skipped,
         "parse_concurrency": concurrency,
+        "batch_parse": {
+            "attempted": batch_parse_used,
+            "ready": len(ready_results),
+            "mode": mode or "auto",
+        },
     }
     prompt = _first_mineru_key_prompt(results)
     if prompt:
         summary["mineru_api_key_prompt"] = prompt
     return summary
+
+
+def _parse_job_snapshot(job_id: str) -> Dict[str, Any]:
+    with _PARSE_JOB_LOCK:
+        job = dict(_PARSE_JOBS.get(job_id) or {})
+    if not job:
+        stored = read_parse_job(job_id)
+        if stored:
+            stored.setdefault("active", False)
+            return stored
+        return {"status": "not_found", "job_id": job_id}
+    return _serializable_parse_job(job, active=True)
+
+
+def _serializable_parse_job(job: Dict[str, Any], *, active: bool) -> Dict[str, Any]:
+    snapshot = dict(job)
+    snapshot.pop("task", None)
+    snapshot["active"] = active
+    return snapshot
+
+
+def _persist_parse_job(job_id: str, job: Dict[str, Any], *, active: bool = False) -> None:
+    snapshot = _serializable_parse_job(job, active=active)
+    write_parse_job(job_id, snapshot)
+
+
+def _update_parse_job(job_id: str, **updates: Any) -> None:
+    with _PARSE_JOB_LOCK:
+        job = _PARSE_JOBS.get(job_id)
+        if not job:
+            stored = read_parse_job(job_id)
+            if stored:
+                stored.update(updates)
+                stored["updated_at"] = utc_now()
+                write_parse_job(job_id, stored)
+            return
+        job.update(updates)
+        job["updated_epoch"] = time.time()
+        job["updated_at"] = utc_now()
+        _persist_parse_job(job_id, job, active=job.get("status") not in {"completed", "canceled", "error"})
+
+
+async def _run_parse_job(
+    *,
+    job_id: str,
+    selection_token: str,
+    selected_indices: str,
+    save_path: str,
+    use_scihub: bool,
+    mode: str,
+    backend: str,
+    force: bool,
+) -> None:
+    _update_parse_job(job_id, status="running", started_epoch=time.time(), started_at=utc_now())
+    try:
+        result = await parse_selected_papers(
+            selection_token=selection_token,
+            selected_indices=selected_indices,
+            save_path=save_path,
+            use_scihub=use_scihub,
+            mode=mode,
+            backend=backend,
+            force=force,
+        )
+        _update_parse_job(
+            job_id,
+            status="completed",
+            completed_epoch=time.time(),
+            completed_at=utc_now(),
+            result=result,
+            parsed=result.get("parsed", 0) if isinstance(result, dict) else 0,
+            total=result.get("total", 0) if isinstance(result, dict) else 0,
+        )
+    except asyncio.CancelledError:
+        _update_parse_job(
+            job_id,
+            status="canceled",
+            completed_epoch=time.time(),
+            completed_at=utc_now(),
+            message="Job was canceled.",
+        )
+        raise
+    except Exception as exc:
+        logger.exception("Parse job %s failed", job_id)
+        _update_parse_job(job_id, status="error", completed_epoch=time.time(), completed_at=utc_now(), message=str(exc))
+
+
+@mcp.tool()
+async def submit_parse_job(
+    selection_token: str,
+    selected_indices: str = "all",
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Submit parse_selected_papers as a background job and return immediately."""
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
+    job_id = f"parse_{int(time.time())}_{secrets.token_hex(6)}"
+    created_epoch = time.time()
+    created_at = utc_now()
+    task = asyncio.create_task(
+        _run_parse_job(
+            job_id=job_id,
+            selection_token=selection_token,
+            selected_indices=selected_indices,
+            save_path=save_path,
+            use_scihub=use_scihub,
+            mode=mode,
+            backend=backend,
+            force=force,
+        )
+    )
+    with _PARSE_JOB_LOCK:
+        _PARSE_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "submitted",
+            "selection_token": selection_token,
+            "selected_indices": selected_indices,
+            "save_path": save_path,
+            "use_scihub": use_scihub,
+            "mode": mode,
+            "backend": backend,
+            "force": force,
+            "created_at": created_at,
+            "created_epoch": created_epoch,
+            "updated_at": created_at,
+            "updated_epoch": created_epoch,
+            "task": task,
+        }
+        _persist_parse_job(job_id, _PARSE_JOBS[job_id], active=True)
+    return {"status": "submitted", "job_id": job_id}
+
+
+@mcp.tool()
+async def get_parse_job_status(job_id: str) -> Dict[str, Any]:
+    """Return current background parse job state and result when completed."""
+    return _parse_job_snapshot(job_id)
+
+
+@mcp.tool()
+async def list_parse_jobs() -> Dict[str, Any]:
+    """List persisted and in-memory background parse jobs."""
+    stored_by_id = {str(job.get("job_id")): dict(job) for job in await asyncio.to_thread(list_parse_job_records)}
+    with _PARSE_JOB_LOCK:
+        for job_id, job in _PARSE_JOBS.items():
+            stored_by_id[job_id] = _serializable_parse_job(job, active=True)
+    jobs = list(stored_by_id.values())
+    jobs.sort(key=lambda job: float(job.get("created_epoch") or 0), reverse=True)
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+@mcp.tool()
+async def cancel_parse_job(job_id: str) -> Dict[str, Any]:
+    """Best-effort cancellation for a running background parse job."""
+    with _PARSE_JOB_LOCK:
+        job = _PARSE_JOBS.get(job_id)
+        task = job.get("task") if isinstance(job, dict) else None
+    if not job:
+        stored = read_parse_job(job_id)
+        if stored:
+            return {"status": str(stored.get("status") or "unknown"), "job_id": job_id, "active": False}
+        return {"status": "not_found", "job_id": job_id}
+    if task is not None and not task.done():
+        task.cancel()
+        _update_parse_job(job_id, status="cancel_requested", message="Cancellation requested.")
+        return {"status": "cancel_requested", "job_id": job_id}
+    snapshot = _serializable_parse_job(job, active=False)
+    _persist_parse_job(job_id, job, active=False)
+    return {"status": str(snapshot.get("status") or "completed"), "job_id": job_id, "active": False}
 
 
 @mcp.tool()
@@ -3842,6 +4940,10 @@ async def _download_with_fallback_path(
     """
     save_path = resolve_save_path(save_path)
     source_name = source.strip().lower()
+    arxiv_id = _extract_arxiv_id(paper_id, doi, title)
+    if arxiv_id:
+        source_name = "arxiv"
+        paper_id = arxiv_id
 
     oa_result, attempt_errors = await _race_oa_downloads(
         source_name=source_name,
@@ -3927,6 +5029,43 @@ async def _download_and_parse_session_paper(
     backend: str,
     force: bool,
 ) -> Dict[str, Any]:
+    resolved = await _resolve_session_paper_pdf(
+        paper=paper,
+        index=index,
+        save_path=save_path,
+        use_scihub=use_scihub,
+    )
+    if resolved.get("status") != "ready":
+        return resolved
+
+    candidate = resolved["candidate"]
+    parse_result = await parse_pdf_with_mineru(
+        pdf_path=resolved["pdf_path"],
+        source=candidate["source"],
+        paper_id=candidate["paper_id"],
+        doi=candidate["doi"],
+        title=candidate["title"],
+        mode=mode,
+        backend=backend,
+        force=force,
+    )
+    return {
+        "index": index,
+        "status": parse_result.get("status", "unknown"),
+        "candidate": candidate,
+        "download_method": resolved["download_method"],
+        "pdf_path": resolved["pdf_path"],
+        "parse": parse_result,
+    }
+
+
+async def _resolve_session_paper_pdf(
+    *,
+    paper: Dict[str, Any],
+    index: int,
+    save_path: str,
+    use_scihub: bool,
+) -> Dict[str, Any]:
     candidate = _paper_parse_candidate(paper, index)
     if not candidate["parse_ready"]:
         return {
@@ -3945,28 +5084,17 @@ async def _download_and_parse_session_paper(
     download_id = paper_id or doi or title
 
     if local_pdf_path and os.path.exists(local_pdf_path):
-        parse_result = await parse_pdf_with_mineru(
-            pdf_path=local_pdf_path,
-            source=source,
-            paper_id=paper_id,
-            doi=doi,
-            title=title,
-            mode=mode,
-            backend=backend,
-            force=force,
-        )
         return {
             "index": index,
-            "status": parse_result.get("status", "unknown"),
+            "status": "ready",
             "candidate": candidate,
             "download_method": "local_pdf_path",
             "pdf_path": local_pdf_path,
-            "parse": parse_result,
         }
 
     direct_error = ""
     if pdf_url:
-        filename_hint = f"{source}_{download_id or index}"
+        filename_hint = str(candidate.get("canonical_pdf_stem") or download_id or f"paper_{index}")
         direct_path = await _download_from_url(pdf_url, save_path, filename_hint)
         if isinstance(direct_path, str) and os.path.exists(direct_path):
             record_download(
@@ -3978,23 +5106,12 @@ async def _download_and_parse_session_paper(
                 downloader="search_result_pdf_url",
                 legal_status="search_result_open_access_pdf_url",
             )
-            parse_result = await parse_pdf_with_mineru(
-                pdf_path=direct_path,
-                source=source,
-                paper_id=paper_id,
-                doi=doi,
-                title=title,
-                mode=mode,
-                backend=backend,
-                force=force,
-            )
             return {
                 "index": index,
-                "status": parse_result.get("status", "unknown"),
+                "status": "ready",
                 "candidate": candidate,
                 "download_method": "search_result_pdf_url",
                 "pdf_path": direct_path,
-                "parse": parse_result,
             }
         direct_error = "direct pdf_url download failed"
 
@@ -4017,24 +5134,590 @@ async def _download_and_parse_session_paper(
             "message": message,
         }
 
-    parse_result = await parse_pdf_with_mineru(
-        pdf_path=pdf_path,
-        source=source,
-        paper_id=paper_id or doi,
-        doi=doi,
-        title=title,
-        mode=mode,
-        backend=backend,
-        force=force,
-    )
     return {
         "index": index,
-        "status": parse_result.get("status", "unknown"),
+        "status": "ready",
         "candidate": candidate,
         "download_method": "download_with_fallback",
         "pdf_path": pdf_path,
-        "parse": parse_result,
     }
+
+
+def _is_valid_pdf_file(path: Any) -> bool:
+    if not isinstance(path, (str, os.PathLike)):
+        return False
+    try:
+        target = Path(path).expanduser()
+        if not target.exists() or not target.is_file():
+            return False
+        with target.open("rb") as file_obj:
+            header = file_obj.read(4096)
+        return header.lstrip().startswith(b"%PDF")
+    except OSError:
+        return False
+
+
+def _pdf_result_metadata(path: str) -> Dict[str, Any]:
+    target = Path(path).expanduser().resolve()
+    metadata = {
+        "pdf_path": str(target),
+        "bytes": 0,
+        "pdf_sha256": "",
+        "valid_pdf": _is_valid_pdf_file(str(target)),
+    }
+    try:
+        metadata["bytes"] = target.stat().st_size
+        metadata["pdf_sha256"] = sha256_file(target)
+    except Exception:
+        pass
+    return metadata
+
+
+def _candidate_download_id(candidate: Dict[str, Any]) -> str:
+    return (
+        str(candidate.get("paper_id") or "").strip()
+        or str(candidate.get("doi") or "").strip()
+        or str(candidate.get("title") or "").strip()
+    )
+
+
+def _existing_pdf_candidates(candidate: Dict[str, Any], *, index: int, save_path: str) -> List[tuple[str, Path]]:
+    root = Path(resolve_save_path(save_path)).expanduser()
+    paths: List[tuple[str, Path]] = []
+
+    local_pdf_path = str(candidate.get("local_pdf_path") or "").strip()
+    if local_pdf_path:
+        paths.append(("local_pdf_path", Path(local_pdf_path).expanduser()))
+
+    source = str(candidate.get("source") or "").strip().lower()
+    paper_id = str(candidate.get("paper_id") or "").strip()
+    download_id = _candidate_download_id(candidate)
+    canonical_stem = str(candidate.get("canonical_pdf_stem") or "").strip()
+    if canonical_stem:
+        paths.append(("existing_canonical", root / _pdf_filename_from_hint(canonical_stem, default=f"paper_{index}")))
+
+    if candidate.get("pdf_url"):
+        paths.append(("existing_direct_pdf_url", root / _pdf_filename_from_hint(download_id or f"paper_{index}")))
+
+    if paper_id:
+        paper_variants = [
+            paper_id,
+            paper_id.replace("/", "_").replace("\\", "_"),
+            _safe_filename(paper_id),
+        ]
+        for variant in paper_variants:
+            if not variant:
+                continue
+            paths.append(("existing_source_native", root / _pdf_filename_from_hint(variant)))
+            if source:
+                paths.append(("existing_source_native", root / _pdf_filename_from_hint(f"{source}_{variant}")))
+
+    seen: set[str] = set()
+    unique: List[tuple[str, Path]] = []
+    for method, path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((method, path))
+    return unique
+
+
+def _find_existing_pdf(candidate: Dict[str, Any], *, index: int, save_path: str) -> tuple[str, str]:
+    for method, path in _existing_pdf_candidates(candidate, index=index, save_path=save_path):
+        if _is_valid_pdf_file(str(path)):
+            return str(path.expanduser().resolve()), method
+    return "", ""
+
+
+async def _download_selected_session_paper(
+    *,
+    paper: Dict[str, Any],
+    index: int,
+    save_path: str,
+    use_scihub: bool,
+) -> Dict[str, Any]:
+    candidate = _paper_parse_candidate(paper, index)
+    if not candidate["parse_ready"]:
+        return {
+            "index": index,
+            "status": "skipped",
+            "candidate": candidate,
+            "message": candidate["reason"],
+        }
+
+    existing_path, existing_method = _find_existing_pdf(candidate, index=index, save_path=save_path)
+    if existing_path:
+        result = {
+            "index": index,
+            "status": "skipped_existing",
+            "candidate": candidate,
+            "download_method": existing_method,
+            **_pdf_result_metadata(existing_path),
+        }
+        return result
+
+    source = candidate["source"]
+    paper_id = candidate["paper_id"]
+    doi = candidate["doi"]
+    title = candidate["title"]
+    pdf_url = candidate["pdf_url"]
+    download_id = _candidate_download_id(candidate)
+
+    invalid_local_path = str(candidate.get("local_pdf_path") or "").strip()
+    if invalid_local_path and Path(invalid_local_path).expanduser().exists() and not _is_valid_pdf_file(invalid_local_path):
+        if not (pdf_url or paper_id or doi or title):
+            return {
+                "index": index,
+                "status": "invalid_pdf",
+                "candidate": candidate,
+                "pdf_path": invalid_local_path,
+                "message": "Existing local_pdf_path is not a valid PDF.",
+            }
+
+    direct_error = ""
+    if pdf_url:
+        filename_hint = str(candidate.get("canonical_pdf_stem") or download_id or f"paper_{index}")
+        direct_path = await _download_from_url(pdf_url, save_path, filename_hint)
+        if isinstance(direct_path, str) and os.path.exists(direct_path):
+            if not _is_valid_pdf_file(direct_path):
+                return {
+                    "index": index,
+                    "status": "invalid_pdf",
+                    "candidate": candidate,
+                    "download_method": "search_result_pdf_url",
+                    "pdf_path": direct_path,
+                    "message": "Downloaded file failed PDF validation.",
+                }
+            await asyncio.to_thread(
+                record_download,
+                pdf_path=direct_path,
+                source=source,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                downloader="search_result_pdf_url",
+                legal_status="search_result_open_access_pdf_url",
+            )
+            return {
+                "index": index,
+                "status": "downloaded",
+                "candidate": candidate,
+                "download_method": "search_result_pdf_url",
+                **_pdf_result_metadata(direct_path),
+            }
+        direct_error = "direct pdf_url download failed"
+
+    pdf_path = await _download_with_fallback_path(
+        source=source,
+        paper_id=download_id,
+        doi=doi,
+        title=title,
+        save_path=save_path,
+        use_scihub=use_scihub,
+    )
+    if not isinstance(pdf_path, str) or not os.path.exists(pdf_path):
+        message = str(pdf_path)
+        if direct_error:
+            message = f"{direct_error}; {message}"
+        return {
+            "index": index,
+            "status": "download_failed",
+            "candidate": candidate,
+            "message": message,
+        }
+    if not _is_valid_pdf_file(pdf_path):
+        return {
+            "index": index,
+            "status": "invalid_pdf",
+            "candidate": candidate,
+            "download_method": "download_with_fallback",
+            "pdf_path": pdf_path,
+            "message": "Downloaded file failed PDF validation.",
+        }
+
+    return {
+        "index": index,
+        "status": "downloaded",
+        "candidate": candidate,
+        "download_method": "download_with_fallback",
+        **_pdf_result_metadata(pdf_path),
+    }
+
+
+def _download_manifest_path(save_path: str, selection_token: str) -> str:
+    root = Path(resolve_save_path(save_path))
+    root.mkdir(parents=True, exist_ok=True)
+    token = _safe_filename(selection_token, default="selection")
+    return str((root / f"paper_search_download_manifest_{token}.json").resolve())
+
+
+@mcp.tool()
+async def download_selected_papers(
+    selection_token: str,
+    selected_indices: str = "all",
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    concurrency: int = 0,
+) -> Dict[str, Any]:
+    """Download papers from a saved selection session without parsing them."""
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
+    save_path = resolve_save_path(save_path)
+    session = await asyncio.to_thread(cache_get_search_session, selection_token)
+    if not session:
+        return {
+            "status": "not_found",
+            "selection_token": selection_token,
+            "message": "Search session not found. Run crawl_papers_for_selection again.",
+        }
+
+    papers = session.get("papers", [])
+    if not isinstance(papers, list):
+        papers = []
+
+    try:
+        indices = _parse_selected_indices(selected_indices, len(papers))
+    except ValueError as exc:
+        return {
+            "status": "invalid_selection",
+            "selection_token": selection_token,
+            "message": str(exc),
+            "total": len(papers),
+        }
+
+    download_concurrency = concurrency if concurrency and concurrency > 0 else _env_int(
+        DOWNLOAD_CONCURRENCY_ENV,
+        4,
+        minimum=1,
+    )
+    semaphore = asyncio.Semaphore(download_concurrency)
+
+    async def _limited(index: int) -> Dict[str, Any]:
+        async with semaphore:
+            paper = papers[index - 1]
+            if not isinstance(paper, dict):
+                return {
+                    "index": index,
+                    "status": "skipped",
+                    "message": "Stored search result is not a paper dictionary.",
+                }
+            return await _download_selected_session_paper(
+                paper=paper,
+                index=index,
+                save_path=save_path,
+                use_scihub=use_scihub,
+            )
+
+    results = await asyncio.gather(*[_limited(index) for index in indices])
+    downloaded = sum(1 for result in results if result.get("status") == "downloaded")
+    skipped_existing = sum(1 for result in results if result.get("status") == "skipped_existing")
+    skipped = sum(1 for result in results if result.get("status") == "skipped")
+    failed = len(results) - downloaded - skipped_existing - skipped
+    status = "ok" if failed == 0 else "partial" if downloaded or skipped_existing else "failed"
+    parse_prompt = await _parse_prompt_for_download_results(
+        selection_token=selection_token,
+        session=session,
+        results=results,
+        save_path=save_path,
+        use_scihub=use_scihub,
+    )
+
+    manifest_path = _download_manifest_path(save_path, selection_token)
+    manifest = {
+        "status": status,
+        "selection_token": selection_token,
+        "query": session.get("query", ""),
+        "sources": session.get("sources", ""),
+        "selected_indices": indices,
+        "save_path": save_path,
+        "use_scihub": use_scihub,
+        "download_concurrency": download_concurrency,
+        "created_at": utc_now(),
+        "results": results,
+        "total": len(results),
+        "downloaded": downloaded,
+        "skipped_existing": skipped_existing,
+        "skipped": skipped,
+        "failed": failed,
+        "parse_prompt": parse_prompt,
+    }
+    await asyncio.to_thread(write_json, manifest_path, manifest)
+
+    response = {**manifest, "manifest_path": manifest_path}
+    if isinstance(parse_prompt, dict) and isinstance(parse_prompt.get("app"), dict):
+        response["app"] = parse_prompt["app"]
+    return response
+
+
+@mcp.tool()
+async def crawl_download_parse_papers(
+    query: str,
+    count: int = 10,
+    max_results_per_source: int = 5,
+    sources: str = "",
+    year: Optional[str] = None,
+    ranking_profile: str = "",
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    download_concurrency: int = 0,
+) -> Dict[str, Any]:
+    """Compatibility workflow: search and download top-ranked papers, then return a parse prompt.
+
+    For natural-language MCP use, prefer paper_research_workflow. It can also
+    submit the background parse job so the caller does not need to interpret
+    parse_prompt manually.
+    """
+    invalid_save_path = _invalid_mcp_save_path(save_path)
+    if invalid_save_path:
+        return invalid_save_path
+
+    limit = max(1, int(count or 1))
+    selection = await crawl_papers_for_selection(
+        query=query,
+        max_results_per_source=max_results_per_source,
+        sources=sources,
+        year=year,
+        ranking_profile=ranking_profile,
+    )
+    papers = selection.get("papers", [])
+    if not isinstance(papers, list) or not papers:
+        return {
+            "status": "no_results",
+            "query": query,
+            "selection": selection,
+            "message": "No papers were found to download.",
+        }
+
+    selected_indices = ",".join(str(index) for index in range(1, min(limit, len(papers)) + 1))
+    download = await download_selected_papers(
+        selection_token=selection["selection_token"],
+        selected_indices=selected_indices,
+        save_path=save_path,
+        use_scihub=use_scihub,
+        concurrency=download_concurrency,
+    )
+    status = download.get("status", "unknown") if isinstance(download, dict) else "unknown"
+    response = {
+        "status": status,
+        "query": query,
+        "count_requested": limit,
+        "selected_indices": selected_indices,
+        "save_path": resolve_save_path(save_path),
+        "selection": selection,
+        "download": download,
+        "parse_prompt": download.get("parse_prompt") if isinstance(download, dict) else None,
+    }
+    if isinstance(download, dict) and isinstance(download.get("app"), dict):
+        response["app"] = download["app"]
+    return response
+
+
+def _workflow_intent_name(intent: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", (intent or "").strip().lower()).strip("_")
+    return normalized or "search_download_parse"
+
+
+def _workflow_selection_indices(selected_indices: str, selection_mode: str, count: int, total: int) -> str:
+    explicit = (selected_indices or "").strip()
+    if explicit:
+        return explicit
+
+    mode = re.sub(r"[^a-z0-9]+", "_", (selection_mode or "").strip().lower()).strip("_") or "auto_top"
+    if mode in {"all", "auto_all"}:
+        return "all"
+
+    try:
+        limit = max(1, int(count or 1))
+    except (TypeError, ValueError):
+        limit = 1
+    limit = min(limit, max(0, total))
+    return ",".join(str(index) for index in range(1, limit + 1))
+
+
+def _workflow_parse_execution_name(parse_execution: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", (parse_execution or "").strip().lower()).strip("_")
+    if normalized in {"sync", "synchronous", "wait", "blocking", "inline"}:
+        return "sync"
+    if normalized in {"none", "no", "off", "false", "prompt", "manual"}:
+        return "none"
+    return "background"
+
+
+@mcp.tool()
+async def paper_research_workflow(
+    query: str,
+    intent: str = "search_download_parse",
+    count: int = 5,
+    max_results_per_source: int = 5,
+    sources: str = "",
+    year: Optional[str] = None,
+    ranking_profile: str = "",
+    selection_mode: str = "auto_top",
+    selected_indices: str = "",
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    parse_mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+    parse_execution: str = "background",
+    download_concurrency: int = 0,
+) -> Dict[str, Any]:
+    """Preferred MCP-first natural-language workflow for paper research.
+
+    Use this high-level tool when the user asks in natural language to find,
+    select, download, or parse papers. It coordinates the lower-level MCP tools
+    directly and only returns CLI instructions as a fallback for unavailable
+    host capabilities.
+    """
+    intent_name = _workflow_intent_name(intent)
+    selection_mode_name = _workflow_intent_name(selection_mode)
+    parse_execution_name = _workflow_parse_execution_name(parse_execution)
+
+    search_only_intents = {"search", "search_only", "find", "find_only", "discover", "selection", "select"}
+    manual_selection = selection_mode_name in {"manual", "choose", "selection", "select"}
+    should_download = intent_name not in search_only_intents and not manual_selection
+    should_parse = should_download and (
+        "parse" in intent_name
+        or intent_name in {"research", "full", "end_to_end", "search_download_parse", "download_parse"}
+    )
+
+    selection = await crawl_papers_for_selection(
+        query=query,
+        max_results_per_source=max_results_per_source,
+        sources=sources,
+        year=year,
+        ranking_profile=ranking_profile,
+    )
+    papers = selection.get("papers", []) if isinstance(selection, dict) else []
+    if not isinstance(papers, list) or not papers:
+        return {
+            "status": "no_results",
+            "workflow": {
+                "tool": "paper_research_workflow",
+                "mcp_first": True,
+                "intent": intent_name,
+                "selection_mode": selection_mode_name,
+            },
+            "query": query,
+            "selection": selection,
+            "message": "No papers were found for the query.",
+        }
+
+    if not should_download:
+        response = {
+            "status": "selection_ready",
+            "workflow": {
+                "tool": "paper_research_workflow",
+                "mcp_first": True,
+                "intent": intent_name,
+                "selection_mode": selection_mode_name,
+                "next_tool": "download_selected_papers",
+            },
+            "query": query,
+            "selection": selection,
+            "message": (
+                "Paper candidates are ready. Use the MCP App/numbered fallback, "
+                "or call download_selected_papers with the returned selection_token."
+            ),
+        }
+        if isinstance(selection, dict) and isinstance(selection.get("app"), dict):
+            response["app"] = selection["app"]
+        return response
+
+    indices = _workflow_selection_indices(selected_indices, selection_mode, count, len(papers))
+    if not indices:
+        return {
+            "status": "invalid_selection",
+            "workflow": {
+                "tool": "paper_research_workflow",
+                "mcp_first": True,
+                "intent": intent_name,
+                "selection_mode": selection_mode_name,
+            },
+            "query": query,
+            "selection": selection,
+            "message": "No selected papers were available to download.",
+        }
+
+    download = await download_selected_papers(
+        selection_token=selection["selection_token"],
+        selected_indices=indices,
+        save_path=save_path,
+        use_scihub=use_scihub,
+        concurrency=download_concurrency,
+    )
+
+    response: Dict[str, Any] = {
+        "status": download.get("status", "unknown") if isinstance(download, dict) else "unknown",
+        "workflow": {
+            "tool": "paper_research_workflow",
+            "mcp_first": True,
+            "intent": intent_name,
+            "selection_mode": selection_mode_name,
+            "selected_indices": indices,
+            "parse_execution": parse_execution_name,
+        },
+        "query": query,
+        "count_requested": count,
+        "selected_indices": indices,
+        "save_path": resolve_save_path(save_path),
+        "selection": selection,
+        "download": download,
+        "parse_prompt": download.get("parse_prompt") if isinstance(download, dict) else None,
+    }
+    if isinstance(download, dict) and isinstance(download.get("app"), dict):
+        response["app"] = download["app"]
+
+    parse_prompt = response.get("parse_prompt")
+    if not should_parse or parse_execution_name == "none":
+        response["workflow"]["next_tool"] = "submit_parse_job" if should_parse else ""
+        return response
+
+    if not isinstance(parse_prompt, dict) or not parse_prompt.get("selection_token"):
+        response["status"] = "partial"
+        response["message"] = "Download finished, but no parse-ready PDFs were found."
+        return response
+
+    parse_ready_total = int(parse_prompt.get("parse_ready_total") or 0)
+    if parse_ready_total <= 0:
+        response["status"] = "partial"
+        response["message"] = "Download finished, but no parse-ready PDFs were found."
+        return response
+
+    parse_selection_token = str(parse_prompt["selection_token"])
+    parse_indices = str(parse_prompt.get("recommended_selected_indices") or "all")
+
+    if parse_execution_name == "sync":
+        parse_result = await parse_selected_papers(
+            selection_token=parse_selection_token,
+            selected_indices=parse_indices,
+            save_path=save_path,
+            use_scihub=use_scihub,
+            mode=parse_mode,
+            backend=backend,
+            force=force,
+        )
+        response["parse"] = parse_result
+        response["status"] = parse_result.get("status", response["status"]) if isinstance(parse_result, dict) else response["status"]
+        response["workflow"]["next_tool"] = "get_parsed_paper"
+        return response
+
+    parse_job = await submit_parse_job(
+        selection_token=parse_selection_token,
+        selected_indices=parse_indices,
+        save_path=save_path,
+        use_scihub=use_scihub,
+        mode=parse_mode,
+        backend=backend,
+        force=force,
+    )
+    response["parse_job"] = parse_job
+    response["status"] = parse_job.get("status", response["status"]) if isinstance(parse_job, dict) else response["status"]
+    response["workflow"]["next_tool"] = "get_parse_job_status"
+    return response
 
 
 @mcp.tool()
@@ -4067,6 +5750,45 @@ async def parse_pdf_with_mineru(
         force=force,
     )
     return _attach_mineru_key_prompt(result)
+
+
+@mcp.tool()
+async def parse_pdfs_with_mineru(
+    pdf_paths: str,
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Parse multiple local PDFs; newline/comma/semicolon separated paths are accepted."""
+    paths = [part.strip() for part in re.split(r"[\n;,]+", pdf_paths or "") if part.strip()]
+    if not paths:
+        return {"status": "invalid_request", "message": "At least one PDF path is required.", "results": []}
+    results = await asyncio.to_thread(
+        run_parse_pdfs_with_mineru,
+        [{"pdf_path": path} for path in paths],
+        mode=mode,
+        backend=backend,
+        force=force,
+    )
+    results = [_attach_mineru_key_prompt(result) for result in results]
+    parsed = sum(1 for result in results if result.get("status") in {"ok", "cached"})
+    failed = len(results) - parsed
+    status = "ok" if failed == 0 else "partial" if parsed else "failed"
+    response = {
+        "status": status,
+        "results": results,
+        "total": len(results),
+        "parsed": parsed,
+        "failed": failed,
+        "batch_parse": {
+            "attempted": len(results) > 1 and _mineru_batch_parse_enabled(mode),
+            "mode": mode or "auto",
+        },
+    }
+    prompt = _first_mineru_key_prompt(results)
+    if prompt:
+        response["mineru_api_key_prompt"] = prompt
+    return response
 
 
 @mcp.tool()
@@ -4162,8 +5884,23 @@ async def get_paper_assets(paper_key: str, asset_type: str = "all") -> List[Dict
 @mcp.tool()
 async def search_parsed_paper(paper_key: str, query: str, max_results: int = 20) -> Dict[str, Any]:
     """Search cached parsed Markdown/content blocks for a query string."""
-    hits = await asyncio.to_thread(search_parsed, paper_key, query, max_results)
-    return {"paper_key": paper_key, "query": query, "hits": hits, "total": len(hits)}
+    hits = await asyncio.to_thread(search_parsed_index, query, paper_key, max_results)
+    return {"paper_key": paper_key, "query": query, "hits": hits, "total": len(hits), "index": "sqlite_fts_or_fallback"}
+
+
+@mcp.tool()
+async def search_parsed_papers(query: str, paper_key: str = "", max_results: int = 20) -> Dict[str, Any]:
+    """Search the parsed-paper FTS index across one or all parsed papers."""
+    hits = await asyncio.to_thread(search_parsed_index, query, paper_key, max_results)
+    return {"paper_key": paper_key, "query": query, "hits": hits, "total": len(hits), "index": "sqlite_fts_or_fallback"}
+
+
+@mcp.tool()
+async def index_parsed_cache(paper_key: str = "") -> Dict[str, Any]:
+    """Build or rebuild the parsed-paper SQLite FTS index."""
+    if paper_key:
+        return await asyncio.to_thread(index_parsed_paper, paper_key)
+    return await asyncio.to_thread(rebuild_parsed_index)
 
 
 @mcp.tool()
@@ -4177,6 +5914,12 @@ async def delete_parsed_cache(paper_key: str) -> Dict[str, Any]:
 async def cleanup_redundant_cache_artifacts(apply: bool = False) -> Dict[str, Any]:
     """Remove historical heavyweight cache duplicates; dry-run unless apply is true."""
     return await asyncio.to_thread(cleanup_redundant_artifacts, None, dry_run=not apply)
+
+
+@mcp.tool()
+async def get_download_health_stats() -> Dict[str, Any]:
+    """Return persistent success/latency stats for download fallback methods."""
+    return await asyncio.to_thread(get_download_health)
 
 
 @mcp.tool()

@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import zipfile
 import shutil
+import os
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -49,15 +50,7 @@ class TestMinerUParser(unittest.TestCase):
             self.assertEqual(Path(result["full_md_path"]).parent, pdf.with_name("paper_mineru"))
             self.assertEqual(Path(result["assets_dir"]), pdf.with_name("paper_mineru") / "assets")
             self.assertEqual(Path(result["result_zip_path"]), pdf.with_suffix(".zip"))
-            self.assertTrue(Path(result["result_zip_path"]).exists())
-
-            with zipfile.ZipFile(result["result_zip_path"]) as archive:
-                names = set(archive.namelist())
-            self.assertIn("full.md", names)
-            self.assertIn("content_list.json", names)
-            self.assertIn("manifest.json", names)
-            self.assertIn("metadata.json", names)
-            self.assertIn("status.json", names)
+            self.assertFalse(Path(result["result_zip_path"]).exists())
 
             manifest = read_json(result["manifest_path"], {})
             self.assertEqual(manifest["parser"], "pypdf")
@@ -83,7 +76,7 @@ class TestMinerUParser(unittest.TestCase):
             self.assertEqual(first["status"], "ok")
             self.assertEqual(second["status"], "cached")
             self.assertEqual(second["paper_key"], "stable-key")
-            self.assertTrue(Path(second["result_zip_path"]).exists())
+            self.assertFalse(Path(second["result_zip_path"]).exists())
             self.assertEqual(Path(second["full_md_path"]).parent, pdf.with_name("paper_mineru"))
             self.assertTrue(Path(second["full_md_path"]).exists())
 
@@ -96,27 +89,85 @@ class TestMinerUParser(unittest.TestCase):
             parser.parse_pdf(str(pdf), paper_key_hint="stable-key")
             visible_dir = pdf.with_name("paper_mineru")
             shutil.rmtree(visible_dir)
-            pdf.with_suffix(".zip").unlink()
 
             result = parser.parse_pdf(str(pdf), paper_key_hint="stable-key")
 
             self.assertEqual(result["status"], "ok")
             self.assertTrue((visible_dir / "full.md").exists())
             self.assertTrue((visible_dir / "manifest.json").exists())
-            self.assertTrue(pdf.with_suffix(".zip").exists())
+            self.assertFalse(pdf.with_suffix(".zip").exists())
 
-    def test_export_zip_can_be_disabled(self):
+    def test_export_zip_is_disabled_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "paper.pdf"
             _make_pdf(pdf)
 
-            with patch.dict("os.environ", {"PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP": "false"}):
-                parser = MinerUParser(mode="pypdf", cache_dir=tmp)
-                result = parser.parse_pdf(str(pdf), paper_key_hint="no-zip", force=True)
+            parser = MinerUParser(mode="pypdf", cache_dir=tmp)
+            result = parser.parse_pdf(str(pdf), paper_key_hint="no-zip", force=True)
 
             self.assertEqual(result["status"], "ok")
             self.assertTrue(Path(result["full_md_path"]).exists())
             self.assertFalse(Path(result["result_zip_path"]).exists())
+
+    def test_export_zip_can_be_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            _make_pdf(pdf)
+
+            with patch.dict("os.environ", {"PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP": "true"}):
+                parser = MinerUParser(mode="pypdf", cache_dir=tmp)
+                result = parser.parse_pdf(str(pdf), paper_key_hint="with-zip", force=True)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(Path(result["result_zip_path"]).exists())
+            with zipfile.ZipFile(result["result_zip_path"]) as archive:
+                names = set(archive.namelist())
+            self.assertIn("full.md", names)
+            self.assertIn("content_list.json", names)
+            self.assertIn("manifest.json", names)
+            self.assertIn("metadata.json", names)
+            self.assertIn("status.json", names)
+
+    def test_extract_oss_no_proxy_is_added_by_default(self):
+        with patch.dict(os.environ, {"NO_PROXY": "localhost"}, clear=True):
+            MinerUParser(mode="extract", api_key="test-token")
+
+            self.assertEqual(
+                os.environ["NO_PROXY"],
+                "localhost,.aliyuncs.com,mineru.oss-cn-shanghai.aliyuncs.com",
+            )
+            self.assertEqual(
+                os.environ["no_proxy"],
+                "localhost,.aliyuncs.com,mineru.oss-cn-shanghai.aliyuncs.com",
+            )
+
+    def test_extract_oss_no_proxy_can_be_disabled(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY": "false",
+                "NO_PROXY": "localhost",
+            },
+            clear=True,
+        ):
+            MinerUParser(mode="extract", api_key="test-token")
+
+            self.assertEqual(os.environ["NO_PROXY"], "localhost")
+            self.assertEqual(os.environ["no_proxy"], "localhost")
+
+    def test_extract_oss_no_proxy_hosts_can_be_customized(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY_HOSTS": ".aliyuncs.com,example.test",
+                "NO_PROXY": ".aliyuncs.com",
+            },
+            clear=True,
+        ):
+            MinerUParser(mode="extract", api_key="test-token")
+
+            self.assertEqual(os.environ["NO_PROXY"], ".aliyuncs.com,example.test")
+            self.assertEqual(os.environ["no_proxy"], ".aliyuncs.com,example.test")
 
     def test_auto_mode_uses_extract_local_cli_then_pypdf_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,7 +243,6 @@ class TestMinerUParser(unittest.TestCase):
             shutil.copy2(first["content_list_path"], cache_paths["content_list"])
             shutil.copy2(first["manifest_path"], cache_paths["manifest"])
             shutil.rmtree(pdf.with_name("paper_mineru"))
-            pdf.with_suffix(".zip").unlink()
 
             result = parser.parse_pdf(str(pdf), paper_key_hint="stable-key")
 
@@ -268,7 +318,7 @@ class TestMinerUParser(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["mode"], "extract")
             self.assertEqual(Path(result["result_zip_path"]), pdf.with_suffix(".zip"))
-            self.assertTrue(Path(result["result_zip_path"]).exists())
+            self.assertFalse(Path(result["result_zip_path"]).exists())
             self.assertEqual(Path(result["manifest_path"]).parent, pdf.with_name("paper_mineru"))
             self.assertTrue(Path(result["full_md_path"]).read_text(encoding="utf-8").startswith("# Parsed Paper"))
 
@@ -279,15 +329,150 @@ class TestMinerUParser(unittest.TestCase):
             self.assertEqual(put_mock.call_args.args[0], "https://upload.example/paper.pdf")
             self.assertGreaterEqual(get_mock.call_count, 2)
 
-            with zipfile.ZipFile(result["result_zip_path"]) as archive:
-                names = set(archive.namelist())
-            self.assertIn("full.md", names)
-            self.assertIn("content_list.json", names)
-            self.assertIn("assets/figures/figure1.png", names)
-            self.assertFalse(any(name.startswith("raw/") for name in names))
-
             mineru_dir = Path(result["manifest_path"]).parent
             self.assertFalse((mineru_dir / "raw").exists())
+
+    def test_extract_api_batch_parses_multiple_pdfs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf1 = Path(tmp) / "paper-one.pdf"
+            pdf2 = Path(tmp) / "paper-two.pdf"
+            _make_pdf(pdf1)
+            _make_pdf(pdf2)
+
+            zip_one = self._zip_bytes({"paper/full.md": b"# One\n\nBatch alpha"})
+            zip_two = self._zip_bytes({"paper/full.md": b"# Two\n\nBatch beta"})
+
+            post_response = Mock()
+            post_response.json.return_value = {
+                "code": 0,
+                "data": {
+                    "batch_id": "batch-2",
+                    "file_urls": [
+                        {"upload_url": "https://upload.example/one.pdf"},
+                        {"upload_url": "https://upload.example/two.pdf"},
+                    ],
+                },
+            }
+            post_response.raise_for_status.return_value = None
+
+            put_response = Mock()
+            put_response.raise_for_status.return_value = None
+
+            def fake_get(url, **kwargs):
+                response = Mock()
+                response.raise_for_status.return_value = None
+                if "extract-results" in url:
+                    data_ids = [item["data_id"] for item in fake_get.batch_payload["files"]]
+                    response.json.return_value = {
+                        "code": 0,
+                        "data": {
+                            "extract_result": [
+                                {"data_id": data_ids[0], "state": "done", "full_zip_url": "https://cdn.example/one.zip"},
+                                {"data_id": data_ids[1], "state": "done", "full_zip_url": "https://cdn.example/two.zip"},
+                            ]
+                        },
+                    }
+                    return response
+                response.headers = {"content-type": "application/zip"}
+                response.content = zip_one if "one.zip" in url else zip_two
+                return response
+
+            parser = MinerUParser(mode="extract", api_key="test-token", cache_dir=tmp, timeout=30)
+
+            def fake_post(url, **kwargs):
+                fake_get.batch_payload = kwargs["json"]
+                return post_response
+
+            with patch("paper_search_mcp.parsers.mineru.requests.post", side_effect=fake_post) as post_mock, patch(
+                "paper_search_mcp.parsers.mineru.requests.put", return_value=put_response
+            ) as put_mock, patch("paper_search_mcp.parsers.mineru.requests.get", side_effect=fake_get):
+                results = parser.parse_pdfs(
+                    [
+                        {"pdf_path": str(pdf1), "paper_key": "batch-one", "title": "Batch One"},
+                        {"pdf_path": str(pdf2), "paper_key": "batch-two", "title": "Batch Two"},
+                    ],
+                    force=True,
+                )
+
+            self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+            self.assertEqual([result["mode"] for result in results], ["extract", "extract"])
+            self.assertEqual(post_mock.call_args.kwargs["json"]["files"][0]["name"], "paper-one.pdf")
+            self.assertEqual(len(post_mock.call_args.kwargs["json"]["files"]), 2)
+            self.assertEqual(put_mock.call_count, 2)
+            self.assertIn("Batch alpha", Path(results[0]["full_md_path"]).read_text(encoding="utf-8"))
+            self.assertIn("Batch beta", Path(results[1]["full_md_path"]).read_text(encoding="utf-8"))
+
+    def test_extract_api_batch_reuses_downloaded_zip_on_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf1 = Path(tmp) / "paper-one.pdf"
+            pdf2 = Path(tmp) / "paper-two.pdf"
+            _make_pdf(pdf1)
+            _make_pdf(pdf2)
+
+            zip_one = self._zip_bytes({"paper/full.md": b"# One\n\nReusable alpha"})
+            zip_two = self._zip_bytes({"paper/full.md": b"# Two\n\nReusable beta"})
+
+            post_response = Mock()
+            post_response.json.return_value = {
+                "code": 0,
+                "data": {
+                    "batch_id": "batch-reuse",
+                    "file_urls": [
+                        {"upload_url": "https://upload.example/one.pdf"},
+                        {"upload_url": "https://upload.example/two.pdf"},
+                    ],
+                },
+            }
+            post_response.raise_for_status.return_value = None
+            put_response = Mock()
+            put_response.raise_for_status.return_value = None
+
+            def fake_post(url, **kwargs):
+                fake_get.batch_payload = kwargs["json"]
+                return post_response
+
+            def fake_get(url, **kwargs):
+                response = Mock()
+                response.raise_for_status.return_value = None
+                if "extract-results" in url:
+                    data_ids = [item["data_id"] for item in fake_get.batch_payload["files"]]
+                    response.json.return_value = {
+                        "code": 0,
+                        "data": {
+                            "extract_result": [
+                                {"data_id": data_ids[0], "state": "done", "full_zip_url": "https://cdn.example/one.zip"},
+                                {"data_id": data_ids[1], "state": "done", "full_zip_url": "https://cdn.example/two.zip"},
+                            ]
+                        },
+                    }
+                    return response
+                response.headers = {"content-type": "application/zip"}
+                response.content = zip_one if "one.zip" in url else zip_two
+                return response
+
+            parser = MinerUParser(mode="extract", api_key="test-token", cache_dir=tmp, timeout=30)
+            items = [
+                {"pdf_path": str(pdf1), "paper_key": "reuse-one", "title": "Reuse One"},
+                {"pdf_path": str(pdf2), "paper_key": "reuse-two", "title": "Reuse Two"},
+            ]
+            with patch("paper_search_mcp.parsers.mineru.requests.post", side_effect=fake_post), patch(
+                "paper_search_mcp.parsers.mineru.requests.put", return_value=put_response
+            ), patch("paper_search_mcp.parsers.mineru.requests.get", side_effect=fake_get):
+                first = parser.parse_pdfs(items, force=True)
+
+            self.assertEqual([result["status"] for result in first], ["ok", "ok"])
+            self.assertTrue(list((Path(tmp) / "mineru_batches").rglob("*.zip")))
+            shutil.rmtree(pdf1.with_name("paper-one_mineru"))
+            shutil.rmtree(pdf2.with_name("paper-two_mineru"))
+
+            with patch(
+                "paper_search_mcp.parsers.mineru.requests.post",
+                side_effect=AssertionError("batch submit should be skipped when reusable zip exists"),
+            ):
+                second = parser.parse_pdfs(items, force=False)
+
+            self.assertEqual([result["status"] for result in second], ["ok", "ok"])
+            self.assertIn("Reusable alpha", Path(second[0]["full_md_path"]).read_text(encoding="utf-8"))
 
     def test_cli_mode_uses_temporary_raw_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

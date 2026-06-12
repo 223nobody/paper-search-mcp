@@ -1,6 +1,6 @@
 <h1 align="center">Paper Search MCP</h1>
 
-`paper-search-mcp` 是一个面向论文检索、PDF 下载和论文解析的 MCP Server，也提供 `paper-search` 命令行工具。当前版本在原始多源论文检索能力上，补齐了“检索/下载 PDF -> 小批量自动 MinerU 解析 / 大批量选择解析 -> 缓存与同名 zip 导出”的完整链路。
+`paper-search-mcp` 是一个面向论文检索、PDF 下载和论文解析的 MCP Server，也提供 `paper-search` 命令行工具。当前版本在原始多源论文检索能力上，补齐了“检索/下载 PDF -> 解析提示或后台 MinerU 解析任务 -> PDF 同目录解析产物与轻量缓存”的完整链路。
 
 <p align="center"><a href="README_CN.md">Chinese</a> | <a href="README.md">English</a></p>
 
@@ -10,7 +10,7 @@
 
 - 从多个公开学术数据源检索论文，并统一输出论文条目。
 - 优先使用开放获取和来源原生 PDF 链接下载论文。
-- 当 MCP 工具实际保存 PDF 后，单次保存 10 篇及以下会自动进行 MinerU 解析；超过 10 篇时再返回 checkbox/编号选择。
+- 当 MCP 工具实际保存 PDF 后，会返回解析提示；单篇下载可自动解析，小批量/大批量选择下载可走后台解析任务或 checkbox/编号选择。
 - 使用 MinerU 将 PDF 解析为 Markdown、结构化 JSON 和图片/表格/公式等资源。
 - 将解析产物缓存起来，方便后续按论文 key 读取、搜索和复用。
 
@@ -19,13 +19,16 @@
 - **多源论文检索**：支持 arXiv、PubMed、bioRxiv、medRxiv、Semantic Scholar、Crossref、OpenAlex、PMC、CORE、Europe PMC、dblp、OpenAIRE、CiteSeerX、DOAJ、BASE、Zenodo、HAL、SSRN、Unpaywall 等来源。
 - **统一结果格式**：不同来源返回的论文会被整理为统一字段，便于 Agent 后续选择、下载和解析。
 - **开放获取优先下载**：`download_with_fallback` 会优先使用来源原生下载、开放仓储、Unpaywall 等路径；Sci-Hub 保持可选且默认不启用。
-- **保存 PDF 后自动解析 / 大批量选择**：只要 MCP 工具路径中发生 PDF 保存行为，就会返回 `parse_prompt`；单次保存 10 篇及以下自动解析全部可解析 PDF，超过 10 篇时才进入选择流程。
-- **Checkbox/多选 UI 与降级机制**：支持 MCP Elicitation 或 MCP Apps 的客户端可以显示多选/checkbox UI；不支持时返回 `selection_token` 和编号列表，再用 `parse_selected_papers` 解析。
+- **保存 PDF 后解析提示 / 大批量选择**：只要 MCP 工具路径中发生 PDF 保存行为，就会返回 `parse_prompt`；批量下载不会同步阻塞解析，而是建议 `submit_parse_job` 或 checkbox/编号选择。
+- **Checkbox/多选 UI 与降级机制**：支持 MCP Elicitation 或 MCP Apps 的客户端可以显示多选/checkbox UI；不支持时返回 `selection_token` 和编号列表，再用 `submit_parse_job` 或 `parse_selected_papers` 解析。
 - **MinerU 优先解析**：支持官方 extract API、本地 MinerU API、MinerU CLI，并保留 `pypdf` 作为兜底文本提取方式。
+- **MinerU 批量 extract**：在 `mode="extract"` / `mode="cloud_api"` 下，多篇 PDF 会合并提交到 MinerU `/file-urls/batch`，减少逐篇请求、轮询和下载开销；`auto` 模式可用环境变量显式开启。
 - **PDF 同目录产物**：解析后会在 PDF 所在文件夹生成 `<pdf 文件名>_mineru/`，其中包含 `full.md`、`content_list.json`、`manifest.json` 和 `assets/`。
-- **同名 zip 导出**：解析后也会在 PDF 所在文件夹生成同名 `.zip`，例如 `paper.pdf` -> `paper.zip`。
-- **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session 和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
-- **CLI 与 MCP 双入口**：既可以作为 MCP Server 供 VS Code Copilot Agent Mode、Claude Desktop 等客户端调用，也可以直接用命令行运行。
+- **可选同名 zip 导出**：默认不生成同名 `.zip`；如需打包副本，可设置 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true`，例如 `paper.pdf` -> `paper.zip`。
+- **FTS 解析索引**：`.paper_search_cache` 会维护轻量 SQLite FTS 索引，用于快速搜索已解析内容；不可用时自动退回文件搜索。
+- **后台解析任务**：长时间批量解析可用 `submit_parse_job` 提交，再用 `get_parse_job_status`、`list_parse_jobs`、`cancel_parse_job` 管理。
+- **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session、下载健康统计和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
+- **MCP 优先、CLI 兜底**：自然语言 Agent 场景优先通过 MCP 工具调用；命令行工具保留给手动验证、脚本和 MCP 不可用时的兜底。
 
 ## 安装与本地运行
 
@@ -118,7 +121,10 @@ PAPER_SEARCH_MCP_MINERU_IS_OCR=false
 PAPER_SEARCH_MCP_MINERU_ENABLE_FORMULA=true
 PAPER_SEARCH_MCP_MINERU_ENABLE_TABLE=true
 PAPER_SEARCH_MCP_MINERU_AUTO_ORDER=extract,local_api,cli,pypdf
-PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true
+PAPER_SEARCH_MCP_MINERU_BATCH_PARSE=false
+PAPER_SEARCH_MCP_MINERU_UPLOAD_CONCURRENCY=4
+PAPER_SEARCH_MCP_MINERU_DOWNLOAD_CONCURRENCY=4
+PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=false
 
 PAPER_SEARCH_MCP_UNPAYWALL_EMAIL=
 PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY=
@@ -169,29 +175,39 @@ MinerU 解析模式说明：
 - `cli`：只使用本机 MinerU CLI。
 - `pypdf`：只做基础文本提取，不会得到 MinerU 的版面结构和图片资产。
 
+MinerU 官方 extract 上传阶段会使用阿里云 OSS 签名 URL。为避免本机系统代理或本地代理导致 OSS 上传 TLS 握手中断，解析器默认会在当前进程中把 `.aliyuncs.com` 和 `mineru.oss-cn-shanghai.aliyuncs.com` 合并写入 `NO_PROXY` / `no_proxy`，已有条目会保留。
+
+```dotenv
+# 如果你的网络必须通过代理访问 OSS，可以关闭默认绕过。
+PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY=false
+
+# 如 MinerU 后续返回了其他 OSS 域名，可自定义绕过列表。
+PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY_HOSTS=.aliyuncs.com,mineru.oss-cn-shanghai.aliyuncs.com
+```
+
 检索默认使用 `fast` profile，不再默认等待所有慢源。需要更全覆盖时，在工具参数中传 `sources="deep"` 或 `sources="all"`。`PAPER_SEARCH_MCP_SEARCH_TIMEOUT_SECONDS` 控制整体检索超时，`PAPER_SEARCH_MCP_SEARCH_SOURCE_TIMEOUT_SECONDS` 控制单来源超时，`PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS` 控制短期查询缓存。
 
-批量解析时可用 `PAPER_SEARCH_MCP_PARSE_CONCURRENCY` 控制并发度。`PAPER_SEARCH_MCP_MINERU_AUTO_ORDER` 控制 auto 模式顺序，例如本地 MinerU 服务常驻时可设为 `local_api,extract,cli,pypdf`。大量解析时如果不需要同名 zip，可设 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=false` 减少磁盘 I/O。
+批量解析时可用 `PAPER_SEARCH_MCP_PARSE_CONCURRENCY` 控制并发度。`mode="extract"` / `mode="cloud_api"` 会优先走 MinerU 官方多文件 batch；如果希望 `auto` 模式也启用真批处理，可设 `PAPER_SEARCH_MCP_MINERU_BATCH_PARSE=true`。上传和结果 zip 下载并发度可分别用 `PAPER_SEARCH_MCP_MINERU_UPLOAD_CONCURRENCY`、`PAPER_SEARCH_MCP_MINERU_DOWNLOAD_CONCURRENCY` 调整。`PAPER_SEARCH_MCP_MINERU_AUTO_ORDER` 控制 auto 模式顺序，例如本地 MinerU 服务常驻时可设为 `local_api,extract,cli,pypdf`。默认不生成同名 zip；如需额外打包副本，可设 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true`。
 
 ## 默认保存位置
 
 当前默认 PDF 保存路径是：
 
 ```text
-~/Desktop
+~/Desktop/papers
 ```
 
 在 Windows 上会解析为当前用户桌面，例如：
 
 ```text
-C:\Users\<你的用户名>\Desktop
+C:\Users\<你的用户名>\Desktop\papers
 ```
 
 你也可以在 CLI 或 MCP 工具参数中传入 `save_path` 覆盖默认位置。
 
 ## MinerU 解析输出
 
-对某个 PDF 执行 MinerU PDF parsing 后，会产生三类结果。
+对某个 PDF 执行 MinerU PDF parsing 后，默认会产生两类结果。
 
 第一类是 PDF 所在目录下的解析产物目录：
 
@@ -206,13 +222,13 @@ C:\Users\<你的用户名>\Desktop
   assets/
 ```
 
-第二类是 PDF 所在目录下的同名 zip：
+如果设置 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true`，还会额外生成 PDF 所在目录下的同名 zip：
 
 ```text
 ~/Desktop/example.zip
 ```
 
-第三类是项目缓存目录中的轻量索引：
+第二类是项目缓存目录中的轻量索引：
 
 ```text
 .paper_search_cache/
@@ -232,7 +248,7 @@ C:\Users\<你的用户名>\Desktop
 - `content_list.json`：MinerU 风格的结构化内容列表，适合后续按段落、标题、图片、表格等类型处理。
 - `manifest.json`：解析器、模式、后端、原始 PDF、生成时间等元信息。
 - `assets/`：解析得到的图片、表格、公式等资源文件。如果使用 `pypdf` 兜底，通常不会生成丰富图片资产。
-- `<pdf 同名>.zip`：将 MinerU 结果导出的压缩包，保存在原 PDF 所在文件夹。
+- `<pdf 同名>.zip`：可选打包副本；仅当 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true` 时生成，保存在原 PDF 所在文件夹。
 
 ## 常用 CLI
 
@@ -268,11 +284,53 @@ uv run paper-search cache get example -f markdown
 uv run paper-search cache get example -f json
 uv run paper-search cache assets example
 uv run paper-search cache search example "regularization"
+uv run paper-search cache search-index "regularization" --paper-key example
+uv run paper-search cache rebuild-index
+uv run paper-search cache download-health
+uv run paper-search parse-batch C:\Users\you\Desktop\a.pdf C:\Users\you\Desktop\b.pdf --mode extract
 ```
+
+本地优化效果可以用 benchmark 脚本验证，不依赖网络：
+
+```powershell
+uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
+```
+
+输出会包含首次解析、缓存命中解析、FTS 重建/搜索、传统文件搜索耗时和 speedup。
 
 ## MCP 使用流程
 
-### 1. 只检索论文
+### 1. 自然语言首选高层入口
+
+对 VS Code Copilot Agent Mode、Claude Desktop、Claude Code 等 MCP Host，
+推荐优先调用 `paper_research_workflow`。它会把检索、排序、下载和解析任务提交都留在 MCP 内完成，
+避免 Agent 为了论文任务打开终端、激活 `.venv` 或执行 CLI 命令。
+
+```json
+{
+  "tool": "paper_research_workflow",
+  "arguments": {
+    "query": "agentic spatial reasoning",
+    "intent": "search_download_parse",
+    "count": 5,
+    "sources": "arxiv,semantic,openalex",
+    "parse_execution": "background"
+  }
+}
+```
+
+常用参数：
+
+- `intent="search_only"`：只检索并返回候选论文/选择 session。
+- `intent="search_download"`：检索并下载排名靠前的论文。
+- `intent="search_download_parse"`：检索、下载，并通过 `submit_parse_job` 提交后台解析任务。
+- `selection_mode="manual"`：先返回 checkbox/编号选择，不自动下载。
+- `parse_execution="background"`：默认后台解析，返回 `parse_job.job_id`，再用 `get_parse_job_status` 查询。
+- `parse_execution="sync"`：仅在明确需要当前调用等待解析完成时使用。
+
+除非用户明确指定目录，不要传 `save_path`；默认保存到 `~/Desktop/papers`。
+
+### 2. 只检索论文
 
 调用：
 
@@ -289,7 +347,7 @@ uv run paper-search cache search example "regularization"
 
 适合只想拿到论文条目、标题、作者、DOI、PDF 链接等元数据的场景。
 
-### 2. 检索后弹出多选解析
+### 3. 检索后弹出多选解析
 
 调用：
 
@@ -300,7 +358,7 @@ uv run paper-search cache search example "regularization"
     "query": "agentic spatial reasoning",
     "sources": "arxiv,semantic,openalex",
     "max_results_per_source": 3,
-    "save_path": "~/Desktop",
+    "save_path": "~/Desktop/papers",
     "mode": "extract"
   }
 }
@@ -322,7 +380,7 @@ uv run paper-search cache search example "regularization"
 }
 ```
 
-该工具会返回 `ui://paper-search/paper-selection.html` 对应的 HTML widget。Widget 中勾选论文后，会通过 Apps bridge 调用 `parse_selected_papers`。如果客户端不支持 MCP Apps，仍可使用下面的编号选择流程。
+该工具会返回 `ui://paper-search/paper-selection.html` 对应的 HTML widget。Widget 中勾选论文后，会通过 Apps bridge 调用 `submit_parse_job` 提交后台解析任务。若客户端不支持 MCP Apps，仍可使用下面的编号选择流程。
 
 如果当前 Host 不能渲染 MCP Apps，但允许打开系统浏览器，可以调用本地浏览器选择页：
 
@@ -337,7 +395,7 @@ uv run paper-search cache search example "regularization"
 }
 ```
 
-该工具会启动一个 localhost 页面并使用系统默认浏览器打开；页面提交后同样会调用 `parse_selected_papers`。MCP Server 不能强制打开 Codex 或其他 Host 的内置浏览器，只能返回 URL 或请求系统浏览器打开。
+该工具会启动一个 localhost 页面并使用系统默认浏览器打开；页面提交后同样会调用 `submit_parse_job`。MCP Server 不能强制打开 Codex 或其他 Host 的内置浏览器，只能返回 URL 或请求系统浏览器打开。
 
 ### 4. 无 checkbox UI 时的编号选择
 
@@ -390,8 +448,8 @@ uv run paper-search cache search example "regularization"
 
 保存后的处理规则：
 
-- 单次保存 **10 篇及以下**：默认自动解析全部可解析 PDF，`parse_prompt.interaction` 为 `auto_parse_saved_pdfs`。
-- 单次保存 **超过 10 篇**：不立即自动解析，而是返回选择提示。支持 Elicitation 的客户端可以弹出多选 UI；支持 MCP Apps 的客户端可使用 `render_paper_selection_app` 渲染 checkbox；都不支持时返回编号列表和 `selection_token`，再由 Agent 调用 `parse_selected_papers`。
+- 单篇下载/读取工具保存 **10 篇及以下** PDF 时，可自动解析全部可解析 PDF，`parse_prompt.interaction` 为 `auto_parse_saved_pdfs`。
+- `download_selected_papers` 面向批量下载：只下载并写 manifest，同时返回 `parse_prompt`。10 篇及以下会建议使用 `submit_parse_job` 后台解析；超过 10 篇会返回 checkbox/编号选择提示。支持 MCP Apps 的客户端可使用 `render_paper_selection_app` 渲染 checkbox；都不支持时返回编号列表和 `selection_token`。
 
 ### 6. 直接解析本地 PDF
 
@@ -408,16 +466,20 @@ uv run paper-search cache search example "regularization"
 }
 ```
 
-解析完成后，会在 `example.pdf` 同目录生成 `example_mineru/` 和 `example.zip`；`.paper_search_cache` 只保留按 `paper_key` 查找这些产物所需的轻量索引。
+解析完成后，默认会在 `example.pdf` 同目录生成 `example_mineru/`；如果显式开启 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true`，才会额外生成 `example.zip`。`.paper_search_cache` 只保留按 `paper_key` 查找这些产物所需的轻量索引。
 
 ## 常用 MCP 工具
 
 - `search_papers`：多源检索并去重。
+- `paper_research_workflow`：自然语言 Agent 首选高层入口，可一次完成检索、下载，并按需提交后台解析任务。
 - `search_papers_with_elicitation`：检索后通过 Elicitation 请求用户多选论文并解析。
 - `search_papers_for_parsing`：检索并创建编号选择 session。
 - `render_paper_selection_app`：为支持 MCP Apps 的客户端渲染 checkbox 论文选择器。
 - `open_paper_selection_page`：为不支持 MCP Apps 的客户端打开本地浏览器 checkbox 选择页。
+- `download_selected_papers`：根据 selection session 批量下载论文，写 manifest，并返回解析提示。
+- `crawl_download_parse_papers`：兼容旧流程的下载入口；新 Agent 工作流优先使用 `paper_research_workflow`。
 - `parse_selected_papers`：根据 `selection_token` 和编号下载/解析论文。
+- `submit_parse_job` / `get_parse_job_status`：提交和查询后台解析任务。
 - `mineru_setup_status`：检查 MinerU API key 配置状态，未配置时返回 MCP Apps 配置弹窗入口。
 - `render_mineru_api_key_setup_app`：渲染 MinerU API key 输入框。
 - `configure_mineru_api_key`：把 MinerU API key 写入 `.env`。
@@ -430,13 +492,14 @@ uv run paper-search cache search example "regularization"
 
 ## 典型使用场景
 
-- **快速找论文**：调用 `search_papers`，拿到多源聚合结果。
-- **找论文并立刻解析**：调用 `search_papers_with_elicitation`，在支持的客户端中勾选要解析的论文。
+- **快速找论文**：优先调用 `paper_research_workflow(intent="search_only")`，只需要低层结果时再直接调用 `search_papers`。
+- **找论文、下载并解析**：调用 `paper_research_workflow(intent="search_download_parse", parse_execution="background")`，返回 `parse_job.job_id` 后用 `get_parse_job_status` 查询。
+- **找论文并手动选择解析**：调用 `paper_research_workflow(intent="search_only", selection_mode="manual")`，在支持的客户端中使用 checkbox，或使用编号 fallback。
 - **客户端支持 MCP Apps**：使用 `search_papers_for_parsing` + `render_paper_selection_app` 打开 checkbox 组件。
 - **客户端不支持 MCP Apps 但可打开浏览器**：使用 `open_paper_selection_page` 打开本地 localhost checkbox 页面。
-- **客户端没有 UI**：使用 `search_papers_for_parsing` + `parse_selected_papers`。
-- **保存 PDF 后自动解析**：调用 `download_*` 或 `download_with_fallback`；单次保存 10 篇及以下会自动解析，超过 10 篇才进入选择流程。
-- **已有 PDF**：调用 `parse_pdf_with_mineru` 或 CLI `paper-search parse`。
+- **客户端没有 UI**：使用 `search_papers_for_parsing` + `submit_parse_job`；只有明确需要同步等待时才用 `parse_selected_papers`。
+- **保存 PDF 后解析**：调用单篇 `download_*` 或 `download_with_fallback` 时，小批量可自动解析；调用 `download_selected_papers` 批量下载时，会返回 `parse_prompt`，再用 `submit_parse_job`、`render_paper_selection_app` 或 `parse_selected_papers` 进入 MinerU 解析。
+- **已有 PDF**：调用 `parse_pdf_with_mineru` 或 `parse_pdfs_with_mineru`，CLI 仅作为 MCP 不可用时的兜底。
 - **构建论文知识库**：批量解析 PDF 后，通过 `cache get/search/assets` 读取 Markdown、JSON 和图片资产。
 - **排查解析质量**：优先检查 `<pdf 文件名>_mineru/manifest.json` 和同名 zip，确认使用的是 `extract`、`local_api`、`cli` 还是 `pypdf`。
 

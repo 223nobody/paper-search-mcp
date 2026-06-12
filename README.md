@@ -59,8 +59,10 @@ A Model Context Protocol (MCP) server for searching and downloading academic pap
 - **Optional API-Key Enhancement**: Sources like Semantic Scholar can work better with a user-provided API key, but are not intended to force paid usage.
 - **Discovery + Retrieval Workflow**: Google Scholar and Crossref can be used for discovery and DOI backfilling, while open repositories and publisher links are used for lawful full-text resolution where available.
 - **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub. Sci-Hub fallback is opt-in.
-- **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into `full.md`, `content_list.json`, `manifest.json`, and extracted assets beside the source PDF. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `auto` mode first uses MinerU official extract API, then local API/CLI, and finally `pypdf`.
-- **Saved-PDF Auto Parsing + Selection UI**: When MCP download/read tools save PDFs, batches of 10 or fewer PDFs are parsed automatically with MinerU. Larger batches return a selection prompt; MCP Apps-capable clients can render a liquid-glass checkbox UI, while plain clients receive a backend `selection_token` and numbered fallback list.
+- **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into `full.md`, `content_list.json`, `manifest.json`, and extracted assets beside the source PDF. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `extract`/`cloud_api` mode can submit multiple PDFs through one MinerU batch; `auto` still falls back through local API/CLI and `pypdf`.
+- **Saved-PDF Parsing Prompts + Selection UI**: Single download/read tools can still auto-parse small saved-PDF sets. Batch selection downloads return a parse prompt instead of blocking on MinerU; batches over 10 PDFs surface the MCP Apps checkbox selector, while plain clients receive a backend `selection_token` and numbered fallback list.
+- **Fast Parsed-Paper Search**: Parsed blocks are indexed into `.paper_search_cache/parsed_index.sqlite3` with SQLite FTS when available, while file-based search remains the fallback.
+- **Background Parsing Jobs**: Long selected-paper parses can be submitted with `submit_parse_job`, then tracked with `get_parse_job_status`, `list_parse_jobs`, and `cancel_parse_job`.
 - **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
 - **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
 
@@ -71,13 +73,13 @@ The project now separates discovery/download from parsing. A typical agent workf
 1. Use `search_papers` or `paper-search search` to discover candidate papers.
 2. Use source-native download or `download_with_fallback` to obtain a PDF.
 3. Parse the PDF with MinerU. This writes parsed artifacts beside the PDF
-   (`example_mineru/full.md`, `content_list.json`, `manifest.json`, `assets/`)
-   and a same-name result zip (`example.pdf` -> `example.zip`). The project
-   cache keeps only lightweight metadata and indexes, not a duplicate PDF or
-   duplicate parsed content:
+   (`example_mineru/full.md`, `content_list.json`, `manifest.json`, `assets/`).
+   The project cache keeps only lightweight metadata and indexes, not a
+   duplicate PDF or duplicate parsed content:
 
 ```bash
 paper-search parse ~/Desktop/example.pdf --paper-key example --mode auto
+paper-search parse-batch ~/Desktop/a.pdf ~/Desktop/b.pdf --mode extract
 ```
 
 4. Reuse parsed artifacts by paper key. The cache commands resolve back to the
@@ -87,6 +89,8 @@ paper-search parse ~/Desktop/example.pdf --paper-key example --mode auto
 paper-search cache list
 paper-search cache get example -f markdown
 paper-search cache search example "attention"
+paper-search cache search-index "attention" --paper-key example
+paper-search cache rebuild-index
 paper-search cache assets example
 ```
 
@@ -110,7 +114,10 @@ PAPER_SEARCH_MCP_MINERU_IS_OCR=false
 PAPER_SEARCH_MCP_MINERU_ENABLE_FORMULA=true
 PAPER_SEARCH_MCP_MINERU_ENABLE_TABLE=true
 PAPER_SEARCH_MCP_MINERU_AUTO_ORDER=extract,local_api,cli,pypdf
-PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true
+PAPER_SEARCH_MCP_MINERU_BATCH_PARSE=false
+PAPER_SEARCH_MCP_MINERU_UPLOAD_CONCURRENCY=4
+PAPER_SEARCH_MCP_MINERU_DOWNLOAD_CONCURRENCY=4
+PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=false
 ```
 
 Set `PAPER_SEARCH_MCP_MINERU_MODE=extract` to force MinerU official extract
@@ -126,8 +133,42 @@ Search defaults to the `fast` profile instead of every connector. Pass
 `PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS` control aggregate timeouts,
 per-source timeouts, and short-lived query caching.
 `PAPER_SEARCH_MCP_PARSE_CONCURRENCY` controls selected-paper parse concurrency.
-Set `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=false` to skip same-name zip generation
-during large batch parsing.
+Set `mode=extract`/`mode=cloud_api`, or set
+`PAPER_SEARCH_MCP_MINERU_BATCH_PARSE=true` for `auto`, to use MinerU's true
+multi-file extract batch path for selected-paper parsing. Upload and result-zip
+download parallelism can be tuned with
+`PAPER_SEARCH_MCP_MINERU_UPLOAD_CONCURRENCY` and
+`PAPER_SEARCH_MCP_MINERU_DOWNLOAD_CONCURRENCY`.
+Set `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true` to also generate a same-name zip
+beside each parsed PDF.
+
+### MCP-first natural-language workflow
+
+For natural-language agents and MCP hosts, prefer the high-level
+`paper_research_workflow` tool. It keeps the whole flow inside MCP instead of
+asking the agent to open a terminal or interpret CLI instructions:
+
+```json
+{
+  "tool": "paper_research_workflow",
+  "arguments": {
+    "query": "agentic spatial reasoning",
+    "intent": "search_download_parse",
+    "count": 5,
+    "sources": "arxiv,semantic,openalex",
+    "parse_execution": "background"
+  }
+}
+```
+
+Use `intent="search_only"` for discovery, `intent="search_download"` for PDF
+retrieval, and `intent="search_download_parse"` when the user asks for parsed
+paper content. By default, parsing is submitted with `submit_parse_job` and the
+response includes `parse_job.job_id` plus `workflow.next_tool =
+"get_parse_job_status"`.
+
+Do not pass `save_path` unless the user explicitly requests a custom directory.
+The MCP default resolves to `~/Desktop/papers`.
 
 ### MCP auto parsing, selection UI, and numbered fallback
 
@@ -146,22 +187,27 @@ Download/read tools use a saved-PDF policy:
   prompt instead of parsing immediately. MCP Apps-capable clients can render
   `ui://paper-search/paper-selection.html` with `render_paper_selection_app`.
   Plain clients receive a numbered `papers` list and `selection_token`.
+- `download_selected_papers` is optimized for batch retrieval. It saves PDFs,
+  writes a manifest, and returns `parse_prompt` with either a background
+  `submit_parse_job` recommendation or a checkbox selector for large batches.
+  It does not synchronously parse the downloaded batch.
+- `crawl_download_parse_papers` is kept as a compatibility workflow. New
+  natural-language hosts should prefer `paper_research_workflow`, which can
+  also submit the background parse job directly.
 
 For example, `download_arxiv` returns `pdf_path`, `pdf_paths`, and
 `parse_prompt`. Small single-paper downloads parse automatically; large batches
 use the selection flow.
 
-Example MCP flow:
+Lower-level MCP flow:
 
 ```json
 {
-  "tool": "search_papers_with_elicitation",
+  "tool": "search_papers_for_parsing",
   "arguments": {
     "query": "agentic spatial reasoning",
     "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3,
-    "save_path": "~/Desktop",
-    "mode": "auto"
+    "max_results_per_source": 3
   }
 }
 ```
@@ -173,11 +219,12 @@ backend fallback workflow:
 1. Call `search_papers_for_parsing`.
 2. Present the returned numbered `papers` list to the user.
 3. Ask the user to choose indices such as `1,3,5`, `2-4`, or `all`.
-4. Call `parse_selected_papers` with the returned `selection_token`.
+4. Call `submit_parse_job` for background parsing, or `parse_selected_papers`
+   when you explicitly want to wait for parsing in the current call.
 
 For hosts without MCP Apps or elicitation UI, `open_paper_selection_page` can
 open a localhost checkbox page in the system browser. That page calls
-`parse_selected_papers` after the user submits the selection. The MCP server
+`submit_parse_job` after the user submits the selection. The MCP server
 cannot force a Codex/host built-in browser; it can only return the URL or ask
 the operating system to open it.
 
@@ -194,15 +241,15 @@ Fallback MCP flow:
 }
 ```
 
-Then parse selected entries:
+Then submit selected entries for background parsing:
 
 ```json
 {
-  "tool": "parse_selected_papers",
+  "tool": "submit_parse_job",
   "arguments": {
     "selection_token": "search_20260610_abcdef12",
     "selected_indices": "1,3",
-    "save_path": "~/Desktop",
+    "save_path": "~/Desktop/papers",
     "mode": "auto"
   }
 }
@@ -213,6 +260,20 @@ Search sessions are stored under `.paper_search_cache/sessions/`. Use
 inspect or clean them. Parsed-paper cache entries store metadata/status and
 point to the PDF-side `*_mineru` artifacts to avoid duplicate PDFs and duplicate
 parsed content in `.paper_search_cache`.
+
+Parsed content can be indexed or rebuilt explicitly with `index_parsed_cache`.
+Downloads also keep lightweight method health stats in
+`.paper_search_cache/download_health.json`; inspect them with
+`get_download_health_stats` or `paper-search cache download-health`.
+
+Local optimization checks can be run without network access:
+
+```bash
+uv run python scripts/bench_search_parse.py --pdf-count 8 --mode pypdf --force
+```
+
+The benchmark reports first-parse time, cache-hit parse time, FTS rebuild/search
+time, legacy file-search time, and the measured speedups as JSON.
 
 ## Source Strategy
 
@@ -350,9 +411,12 @@ Choose the method that best fits your workflow. All methods support the same [op
 
 ---
 
-### Claude Code (Skill) — recommended for Claude Code users
+### Claude Code (Skill) — MCP-first guidance for Claude Code users
 
-Install as a Claude Code skill instead of an MCP server. This gives Claude automatic access to paper search when you mention finding papers, academic literature, etc. — no MCP configuration needed.
+Install the skill when you want Claude Code to recognize paper-search requests
+automatically. The skill is MCP-first: when `paper-search-mcp` MCP tools are
+available, it tells the agent to call `paper_research_workflow` and related MCP
+tools instead of opening a terminal.
 
 **Prerequisites**: [uv](https://docs.astral.sh/uv/getting-started/installation/) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
 
@@ -369,21 +433,24 @@ mkdir -p ~/.claude/skills/paper-search
 cp ~/paper-search-mcp/claude-code/SKILL.md ~/.claude/skills/paper-search/SKILL.md
 ```
 
-**Step 3 — Update the repo path in the skill:**
+**Step 3 — Confirm MCP-first behavior:**
 
-Edit `~/.claude/skills/paper-search/SKILL.md` and replace every `<REPO_PATH>` with the absolute path to your clone (e.g. `/Users/yourname/paper-search-mcp`).
+The included `claude-code/SKILL.md` instructs the agent to use MCP tools first.
+CLI examples are retained only as a fallback if MCP tools are unavailable or the
+user explicitly requests terminal commands.
 
 **Step 4 (optional) — Configure API keys:**
 
 Create a `.env` file in the repo root for optional API keys (see [Environment Variables](#environment-variables-env-file)).
 
-**That's it.** Next time you start Claude Code, just ask it to find papers — the skill activates automatically. For example:
+**That's it.** Next time you start Claude Code, just ask it to find papers. For example:
 
 - "Find me recent papers on CRISPR base editing"
 - "Search arxiv and semantic scholar for transformer attention mechanisms"
 - "Download the PDF for arxiv paper 2106.12345"
 
-The skill uses a CLI (`paper-search`) that wraps the same library as the MCP server, outputting JSON for search/download and plain text for read.
+When MCP is available, the default natural-language path is
+`paper_research_workflow`. The `paper-search` CLI is a fallback only.
 
 ---
 
@@ -652,6 +719,16 @@ MinerU key setup helpers:
 - If the key is missing, expired, or rejected by the extract API, parse and health-check results may include `mineru_api_key_prompt`.
 - MCP Apps-capable clients can render `render_mineru_api_key_setup_app`, backed by `ui://paper-search/mineru-api-key.html`. The widget saves the key by calling `configure_mineru_api_key`, which writes `PAPER_SEARCH_MCP_MINERU_API_KEY` into the active `.env` file.
 - The MinerU key widget and paper-selection widget use the same restrained liquid-glass visual style. Whether a host displays them inline is controlled by the MCP host; non-Apps hosts can still use tool results and numbered fallback flows.
+
+MinerU extract uploads use Aliyun OSS signed URLs. To avoid local/system proxy TLS interruptions during those uploads, the parser adds `.aliyuncs.com` and `mineru.oss-cn-shanghai.aliyuncs.com` to `NO_PROXY` / `no_proxy` in the current process by default. Existing entries are preserved.
+
+```dotenv
+# Disable the automatic OSS proxy bypass if your network requires OSS through a proxy.
+PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY=false
+
+# Override the default bypass hosts.
+PAPER_SEARCH_MCP_MINERU_OSS_NO_PROXY_HOSTS=.aliyuncs.com,mineru.oss-cn-shanghai.aliyuncs.com
+```
 
 ---
 

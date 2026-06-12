@@ -1,4 +1,5 @@
 # paper_search_mcp/paper.py
+import copy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -55,5 +56,5 @@ class Paper:
             'keywords': '; '.join(self.keywords) if self.keywords else '',
             'citations': self.citations,
             'references': '; '.join(self.references) if self.references else '',
-            'extra': str(self.extra) if self.extra else ''
+            'extra': copy.deepcopy(self.extra) if self.extra else {}
         }
