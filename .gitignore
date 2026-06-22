@@ -1,0 +1,137 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local notes and scratch space
+scratch/
+**/CLAUDE.local.md
+
+# Local configuration and secrets
+.env
+*/.env
+!.env.example
+!.env.sample
+!.env.template
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.hypothesis/
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+.python-version
+
+# Build / packaging artifacts
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# Test / coverage output
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+nosetests.xml
+cover/
+
+# Logs and local databases
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-journal
+db.sqlite3
+db.sqlite3-journal
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Project runtime cache and MCP state
+.paper_search_cache/
+.paper_search_cache*/
+.mcp_cache/
+.mineru/
+paper_search_download_manifest_*.json
+
+# Downloaded papers and parser outputs
+downloads/
+test_downloads/
+papers/
+paper_downloads/
+parsed_papers/
+*.pdf
+*.epub
+*.zip
+*_mineru/
+**/*_mineru/
+!tests/fixtures/**/*.pdf
+!tests/fixtures/**/*.zip
+
+# Framework / tool caches
+instance/
+.webassets-cache
+.scrapy/
+docs/_build/
+.pybuilder/
+target/
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+celerybeat-schedule
+celerybeat.pid
+*.sage.py
+local_settings.py
+
+# Site output
+/site
+.agents
+
+# Claude skills — only track paper-search
+.claude/skills/*
+!.claude/skills/paper-search/

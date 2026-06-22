@@ -1,0 +1,25 @@
+{
+  "name": "paper-search-companion",
+  "displayName": "Paper Search Companion",
+  "description": "Embedded paper selector Webview for paper-search-mcp — keeps the selection UI inside VS Code.",
+  "version": "0.1.0",
+  "publisher": "223nobody",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:paper-search-companion.openSelector"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "paper-search-companion.openSelector",
+        "title": "Paper Search: Open Paper Selector"
+      }
+    ]
+  }
+}

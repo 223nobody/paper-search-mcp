@@ -1,0 +1,61 @@
+# Codex Desktop configuration for paper-search-mcp
+# Project-scoped: .codex/config.toml → trusted projects only
+# User-level:    ~/.codex/config.toml
+# Docs: https://developers.openai.com/codex/config-basic
+
+[mcp_servers.paper-search-mcp]
+command = "uv"
+args = ["run", "--directory", "C:\\code\\paper-search-mcp", "-m", "paper_search_mcp.server"]
+env = { PAPER_SEARCH_MCP_SEARCH_PROFILE = "fast", PAPER_SEARCH_MCP_MINERU_MODE = "auto" }
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled = true
+
+# ----- Auto-approve read-only tools for smoother workflow -----
+[mcp_servers.paper-search-mcp.tools.search_papers]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.crawl_papers_for_selection]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.search_iacr]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.list_sources]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.list_search_sessions]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.get_search_session]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.render_paper_selection_app]
+approval_mode = "approve"
+
+[mcp_servers.paper-search-mcp.tools.get_parse_job_status]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.list_parse_jobs]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.list_parsed_papers]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.get_parsed_paper]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.search_parsed_papers]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.mineru_health_check]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.mineru_setup_status]
+approval_mode = "auto"
+
+[mcp_servers.paper-search-mcp.tools.paper_research_workflow]
+approval_mode = "approve"
+
+[mcp_servers.paper-search-mcp.tools.download_selected_papers]
+approval_mode = "approve"
