@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from mcp.server.fastmcp import Context
+from mcp.types import CallToolResult, TextContent
 
 from ..config import env_file_path, get_env
 from ..utils import DEFAULT_SAVE_PATH, resolve_save_path
@@ -86,9 +87,12 @@ from ..engine.search import (
 from ..engine.paper import (
     AGENT_SKILL_RANKING_PROFILE,
     _dedupe_papers,
+    _download_route_for_candidate,
     _extract_arxiv_id,
+    _paper_arxiv_id,
     _paper_field,
     _paper_parse_candidate,
+    _paper_unique_key,
     _paper_value,
     _rank_papers_for_profile,
     _ranking_profile_name,
@@ -172,7 +176,7 @@ logger = logging.getLogger(__name__)
 
 
 def _prefer_local_selection_surface(result: Dict[str, Any]) -> Dict[str, Any]:
-    """Promote localhost selection pages over MCP Apps when they are available."""
+    """Expose localhost selection details when it is the active fallback."""
     if not isinstance(result, dict):
         return result
     prompt = result.get("parse_prompt")
@@ -182,6 +186,21 @@ def _prefer_local_selection_surface(result: Dict[str, Any]) -> Dict[str, Any]:
             local = prompt["local_browser"]
             result["local_browser"] = local
     if not isinstance(local, dict) or local.get("status") != "ok":
+        return result
+
+    surface = local.get("selection_surface")
+    surface_name = surface.get("surface") if isinstance(surface, dict) else ""
+
+    if surface_name == "hybrid":
+        result.setdefault("interaction", "mcp_app")
+        result["local_browser_url"] = local.get("url", "")
+        result["page_id"] = local.get("page_id", "")
+        result["opened"] = bool(local.get("opened", False))
+        result.setdefault("recommended_tool", PAPER_SELECTION_WIDGET_TOOL)
+        result.setdefault("selection_token", local.get("selection_token", ""))
+        result["recommended_url"] = local.get("url", "")
+        if isinstance(surface, dict):
+            result["selection_surface"] = surface
         return result
 
     result["interaction"] = local.get("interaction", "local_browser_checkbox")
@@ -216,6 +235,37 @@ def _prefer_local_selection_surface(result: Dict[str, Any]) -> Dict[str, Any]:
         or "Use the opened localhost checkbox page to select and download papers."
     )
     return result
+
+
+def _to_widget_tool_result(result: Dict[str, Any]) -> Any:
+    """Promote ``_meta`` from the result dict to ``CallToolResult._meta``.
+
+    ``_promote_paper_selection_app`` sets ``result["_meta"]`` when the
+    selection surface is ``mcp_app``.  MCP hosts (Claude Desktop, claude.ai,
+    etc.) only look at ``CallToolResult._meta`` — the top-level protocol
+    metadata — to decide whether to render a sandboxed iframe.
+
+    This helper pops ``_meta`` from the dict (so it does not leak into
+    ``structuredContent``) and places it on the ``CallToolResult`` that
+    FastMCP sends over the wire.
+
+    When ``_meta`` is absent the dict is returned unchanged.
+    """
+    if not isinstance(result, dict):
+        return result
+    meta = result.pop("_meta", None)
+    if not isinstance(meta, dict):
+        return result
+    return CallToolResult(
+        _meta=meta,
+        content=[
+            TextContent(
+                type="text",
+                text=json.dumps(result, ensure_ascii=False),
+            )
+        ],
+        structuredContent={"result": result},
+    )
 
 
 def _split_env_csv(value: str) -> List[str]:
@@ -324,6 +374,67 @@ def _should_require_large_batch_selection(
     if policy == "always":
         return item_count > 0
     return item_count > AUTO_PARSE_SAVED_PDF_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Multi-round search helpers (progressive retry for crawl_papers_for_selection)
+# ---------------------------------------------------------------------------
+def _merge_search_results(
+    base: Dict[str, Any],
+    additional: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge two ``search_papers`` result dicts across retry rounds.
+
+    Combines ``source_results`` (taking the max per source), ``sources_used``
+    (deduplicated, order preserved), ``errors`` (later wins for same key), and
+    ``papers`` (concatenated; cross-round dedup is handled upstream).
+    """
+    merged = dict(base)
+    merged["papers"] = base.get("papers", []) + additional.get("papers", [])
+
+    # Merge source_results — take the higher count per source
+    base_sr = dict(base.get("source_results", {}))
+    add_sr = additional.get("source_results", {})
+    for source, count in add_sr.items():
+        base_sr[source] = max(base_sr.get(source, 0), count)
+    merged["source_results"] = base_sr
+
+    # Merge sources_used — dedup preserving order
+    base_used = list(base.get("sources_used", []))
+    add_used = additional.get("sources_used", [])
+    seen = set(base_used)
+    for s in add_used:
+        if s not in seen:
+            base_used.append(s)
+            seen.add(s)
+    merged["sources_used"] = base_used
+
+    # Merge errors — later value wins for same key
+    base_errs = dict(base.get("errors", {}))
+    add_errs = additional.get("errors", {})
+    base_errs.update(add_errs)
+    merged["errors"] = base_errs
+
+    return merged
+
+
+def _count_download_ready_papers(papers: List[Dict[str, Any]]) -> int:
+    """Lightweight download-ready count without building full parse candidates."""
+    count = 0
+    for paper in papers:
+        arxiv_id = _paper_arxiv_id(paper)
+        ready, _, _ = _download_route_for_candidate(
+            source=paper.get("source", ""),
+            paper_id=paper.get("paper_id", ""),
+            doi=paper.get("doi", ""),
+            title=paper.get("title", ""),
+            pdf_url=paper.get("pdf_url", ""),
+            local_pdf_path=paper.get("local_pdf_path", ""),
+            arxiv_id=arxiv_id,
+        )
+        if ready is not False:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +729,7 @@ async def _create_paper_selection_result(
             "Call select_papers_tui(selection_token, download_only=True|False) "
             "to let the user pick papers in the terminal."
         )
-        if _host_is_claude_code():
+        if _host_is_claude_code() and not surface.get("app_widget_supported"):
             result["recommended_tool"] = "select_papers_tui"
     if requested_over_limit:
         result["parse_decision_required"] = True
@@ -651,7 +762,9 @@ async def _create_paper_selection_result(
             selection_semantics=semantics,
             parse_execution=parse_execution,
         )
-    return _promote_paper_selection_app(_prefer_local_selection_surface(result))
+    return _to_widget_tool_result(
+        _promote_paper_selection_app(_prefer_local_selection_surface(result))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -786,8 +899,14 @@ async def _attach_local_selection_ui(
 
     surface = _selection_surface_policy(force_open=force_open)
     prompt["selection_surface"] = surface
-    if surface.get("surface") != "local_browser":
+    if surface.get("surface") == "numbered_fallback":
         return prompt
+    # ── Hybrid mode: for tentative MCP Apps hosts (Claude Code Desktop/VSCode),
+    #     create the local_browser fallback even though _meta is also set.
+    if surface.get("surface") == "mcp_app":
+        from ..utils import host_mcp_apps_confirmed  # noqa: PLC0415
+        if host_mcp_apps_confirmed():
+            return prompt
     # 已有本地浏览器页面，不重复创建
     if prompt.get("local_browser", {}).get("url"):
         return prompt
@@ -1085,7 +1204,7 @@ async def _parse_prompt_for_download_results(
                 force_open=True,
             )
         await asyncio.to_thread(_write_pending_parse_prompt_state, fallback)
-        return _promote_paper_selection_app(fallback)
+        return _to_widget_tool_result(_promote_paper_selection_app(fallback))
 
     if len(candidates) <= AUTO_PARSE_SAVED_PDF_LIMIT:
         if parse_execution_name == "sync":
@@ -1186,7 +1305,7 @@ async def _parse_prompt_for_download_results(
             "recommended_selected_indices": "",
         }
         await asyncio.to_thread(_write_pending_parse_prompt_state, prompted)
-        return _promote_paper_selection_app(prompted)
+        return _to_widget_tool_result(_promote_paper_selection_app(prompted))
 
     options = [_elicitation_option_label(candidate) for candidate in selectable]
     schema = _build_paper_selection_schema(options)
@@ -1417,7 +1536,9 @@ async def _pre_download_selection_prompt(
             selection_semantics=semantics,
             parse_execution=parse_execution,
         )
-    return _promote_paper_selection_app(_prefer_local_selection_surface(prompt))
+    return _to_widget_tool_result(
+        _promote_paper_selection_app(_prefer_local_selection_surface(prompt))
+    )
 
 
 # ===========================================================================
@@ -1878,38 +1999,99 @@ def register_orchestration_tools(mcp, searchers):
 
         Use ranking_profile='agent-skill' for LLM-agent skill/library/retrieval/security topics.
         The response always includes a selection_token, MCP App checkbox prompt, and numbered_fallback.
+
+        When *requested_count* is set and the first round of search does not
+        return enough downloadable papers, the tool automatically retries with
+        progressively broader source profiles and higher oversampling until the
+        target is met or all configured rounds are exhausted.
         """
         effective_sources = sources
-        if (
-            not (effective_sources or "").strip()
-            and _ranking_profile_name(ranking_profile) == AGENT_SKILL_RANKING_PROFILE
-        ):
+        is_agent_skill = (
+            _ranking_profile_name(ranking_profile) == AGENT_SKILL_RANKING_PROFILE
+        )
+        if not (effective_sources or "").strip() and is_agent_skill:
             effective_sources = "agent-skill-fast"
 
-        # ── Oversample to ensure enough downloadable candidates ──────────
-        # When requested_count is specified, increase max_results_per_source
-        # so that even after filtering out papers without PDF access we have
-        # enough candidates to present to the user.
-        effective_max_per_source = max_results_per_source
-        if requested_count > 0:
-            num_sources = max(len(_parse_sources(effective_sources)), 1)
-            # Oversample by 2.5× to compensate for sources that only provide
-            # metadata (e.g. crossref, openalex) and don't host PDFs directly.
-            oversampled = math.ceil(requested_count * 2.5 / num_sources)
-            effective_max_per_source = max(max_results_per_source, oversampled)
+        # ── Progressive retry rounds ─────────────────────────────────
+        # Each round specifies (source_profile, oversample_multiplier).
+        # Rounds 2 & 3 are only used for the agent-skill profile where
+        # metadata-only sources (crossref, openalex) are known to produce
+        # many non-downloadable candidates.
+        RETRY_ROUNDS: List[tuple] = [
+            (effective_sources, 2.5),
+        ]
+        if is_agent_skill:
+            RETRY_ROUNDS.extend([
+                ("agent-skill-broad", 5.0),
+                ("deep", 8.0),
+            ])
 
-        search_result = await search_papers(
-            query=query,
-            max_results_per_source=effective_max_per_source,
-            sources=effective_sources,
-            year=year,
-        )
+        all_ranked_papers: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+        combined_search_result: Optional[Dict[str, Any]] = None
+        target = max(requested_count, 1) if requested_count > 0 else 0
+
+        for round_idx, (round_sources, multiplier) in enumerate(RETRY_ROUNDS):
+            # ── Check if we already have enough downloadable papers ──
+            if round_idx > 0 and target > 0:
+                ready = _count_download_ready_papers(all_ranked_papers)
+                logger.info(
+                    "crawl_papers_for_selection round %d: %d download-ready, need %d",
+                    round_idx + 1, ready, target,
+                )
+                if ready >= target:
+                    break
+
+            # ── Oversample ──────────────────────────────────────────
+            num_sources = max(len(_parse_sources(round_sources)), 1)
+            if requested_count > 0:
+                oversampled = math.ceil(requested_count * multiplier / num_sources)
+                effective_max = max(max_results_per_source, oversampled)
+            else:
+                effective_max = max_results_per_source
+
+            # ── Search (different sources param ensures cache miss) ──
+            search_result = await search_papers(
+                query=query,
+                max_results_per_source=effective_max,
+                sources=round_sources,
+                year=year,
+            )
+
+            # ── Dedup and accumulate ────────────────────────────────
+            round_papers = search_result.get("papers", [])
+            if not isinstance(round_papers, list):
+                round_papers = []
+            new_papers: List[Dict[str, Any]] = []
+            for paper in round_papers:
+                key = _paper_unique_key(paper)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    new_papers.append(paper)
+            all_ranked_papers.extend(new_papers)
+
+            # ── Merge result metadata ───────────────────────────────
+            if combined_search_result is None:
+                combined_search_result = search_result
+            else:
+                combined_search_result = _merge_search_results(
+                    combined_search_result, search_result
+                )
+
+            # ── Stop early if no new papers found ───────────────────
+            if not new_papers:
+                logger.info(
+                    "crawl_papers_for_selection round %d: no new papers, stopping",
+                    round_idx + 1,
+                )
+                break
+
         return await _create_paper_selection_result(
             query=query,
-            max_results_per_source=effective_max_per_source,
+            max_results_per_source=max_results_per_source,
             sources=effective_sources,
             year=year,
-            search_result=search_result,
+            search_result=combined_search_result,
             interaction="crawl_papers_for_selection",
             ranking_profile=ranking_profile,
             action_tool="download_selected_papers",
@@ -2136,6 +2318,7 @@ def register_orchestration_tools(mcp, searchers):
                 "resourceUri": PAPER_SELECTION_WIDGET_URI,
                 "visibility": ["model", "app"],
             },
+            "ui/resourceUri": PAPER_SELECTION_WIDGET_URI,
             "openai/outputTemplate": PAPER_SELECTION_WIDGET_URI,
             "openai/widgetAccessible": True,
             "openai/toolInvocation/invoking": "Downloading selected papers...",
@@ -2318,8 +2501,10 @@ def register_orchestration_tools(mcp, searchers):
                 response["app"] = prompt["app"]
             if isinstance(prompt.get("local_browser"), dict):
                 response["local_browser"] = prompt["local_browser"]
-            return _promote_paper_selection_app(
+            return _to_widget_tool_result(
+                _promote_paper_selection_app(
                 _prefer_local_selection_surface(response)
+            )
             )
 
         download_concurrency = (
@@ -2608,8 +2793,10 @@ def register_orchestration_tools(mcp, searchers):
                 response["app"] = prompt["app"]
             if isinstance(prompt.get("local_browser"), dict):
                 response["local_browser"] = prompt["local_browser"]
-            return _promote_paper_selection_app(
+            return _to_widget_tool_result(
+                _promote_paper_selection_app(
                 _prefer_local_selection_surface(response)
+            )
             )
 
         download = await download_selected_papers(
@@ -2773,7 +2960,7 @@ def register_orchestration_tools(mcp, searchers):
                 selection.get("app"), dict
             ):
                 response["app"] = selection["app"]
-            return _promote_paper_selection_app(response)
+            return _to_widget_tool_result(_promote_paper_selection_app(response))
 
         indices = _workflow_selection_indices(
             selected_indices,
@@ -2898,8 +3085,10 @@ def register_orchestration_tools(mcp, searchers):
             if isinstance(existing_lb, dict) and existing_lb.get("url"):
                 response["local_browser"] = existing_lb
                 response["local_browser_url"] = existing_lb.get("url")
-            return _promote_paper_selection_app(
-                _prefer_local_selection_surface(response)
+            return _to_widget_tool_result(
+                _promote_paper_selection_app(
+                    _prefer_local_selection_surface(response)
+                )
             )
 
         download = await download_selected_papers(

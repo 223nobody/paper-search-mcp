@@ -871,6 +871,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
+  <script>/*__EXT_APPS_BUNDLE__*/</script>
   <main>
     <section class="shell" aria-labelledby="paper-selector-title">
       <header>
@@ -950,7 +951,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
     let downloadTimer = null;
     let jobStartEpoch = 0;
     let parseDecision = null;
-    let data = normalizeSelectionData(unwrapToolOutput(window.openai?.toolOutput || {}));
+    let data = {};  // populated by initApp() via feature detection
     const clientInstanceId = ((window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : String(Date.now()) + Math.random())).replace(/[^a-zA-Z0-9._-]/g, "");
     let restoreAttempted = false;
     let saveStateTimer = null;
@@ -1234,9 +1235,15 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
     }
 
     async function callTool(name, args) {
+      /* ── Priority 1: standard MCP Apps App class (Claude Desktop) ── */
+      if (app && app.callServerTool) {
+        return app.callServerTool({ name, arguments: args });
+      }
+      /* ── Priority 2: window.openai (Codex / OpenAI) ── */
       if (window.openai?.callTool) {
         return window.openai.callTool(name, args);
       }
+      /* ── Priority 3: postMessage JSON-RPC fallback ── */
       return rpcRequest("tools/call", { name, arguments: args });
     }
 
@@ -1359,6 +1366,21 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       skipButton.disabled = true;
       decisionText.textContent = body?.message || "PDFs were saved. MinerU parsing was not started.";
       setStatus(decisionText.textContent, "success");
+    }
+
+    function isParseReadyPrompt(prompt) {
+      if (!prompt || typeof prompt !== "object") return false;
+      if (!prompt.selection_token) return false;
+      const terminalStatus = String(prompt.status || "").toLowerCase();
+      if (["timed_out_no_parse", "completed_no_parse"].includes(terminalStatus)) return false;
+      const recommended = String(prompt.default_parse_selected_indices || prompt.recommended_selected_indices || "").trim();
+      const papers = Array.isArray(prompt.papers) ? prompt.papers : [];
+      const hasReadyPaper = papers.some((paper) => paper?.parse_ready !== false);
+      return Boolean(prompt.parse_decision_required)
+        || Boolean(prompt.requires_user_parse_decision)
+        || Number(prompt.parse_ready_total || 0) > 0
+        || Boolean(recommended)
+        || hasReadyPaper;
     }
 
     async function dismissParsePrompt(reason) {
@@ -1685,10 +1707,12 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
         }
         if (downloadOnly || downloadAndParse) {
           finishDownloadProgress(body);
-          if (body?.parse_prompt && typeof body.parse_prompt === "object" && body.parse_prompt.parse_decision_required) {
-            startParseDecision(body.parse_prompt);
-          } else if (["timed_out_no_parse", "completed_no_parse"].includes(String(body?.status || ""))) {
-            renderTerminalNoParse(body);
+          const prompt = body?.parse_prompt && typeof body.parse_prompt === "object" ? body.parse_prompt : null;
+          const terminalStatus = String(prompt?.status || body?.status || "").toLowerCase();
+          if (["timed_out_no_parse", "completed_no_parse"].includes(terminalStatus)) {
+            renderTerminalNoParse(prompt || body);
+          } else if (isParseReadyPrompt(prompt)) {
+            startParseDecision(prompt);
           } else {
             setStatus(body?.message || `Downloaded ${body?.downloaded || 0} paper(s).`, body?.failed ? "error" : "success");
             parseButton.disabled = false;
@@ -1800,8 +1824,54 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       }
     }, { passive: true });
 
-    render();
-    startHiddenSelectionTimeout();
+    /* ── Platform detection & initialisation ── */
+    const HAS_EXT_APPS = typeof globalThis.ExtApps !== 'undefined';
+    const HAS_OPENAI  = typeof window.openai !== 'undefined' && window.openai.toolOutput;
+    let app = null;  // MCP Apps App instance (Claude Desktop / standard MCP Apps)
+
+    async function initApp() {
+      if (HAS_EXT_APPS) {
+        /* ── Claude Desktop / standard MCP Apps path ── */
+        const { App } = globalThis.ExtApps;
+        app = new App({ name: "paper-selector", version: "1.0.0" });
+
+        /* Required protocol handlers (all four must be registered before connect) */
+        app.onteardown      = () => ({});
+        app.ontoolinput     = () => ({});
+        app.ontoolcancelled = () => ({});
+        app.onerror         = (err) => console.error("MCP App error:", err);
+
+        /* Receive tool-result data pushed by the host */
+        app.ontoolresult = (toolResult) => {
+          const sc = toolResult?.structuredContent;
+          if (sc) {
+            data = normalizeSelectionData(unwrapToolOutput(sc));
+            render();
+          }
+        };
+
+        await app.connect();
+
+        /* Some hosts provide initial data via host context */
+        const ctx = app.getHostContext();
+        if (ctx?.toolOutput) {
+          data = normalizeSelectionData(unwrapToolOutput(ctx.toolOutput));
+        }
+        render();
+        startHiddenSelectionTimeout();
+      } else if (HAS_OPENAI) {
+        /* ── Codex / OpenAI path (existing logic, unchanged) ── */
+        data = normalizeSelectionData(unwrapToolOutput(window.openai.toolOutput));
+        render();
+        startHiddenSelectionTimeout();
+      } else {
+        /* ── Pure postMessage fallback ── */
+        render();
+        startHiddenSelectionTimeout();
+      }
+    }
+
+    initApp();
   </script>
 </body>
 </html>"""

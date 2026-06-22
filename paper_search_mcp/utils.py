@@ -172,24 +172,66 @@ def _looks_like_codex_vscode_process() -> bool:
     return False
 
 
+MCP_APPS_WIDGET_HOSTS = frozenset(
+    {
+        "codex",
+        "claude_desktop",
+        # ── Tentative MCP Apps hosts (2026-06) ──
+        # These hosts MAY support MCP Apps sandbox widgets — we include
+        # _meta on tool results AND also open a local_browser page as a
+        # fallback.  If the widget renders, the user can use either.
+        # If it doesn't, the browser page is already open.
+        "claude_code_desktop",
+        "claude_code_vscode",
+    }
+)
+
+# Hosts KNOWN to definitely support MCP Apps sandbox widgets.
+# For these hosts we use "app_only" mode — no local_browser fallback.
+MCP_APPS_CONFIRMED_HOSTS = frozenset(
+    {
+        "codex",
+        "claude_desktop",
+        # ── claude_code_desktop intentionally omitted as of 2026-06 ──
+        # Claude Code Desktop does NOT yet support MCP Apps sandbox
+        # widgets.  It is kept in MCP_APPS_WIDGET_HOSTS for hybrid mode
+        # (_meta is sent as future-proofing) but is NOT a confirmed
+        # host, so the local_browser fallback is activated.
+    }
+)
+
+
 def host_supports_mcp_apps_widget() -> bool:
-    """Return True when the host can render MCP Apps sandboxed iframes.
+    """Return True when the host might render MCP Apps sandboxed iframes.
+
+    This is intentionally broader than ``host_mcp_apps_confirmed()``:
+    tentative hosts return True so widget metadata is sent, but they still
+    need local_browser fallback in hybrid mode.
 
     Supported hosts (as of 2026-06):
-      - Codex Desktop (native MCP Apps sandbox)
-      - Claude Desktop (legacy standalone app with iframe support)
-      - Claude Code Desktop (standalone GUI app with iframe support)
+      - Codex Desktop (confirmed — native MCP Apps sandbox)
+      - Claude Desktop (confirmed — legacy standalone app)
+      - Claude Code Desktop (confirmed — standalone GUI WebView)
+      - Claude Code VS Code extension (tentative — hybrid: widget + local_browser)
 
     NOT supported (no sandboxed iframe capability):
       - Codex VS Code plugin → uses localhost browser fallback
-      - Claude Code VS Code extension → uses localhost browser fallback
       - Claude Code CLI → uses numbered fallback or TUI
     """
-    return detect_host() in (
-        "codex",               # Codex Desktop
-        "claude_desktop",      # Claude Desktop (legacy)
-        "claude_code_desktop", # Claude Code Desktop
-    )
+    return detect_host() in MCP_APPS_WIDGET_HOSTS
+
+
+def host_mcp_apps_confirmed() -> bool:
+    """Return True when the host is KNOWN to definitely support MCP Apps.
+
+    Confirmed hosts use ``app_only`` mode — no local_browser fallback.
+    As of 2026-06 ONLY codex and claude_desktop are confirmed.
+    Claude Code Desktop and VS Code are *tentative* hosts (in
+    MCP_APPS_WIDGET_HOSTS but NOT confirmed) — hybrid mode is used:
+    _meta is sent for future widget support, AND a local_browser page
+    is opened as a working fallback.
+    """
+    return detect_host() in MCP_APPS_CONFIRMED_HOSTS
 
 
 def host_is_codex() -> bool:

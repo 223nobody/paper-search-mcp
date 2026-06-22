@@ -3848,8 +3848,13 @@ async def _attach_local_selection_ui(
 ) -> Dict[str, Any]:
     surface = _selection_surface_policy(force_open=force_open)
     prompt["selection_surface"] = surface
-    if surface.get("surface") != "local_browser":
+    if surface.get("surface") == "numbered_fallback":
         return prompt
+    if surface.get("surface") == "mcp_app":
+        from .utils import host_mcp_apps_confirmed  # noqa: PLC0415
+
+        if host_mcp_apps_confirmed():
+            return prompt
     # 已有本地浏览器页面，不重复创建
     if prompt.get("local_browser", {}).get("url"):
         return prompt
@@ -3874,6 +3879,13 @@ async def _attach_local_selection_ui(
             or prompt["local_browser"].get("selection_timeout")
             or 0
         )
+        if surface.get("surface") == "hybrid":
+            prompt["interaction"] = "mcp_app"
+            prompt["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
+            prompt["recommended_url"] = prompt["local_browser"].get("url", "")
+            prompt["local_browser_url"] = prompt["local_browser"].get("url", "")
+            prompt["page_id"] = prompt["local_browser"].get("page_id", "")
+            prompt["opened"] = bool(prompt["local_browser"].get("opened", False))
     except Exception as exc:
         logger.exception("Failed to open local paper selection UI")
         prompt["local_browser"] = {
@@ -4577,11 +4589,48 @@ async def _download_selected_session_paper(
     )
 
 
+def _prefer_local_selection_surface(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose localhost fallback details from a nested parse prompt."""
+    if not isinstance(response, dict):
+        return response
+    prompt = response.get("parse_prompt")
+    if not isinstance(prompt, dict):
+        return response
+    local = prompt.get("local_browser")
+    if not isinstance(local, dict):
+        return response
+    url = str(local.get("url") or "")
+    if not url:
+        return response
+    surface = local.get("selection_surface")
+    surface_name = surface.get("surface") if isinstance(surface, dict) else ""
+    if surface_name == "hybrid":
+        response.setdefault("interaction", "mcp_app")
+        response.setdefault("recommended_tool", PAPER_SELECTION_WIDGET_TOOL)
+    else:
+        response["interaction"] = local.get("interaction", "local_browser_checkbox")
+        response["recommended_tool"] = LOCAL_PAPER_SELECTION_TOOL
+    response["recommended_url"] = url
+    response["local_browser_url"] = url
+    response["page_id"] = local.get("page_id", "")
+    response["opened"] = bool(local.get("opened", False))
+    response["local_browser"] = local
+    if "parse_decision_required" in prompt:
+        response["parse_decision_required"] = bool(prompt.get("parse_decision_required"))
+    if "requires_user_parse_decision" in prompt:
+        response["requires_user_parse_decision"] = bool(
+            prompt.get("requires_user_parse_decision")
+        )
+    return response
+
+
 async def _after_saved_pdf(result: Any, **kwargs: Any) -> Any:
     kwargs.setdefault("after_save_prompt_hook", _prompt_parse_saved_pdfs)
     kwargs.setdefault("searchers", _SEARCHERS)
     kwargs.setdefault("_attach_local_selection_ui_fn", _attach_local_selection_ui)
     response = await _engine_after_saved_pdf(result, **kwargs)
+    if isinstance(response, dict):
+        response = _prefer_local_selection_surface(response)
     return (
         _promote_paper_selection_app(response)
         if isinstance(response, dict)
@@ -4595,6 +4644,8 @@ async def _after_saved_pdfs(pdf_paths: List[str], **kwargs: Any) -> Optional[Dic
     kwargs.setdefault("searchers", _SEARCHERS)
     kwargs.setdefault("_attach_local_selection_ui_fn", _attach_local_selection_ui)
     response = await _engine_after_saved_pdfs(pdf_paths, **kwargs)
+    if isinstance(response, dict):
+        response = _prefer_local_selection_surface(response)
     return (
         _promote_paper_selection_app(response)
         if isinstance(response, dict)

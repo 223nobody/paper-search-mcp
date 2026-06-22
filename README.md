@@ -8,9 +8,50 @@
 
 ---
 
-## 🚀 快速开始
+## 🤖 一键 AI 安装
 
-配置好 MCP 客户端后，只需用自然语言描述需求即可：
+将以下提示词粘贴到 Claude Code 或 Codex 中，AI 将自动完成安装：
+
+```text
+请帮我安装 paper-search-mcp。这是一个多源学术论文检索/下载/解析 MCP 服务。按以下流程操作：
+
+## 1. 克隆仓库
+git clone https://github.com/223nobody/paper-search-mcp.git ~/code/paper-search-mcp
+（根据平台调整路径：macOS/Linux 用 ~/code/paper-search-mcp，Windows 用 C:\code\paper-search-mcp）
+
+## 2. 检测平台并安装依赖
+- 检查是否安装了 uv（Python 包管理器），如未安装则先安装。
+- 进入项目目录，运行 `uv sync` 安装依赖。
+
+## 3. 配置 .env
+- 如果 .env 不存在，从 .env.example 复制一份。
+- 引导用户填写必要的 API Key：
+  - MinerU API Key（重要——高质量 PDF 解析，免费注册 https://mineru.net）
+  - Semantic Scholar API Key（可选——提升搜索速率限制）
+  - CORE API Key（可选——下载回退）
+- 其余保持默认。
+
+## 4. 注册为全局 MCP Server
+运行安装脚本 `python scripts/install-mcp-global.py`。
+这会将 MCP Server 配置写入 `~/.claude/mcp.json`，之后从任意工作区打开 Claude Code 都能使用，无需手动编辑 JSON。
+（可选参数：`--dry-run` 预览变更、`--force` 强制覆盖、`--uninstall` 卸载）
+
+## 5. 安装 Skill（可选但推荐）
+- Claude Code：将 .claude/skills/paper-search/SKILL.md 复制到 ~/.claude/skills/paper-search/SKILL.md
+- Codex：将 .codex/skills/paper-search/SKILL.md 复制到 ~/.codex/skills/paper-search/SKILL.md
+
+## 6. 验证安装
+- 运行 `uv run -m paper_search_mcp.server` 确认服务启动成功。
+- 看到工具注册列表后，告知安装完成，列出核心功能，并提供几个示例 prompt。
+```
+
+> 💡 **原理**：以上 prompt 就是给 AI Agent 的"安装脚本"。你不需要手动执行任何步骤——只需粘贴到 Claude Code，AI 会自动检测平台、克隆代码、配置环境、注册 MCP、验证安装。
+
+---
+
+### 安装后使用
+
+MCP 可用后，只需用自然语言描述需求即可：
 
 ```text
 # 最常用：检索 → 下载 → 解析，一句话搞定
@@ -92,53 +133,6 @@ uv pip install -e ".[dev]"
 
 ---
 
-## ⚙️ MCP 客户端配置示例
-
-VS Code `.vscode/mcp.json` 示例：
-
-```json
-{
-  "servers": {
-    "paper-search-mcp": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "C:\\code\\paper-search-mcp",
-        "-m",
-        "paper_search_mcp.server"
-      ],
-      "env": {
-        "PAPER_SEARCH_MCP_MINERU_MODE": "auto",
-        "PAPER_SEARCH_MCP_MINERU_API_KEY": "",
-        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": ""
-      }
-    }
-  }
-}
-```
-
-Claude Desktop 的配置结构通常使用 `mcpServers`：
-
-```json
-{
-  "mcpServers": {
-    "paper-search-mcp": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "C:\\code\\paper-search-mcp",
-        "-m",
-        "paper_search_mcp.server"
-      ]
-    }
-  }
-}
-```
-
----
-
 ## 🔧 环境变量
 
 在仓库根目录创建 `.env`（不要将 token 提交到 Git）：
@@ -216,16 +210,7 @@ PAPER_SEARCH_MCP_DISABLED_SOURCES=pubmed,biorxiv,medrxiv,google_scholar,iacr,sem
 
 ### 🔑 MinerU API Key 配置弹窗
 
-支持 MCP Apps 的客户端可调用 `mineru_setup_status` 检查配置。未配置 `PAPER_SEARCH_MCP_MINERU_API_KEY` 时返回 `mineru_api_key_prompt`，指向 `render_mineru_api_key_setup_app`，客户端据此显示输入弹窗。
-
-```json
-{
-  "tool": "render_mineru_api_key_setup_app",
-  "arguments": { "reason": "missing" }
-}
-```
-
-Widget 提交后调用 `configure_mineru_api_key`，将 key 写入 `.env`：`PAPER_SEARCH_MCP_MINERU_API_KEY=<你的 key>`。
+支持 MCP Apps 的客户端可调用 `mineru_setup_status` 检查配置。未配置 `PAPER_SEARCH_MCP_MINERU_API_KEY` 时返回 `mineru_api_key_prompt`，指向 `render_mineru_api_key_setup_app`，客户端据此显示输入弹窗。Widget 提交后调用 `configure_mineru_api_key`，将 key 写入 `.env`。
 
 解析时若检测到 key 缺失/过期/401/403 等鉴权错误，返回结果会附带 `mineru_api_key_prompt` 提示重新配置。
 
@@ -320,54 +305,6 @@ C:\Users\<你的用户名>\Desktop\papers
 
 ---
 
-## 💻 常用 CLI
-
-检索论文：
-
-```powershell
-uv run paper-search search "agentic spatial reasoning" -s arxiv,semantic,openalex -n 3
-```
-
-下载论文，默认保存到桌面：
-
-```powershell
-uv run paper-search download arxiv 2401.12345
-```
-
-解析本地 PDF：
-
-```powershell
-uv run paper-search parse "$env:USERPROFILE\Desktop\example.pdf" --paper-key example --mode extract
-```
-
-查看 MinerU/解析环境：
-
-```powershell
-uv run paper-search mineru-health --mode auto
-```
-
-读取缓存结果：
-
-```powershell
-uv run paper-search cache list
-uv run paper-search cache get example -f markdown
-uv run paper-search cache search example "regularization"
-uv run paper-search cache search-index "regularization" --paper-key example
-uv run paper-search cache rebuild-index
-uv run paper-search cache cleanup-stale
-uv run paper-search parse-batch C:\Users\you\Desktop\a.pdf C:\Users\you\Desktop\b.pdf --mode extract
-```
-
-本地优化效果可以用 benchmark 脚本验证，不依赖网络：
-
-```powershell
-uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
-```
-
-输出会包含首次解析、缓存命中解析、FTS 重建/搜索、传统文件搜索耗时和 speedup。
-
----
-
 ## 🔌 MCP 使用流程
 
 ### 1. 🚀 自然语言首选高层入口
@@ -388,21 +325,6 @@ uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
 帮我找 2024 年以来关于 "mamba state space model" 的高引论文 5 篇，下载并解析。
 ```
 
-**底层 JSON 调用**：
-
-```json
-{
-  "tool": "paper_research_workflow",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "intent": "search_download_parse",
-    "count": 5,
-    "sources": "arxiv,semantic,openalex",
-    "parse_execution": "background"
-  }
-}
-```
-
 常用参数：`intent="search_only"` 仅检索；`intent="search_download"` 检索并下载；`intent="search_download_parse"` 检索下载并后台解析；`selection_mode="manual"` 先选后下载；`parse_execution="background"` 后台解析（返回 job_id）；`parse_execution="sync"` 同步等待解析；`parse_execution="none"/"skip"` 只下载不解析。
 
 除非用户明确指定目录，不要传 `save_path`；默认保存到 `~/Desktop/papers`。
@@ -419,19 +341,6 @@ uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
 全面搜索 "neural radiance field" 相关论文，用 deep 来源。
 ```
 
-**底层 JSON 调用**：
-
-```json
-{
-  "tool": "search_papers",
-  "arguments": {
-    "query": "multi objective reinforcement learning",
-    "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3
-  }
-}
-```
-
 ### 3. ✅ 检索后弹出多选解析
 
 如果 MCP 客户端支持 Elicitation，例如 VS Code Copilot Agent Mode，并且客户端把 `array + enum` 渲染为多选控件，就可以看到 checkbox 或多选列表。用户选择论文后，MCP Server 会下载并解析所选条目。
@@ -443,49 +352,11 @@ uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
 帮我找几篇 "prompt engineering" 的论文，让我勾选需要下载解析的。
 ```
 
-```json
-{
-  "tool": "search_papers_with_elicitation",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3,
-    "save_path": "~/Desktop/papers",
-    "mode": "extract"
-  }
-}
-```
-
 ### 3. 🖥️ MCP Apps checkbox UI
 
-支持 MCP Apps 的客户端可以打开独立 checkbox 组件，适合检索候选论文后手动选择，或单次保存超过 10 篇 PDF 后选择要解析的论文：
+支持 MCP Apps 的客户端可以打开独立 checkbox 组件，适合检索候选论文后手动选择，或单次保存超过 10 篇 PDF 后选择要解析的论文。勾选论文后走 `download_selected_papers`（仅下载）或 `download_and_parse_selected_papers`（下载并解析）。
 
-```json
-{
-  "tool": "render_paper_selection_app",
-  "arguments": {
-    "selection_token": "search_20260610_xxxxxxxx",
-    "mode": "extract"
-  }
-}
-```
-
-该工具返回 `ui://paper-search/paper-selection.html` 对应的 HTML widget。勾选论文后走 `download_selected_papers`（仅下载）或 `download_and_parse_selected_papers`（下载并解析）。不支持 MCP Apps 时可用下面的编号选择流程。
-
-如当前 Host 不能渲染 MCP Apps 但允许打开系统浏览器：
-
-```json
-{
-  "tool": "open_paper_selection_page",
-  "arguments": {
-    "selection_token": "search_20260610_xxxxxxxx",
-    "mode": "extract",
-    "open_browser": true
-  }
-}
-```
-
-该工具启动 localhost 页面并用系统浏览器打开，提交后同样调用 `download_selected_papers` 或 `download_and_parse_selected_papers`。
+如当前 Host 不能渲染 MCP Apps 但允许打开系统浏览器，可用 `open_paper_selection_page` 启动 localhost 页面并用系统浏览器打开，提交后同样调用下载或下载+解析工具。
 
 ### 4. 🔢 无 checkbox UI 时的编号选择
 
@@ -496,39 +367,6 @@ uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
 ```text
 搜索 "chain of thought prompting" 论文，给我一个编号列表，我选好编号后下载解析。
 帮我检索 "parameter efficient fine-tuning" 的论文并编号，我选第 1、3、5 篇来解析。
-```
-
-**底层调用**：
-
-```json
-{
-  "tool": "search_papers_for_parsing",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3
-  }
-}
-```
-
-返回结果中会包含：
-
-- `selection_token`
-- 编号后的 `papers`
-- 每条论文的 `parse_ready` 状态
-
-然后解析用户选择的编号：
-
-```json
-{
-  "tool": "parse_selected_papers",
-  "arguments": {
-    "selection_token": "search_20260610_xxxxxxxx",
-    "selected_indices": "1,3",
-    "save_path": "~/Desktop",
-    "mode": "extract"
-  }
-}
 ```
 
 `selected_indices` 支持：
@@ -568,19 +406,6 @@ uv run python scripts\bench_search_parse.py --pdf-count 8 --mode pypdf --force
 帮我把桌面上的 paper.pdf 用 MinerU 解析了。
 解析 C:\Users\me\Desktop\draft.pdf，paper_key 设为 my_draft，用 extract 模式。
 把 ~/Desktop/papers/ 下面所有 PDF 都批量解析了。
-```
-
-**底层 JSON 调用**：
-
-```json
-{
-  "tool": "parse_pdf_with_mineru",
-  "arguments": {
-    "pdf_path": "C:\\Users\\<你的用户名>\\Desktop\\example.pdf",
-    "paper_key": "example",
-    "mode": "extract"
-  }
-}
 ```
 
 解析完成后在 PDF 同目录生成 `example_mineru/`，开启 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true` 时额外生成同名 zip。`.paper_search_cache` 只保留轻量索引。
@@ -881,3 +706,4 @@ python -m unittest tests.test_selection_sessions tests.test_mineru_parser tests.
 - [Rimagination/scansci-pdf](https://github.com/Rimagination/scansci-pdf)：提供科学 PDF 处理和解析工作流方面的参考。
 - [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero)：提供将 MinerU PDF parsing 接入论文阅读/管理流程的实现思路参考。
 - [opendatalab/MinerU](https://github.com/opendatalab/MinerU)：提供高质量 PDF 解析、Markdown/JSON/资源抽取能力，是本项目 MinerU 解析链路的核心依赖方向。
+- [mcp-use/mcp-use](https://github.com/mcp-use/mcp-use)：提供 MCP 服务架构与最佳实践参考。

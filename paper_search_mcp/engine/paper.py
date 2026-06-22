@@ -800,9 +800,11 @@ def _agent_skill_profile_score(paper: Dict[str, Any]) -> float:
             if phrase in title:
                 score -= 2.0
 
-    # 无法获取 PDF 的论文大幅扣分，排在末尾
+    # 无法获取 PDF 的论文扣分，排在末尾但不过度惩罚
+    # 保留在候选池中，以便 _recommended_display_candidates 的 Phase-3
+    # fallback 能够在 downloadable 论文不足时填充到 requested_count。
     if paper.get("download_ready") is False:
-        score -= 10.0
+        score -= 5.0
 
     if "multi-agent" in text or "multi agent" in text:
         score += 1.0

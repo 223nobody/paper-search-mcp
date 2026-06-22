@@ -63,7 +63,12 @@ from ..widgets.response import widget_tool_result
 
 async def _handle_paper_selection_widget() -> str:
     """Return the checkbox UI used by MCP Apps-capable hosts."""
-    return PAPER_SELECTION_WIDGET_HTML
+    from ..ui.ext_apps_bundle import get_ext_apps_bundle
+
+    bundle = get_ext_apps_bundle()
+    return PAPER_SELECTION_WIDGET_HTML.replace(
+        "/*__EXT_APPS_BUNDLE__*/", bundle or ""
+    )
 
 
 _PAPER_SELECTION_RESOURCE_META = {
@@ -71,7 +76,7 @@ _PAPER_SELECTION_RESOURCE_META = {
         "prefersBorder": True,
         "csp": {
             "connectDomains": [],
-            "resourceDomains": [],
+            "resourceDomains": ["https://unpkg.com"],
         },
     },
     "openai/widgetDescription": (
@@ -80,7 +85,7 @@ _PAPER_SELECTION_RESOURCE_META = {
     "openai/widgetPrefersBorder": True,
     "openai/widgetCSP": {
         "connect_domains": [],
-        "resource_domains": [],
+        "resource_domains": ["https://unpkg.com"],
     },
 }
 
@@ -507,6 +512,7 @@ _RENDER_PAPER_SELECTION_TOOL_META = {
         "resourceUri": PAPER_SELECTION_WIDGET_URI,
         "visibility": ["model", "app"],
     },
+    "ui/resourceUri": PAPER_SELECTION_WIDGET_URI,
     "openai/outputTemplate": PAPER_SELECTION_WIDGET_URI,
     "openai/widgetAccessible": True,
     "openai/toolInvocation/invoking": "Opening paper selector...",
@@ -689,6 +695,7 @@ _RENDER_MINERU_KEY_TOOL_META = {
         "resourceUri": MINERU_KEY_WIDGET_URI,
         "visibility": ["model", "app"],
     },
+    "ui/resourceUri": MINERU_KEY_WIDGET_URI,
     "openai/outputTemplate": MINERU_KEY_WIDGET_URI,
     "openai/widgetAccessible": True,
     "openai/toolInvocation/invoking": "Opening MinerU setup...",

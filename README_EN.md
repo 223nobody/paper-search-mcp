@@ -40,15 +40,11 @@ git clone https://github.com/223nobody/paper-search-mcp.git ~/code/paper-search-
   - CORE API Key (optional — download fallback)
 - Leave the rest as defaults.
 
-## 4. Configure the MCP Server
-
-**Claude Code** — add to `~/.claude/.mcp.json`:
-`{"mcpServers":{"paper-search-mcp":{"type":"stdio","command":"uv","args":["run","--directory","<clone path>","-m","paper_search_mcp.server"],"env":{"PAPER_SEARCH_MCP_SEARCH_PROFILE":"pdf-cs","PAPER_SEARCH_MCP_MINERU_MODE":"auto"}}}}`
-
-Then in `~/.claude/settings.json`: `"enabledMcpjsonServers":["paper-search-mcp"]`
-
-**Codex** — add to `~/.codex/config.toml`:
-`[mcp_servers.paper-search-mcp]` / `command="uv"` / `args=["run","--directory","<clone path>","-m","paper_search_mcp.server"]` / `startup_timeout_sec=20` / `enabled=true`
+## 4. Register as Global MCP Server
+Run the install script to register paper-search-mcp globally:
+`python scripts/install-mcp-global.py`
+This writes the MCP server config to `~/.claude/mcp.json`, so it works from any workspace without manual JSON editing.
+(Use `--dry-run` to preview, `--force` to overwrite, or `--uninstall` to remove.)
 
 ## 5. Install the Skill (optional but recommended)
 - Claude Code: Copy .claude/skills/paper-search/SKILL.md to ~/.claude/skills/paper-search/SKILL.md
@@ -613,20 +609,7 @@ Search defaults to `fast` profile. Pass `sources=deep/all` for long-tail sources
 
 ### 🔌 MCP-first natural-language workflow
 
-Prefer the high-level `paper_research_workflow` tool — it keeps the whole flow inside MCP:
-
-```json
-{
-  "tool": "paper_research_workflow",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "intent": "search_download_parse",
-    "count": 5,
-    "sources": "arxiv,semantic,openalex",
-    "parse_execution": "background"
-  }
-}
-```
+Prefer the high-level `paper_research_workflow` tool — it keeps the whole flow inside MCP.
 
 `intent="search_only"` for discovery, `"search_download"` for PDF retrieval, `"search_download_parse"` for parsed content. Default: background parsing via `submit_parse_job` (returns `job_id`). Use `parse_execution="none"/"skip"` to skip MinerU. Don't pass `save_path` unless explicitly requested (default: `~/Desktop/papers`).
 
@@ -648,18 +631,7 @@ For example, `download_arxiv` returns `pdf_path`, `pdf_paths`, and
 default; pass `parse_execution="skip"` to only save the PDF. Existing valid PDFs
 are reused instead of downloaded again.
 
-Lower-level MCP flow:
-
-```json
-{
-  "tool": "search_papers_for_parsing",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3
-  }
-}
-```
+Lower-level MCP flow: call `search_papers_for_parsing` to get a `selection_token` and numbered paper list, then use `submit_parse_job` for background parsing or `parse_selected_papers` to wait synchronously. For download-and-parse sessions, call `download_and_parse_selected_papers` instead.
 
 If the client does not support elicitation, or the user cancels the form, the
 tool returns the same `selection_token` and numbered `papers` list used by the
@@ -700,35 +672,7 @@ batch-selection threshold policy is controlled by
 papers, `always` prompts for any non-empty batch, and `never` disables the
 guard.
 
-Fallback MCP flow:
-
-```json
-{
-  "tool": "search_papers_for_parsing",
-  "arguments": {
-    "query": "agentic spatial reasoning",
-    "sources": "arxiv,semantic,openalex",
-    "max_results_per_source": 3
-  }
-}
-```
-
-Then submit selected entries for background parsing. If the selection came from
-`selection_semantics="download_and_parse_selected_only"`, use
-`download_and_parse_selected_papers` instead so the selected PDFs are downloaded
-before MinerU parsing starts:
-
-```json
-{
-  "tool": "submit_parse_job",
-  "arguments": {
-    "selection_token": "search_20260610_abcdef12",
-    "selected_indices": "1,3",
-    "save_path": "~/Desktop/papers",
-    "mode": "auto"
-  }
-}
-```
+Fallback MCP flow: call `search_papers_for_parsing` to get a `selection_token` and numbered paper list. Then submit selected entries via `submit_parse_job` for background parsing, or use `download_and_parse_selected_papers` when the selection was created with `selection_semantics="download_and_parse_selected_only"`.
 
 Search sessions are stored under `.paper_search_cache/sessions/`. Use
 `list_search_sessions`, `get_search_session`, and `delete_search_session` to
@@ -882,6 +826,7 @@ This fork and extension benefited from the following open-source projects and pr
 | [Rimagination/scansci-pdf](https://github.com/Rimagination/scansci-pdf)             | Reference ideas for scientific PDF processing and extraction-oriented workflows                              |
 | [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero)               | Reference implementation direction for integrating MinerU-style PDF parsing into a research-reading workflow |
 | [opendatalab/MinerU](https://github.com/opendatalab/MinerU)                         | The document parsing engine used for high-quality PDF-to-Markdown/JSON/assets extraction                     |
+| [mcp-use/mcp-use](https://github.com/mcp-use/mcp-use)                               | Reference for MCP server architecture and best practices                                                    |
 
 ---
 

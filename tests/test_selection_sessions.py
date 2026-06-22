@@ -29,6 +29,8 @@ class TestSelectionSessions(unittest.TestCase):
         tools = asyncio.run(server.mcp.list_tools())
         tool = next(item for item in tools if item.name == "download_selected_papers")
 
+        self.assertEqual(tool.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(tool.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertEqual(tool.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertTrue(tool.meta["openai/widgetAccessible"])
 
@@ -153,11 +155,15 @@ class TestSelectionSessions(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
-            {"PAPER_SEARCH_MCP_CACHE_DIR": tmp},
+            {
+                "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
+            },
         ), patch(
             "paper_search_mcp.server.search_papers",
             new=AsyncMock(return_value=fake_search_result),
         ):
+            server.detect_host.cache_clear()
             result = asyncio.run(
                 server.crawl_papers_for_selection(
                     "agent skill",
@@ -165,19 +171,24 @@ class TestSelectionSessions(unittest.TestCase):
                     sources="arxiv",
                 )
             )
-            loaded = cache.get_search_session(result["selection_token"], cache_dir=tmp)
+            payload = unwrap_tool_result(result)
+            loaded = cache.get_search_session(payload["selection_token"], cache_dir=tmp)
+            server.detect_host.cache_clear()
 
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["total"], 11)
-        self.assertEqual(len(result["papers"]), 11)
-        self.assertEqual(len(result["numbered_fallback"]), 11)
-        self.assertEqual(result["app"]["render_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
-        self.assertEqual(result["app"]["selection_token"], result["selection_token"])
-        self.assertEqual(result["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
-        self.assertEqual(result["app"]["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
-        self.assertEqual(result["interaction"], "mcp_app")
-        self.assertEqual(result["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertTrue(result["_meta"]["openai/widgetAccessible"])
+        self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertTrue(result.meta["openai/widgetAccessible"])
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["total"], 11)
+        self.assertEqual(len(payload["papers"]), 11)
+        self.assertEqual(len(payload["numbered_fallback"]), 11)
+        self.assertEqual(payload["app"]["render_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
+        self.assertEqual(payload["app"]["selection_token"], payload["selection_token"])
+        self.assertEqual(payload["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
+        self.assertEqual(payload["app"]["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
+        self.assertEqual(payload["interaction"], "mcp_app")
         self.assertEqual(len(loaded["papers"]), 11)
         self.assertEqual(loaded["metadata"]["interaction"], "crawl_papers_for_selection")
         self.assertEqual(loaded["metadata"]["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
@@ -204,11 +215,15 @@ class TestSelectionSessions(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
-            {"PAPER_SEARCH_MCP_CACHE_DIR": tmp},
+            {
+                "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
+            },
         ), patch(
             "paper_search_mcp.server.search_papers",
             new=AsyncMock(return_value=fake_search_result),
         ):
+            server.detect_host.cache_clear()
             result = asyncio.run(
                 server.crawl_papers_for_selection(
                     "agent skill",
@@ -217,13 +232,16 @@ class TestSelectionSessions(unittest.TestCase):
                     requested_count=12,
                 )
             )
-            loaded = cache.get_search_session(result["selection_token"], cache_dir=tmp)
+            payload = unwrap_tool_result(result)
+            loaded = cache.get_search_session(payload["selection_token"], cache_dir=tmp)
+            server.detect_host.cache_clear()
 
-        self.assertEqual(result["status"], "selection_required")
-        self.assertEqual(result["requested_count"], 12)
-        self.assertEqual(result["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
-        self.assertEqual(result["recommended_selected_indices"], "1-12")
-        self.assertTrue(result["parse_decision_required"])
+        self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(payload["status"], "selection_required")
+        self.assertEqual(payload["requested_count"], 12)
+        self.assertEqual(payload["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
+        self.assertEqual(payload["recommended_selected_indices"], "1-12")
+        self.assertTrue(payload["parse_decision_required"])
         self.assertFalse(loaded["metadata"].get("large_batch_selection_satisfied", False))
 
     def test_codex_app_shortlist_keeps_session_full_and_skips_non_ready(self):
@@ -2342,10 +2360,10 @@ class TestSelectionSessions(unittest.TestCase):
             self.assertEqual(prompt["app"]["resource_uri"], server.PAPER_SELECTION_WIDGET_URI)
             self.assertEqual(prompt["app"]["selection_token"], prompt["selection_token"])
             self.assertEqual(result["app"], prompt["app"])
-            self.assertEqual(result["interaction"], "mcp_app")
-            self.assertEqual(result["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+            self.assertEqual(result["interaction"], "local_browser_checkbox")
+            self.assertNotIn("_meta", result)
             self.assertTrue(result["parse_decision_required"])
-            self.assertEqual(result["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
+            self.assertEqual(result["recommended_tool"], server.LOCAL_PAPER_SELECTION_TOOL)
             self.assertEqual(prompt["local_browser"]["interaction"], "local_browser_checkbox")
 
     def test_over_limit_prompt_opens_local_browser_when_forced(self):
@@ -2391,7 +2409,7 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertNotIn("_meta", result)
         self.assertEqual(result["local_browser"]["interaction"], "local_browser_checkbox")
 
-    def test_over_limit_prompt_app_only_mode_does_not_open_local_browser(self):
+    def test_over_limit_prompt_app_only_confirmed_host_does_not_open_local_browser(self):
         with tempfile.TemporaryDirectory() as tmp:
             papers = []
             for index in range(server.AUTO_PARSE_SAVED_PDF_LIMIT + 1):
@@ -2410,12 +2428,14 @@ class TestSelectionSessions(unittest.TestCase):
                 os.environ,
                 {
                     "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
                     "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "app_only",
                 },
             ), patch(
-                "paper_search_mcp.server.open_paper_selection_page",
-                new=AsyncMock(side_effect=AssertionError("app_only mode should not open local browser")),
+                "paper_search_mcp.utils.open_url_in_host",
+                side_effect=AssertionError("confirmed app_only host should not open localhost"),
             ):
+                server.detect_host.cache_clear()
                 result = asyncio.run(
                     server._prompt_parse_saved_pdfs(
                         papers=papers,
@@ -2427,12 +2447,65 @@ class TestSelectionSessions(unittest.TestCase):
                         custom_save_path_confirmed=True,
                     )
                 )
+                server.detect_host.cache_clear()
 
         self.assertEqual(result["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
         self.assertIn("app", result)
+        self.assertEqual(result["selection_surface"]["surface"], "mcp_app")
         self.assertNotIn("local_browser", result)
 
-    def test_over_limit_prompt_desktop_does_not_attach_local_browser_even_if_forced(self):
+    def test_over_limit_prompt_app_only_tentative_host_keeps_local_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            papers = []
+            for index in range(server.AUTO_PARSE_SAVED_PDF_LIMIT + 1):
+                pdf = Path(tmp) / f"claude-app-only-{index + 1}.pdf"
+                pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+                papers.append(
+                    {
+                        "title": f"Claude App Only {index + 1}",
+                        "source": "local",
+                        "paper_id": f"claude-app-only-{index + 1}",
+                        "local_pdf_path": str(pdf),
+                    }
+                )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                    "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "app_only",
+                },
+            ), patch(
+                "paper_search_mcp.utils.open_url_in_host",
+                return_value=True,
+            ) as open_mock:
+                server.detect_host.cache_clear()
+                result = asyncio.run(
+                    server._prompt_parse_saved_pdfs(
+                        papers=papers,
+                        query="claude app only",
+                        sources="local",
+                        save_path=tmp,
+                        ctx=None,
+                        parse_execution="prompt",
+                        custom_save_path_confirmed=True,
+                    )
+                )
+                server.detect_host.cache_clear()
+
+        self.assertEqual(result["selection_surface"]["surface"], "hybrid")
+        self.assertEqual(result["selection_surface"]["app_widget_supported"], True)
+        self.assertEqual(result["selection_surface"]["app_widget_confirmed"], False)
+        self.assertIn("app", result)
+        self.assertEqual(result["interaction"], "mcp_app")
+        self.assertIn("local_browser", result)
+        self.assertEqual(result["local_browser"]["status"], "ok")
+        self.assertEqual(result["local_browser"]["interaction"], "local_browser_checkbox")
+        self.assertTrue(result["local_browser"]["opened"])
+        open_mock.assert_called_once()
+
+    def test_over_limit_prompt_desktop_default_does_not_attach_local_browser_even_if_forced(self):
         with tempfile.TemporaryDirectory() as tmp:
             papers = []
             for index in range(server.AUTO_PARSE_SAVED_PDF_LIMIT + 1):
@@ -2452,7 +2525,6 @@ class TestSelectionSessions(unittest.TestCase):
                 {
                     "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
                     "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
-                    "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "local_browser",
                 },
             ), patch(
                 "paper_search_mcp.utils.open_url_in_host",
@@ -2519,10 +2591,10 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertEqual(prompt["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
         self.assertTrue(prompt["parse_decision_required"])
         self.assertEqual(result["app"]["selection_token"], prompt["selection_token"])
-        self.assertEqual(result["interaction"], "mcp_app")
-        self.assertEqual(result["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(result["interaction"], "local_browser_checkbox")
+        self.assertNotIn("_meta", result)
         self.assertTrue(result["parse_decision_required"])
-        self.assertNotIn("local_browser", prompt)
+        self.assertEqual(prompt["local_browser"]["interaction"], "local_browser_checkbox")
 
     def test_recent_directory_prompt_restores_metadata_from_download_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2775,6 +2847,8 @@ class TestSelectionSessions(unittest.TestCase):
                 payload = unwrap_tool_result(result)
 
         self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertTrue(result.meta["openai/widgetAccessible"])
         self.assertEqual(payload["interaction"], "mcp_app")
@@ -2814,6 +2888,8 @@ class TestSelectionSessions(unittest.TestCase):
                 payload = unwrap_tool_result(result)
 
         self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertTrue(result.meta["openai/widgetAccessible"])
         self.assertEqual(payload["selection_token"], session["selection_token"])
@@ -2908,6 +2984,64 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertEqual(payload["fallback_tool"], "open_paper_selection_page")
         self.assertNotIn("local_browser", payload)
         open_mock.assert_not_called()
+
+    def test_claude_code_desktop_render_meta_and_local_page_are_both_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cache.create_search_session(
+                query="claude hybrid widget",
+                sources="arxiv",
+                papers=[
+                    {
+                        "title": "Claude Hybrid Paper",
+                        "source": "arxiv",
+                        "paper_id": "2601.00022",
+                        "pdf_url": "https://example.org/claude-hybrid.pdf",
+                    }
+                ],
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                },
+            ), patch(
+                "paper_search_mcp.utils.open_url_in_host",
+                return_value=True,
+            ) as open_mock:
+                server.detect_host.cache_clear()
+                render_tool = server.mcp._tool_manager.get_tool("render_paper_selection_app")
+                render_result = asyncio.run(
+                    render_tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                render_payload = unwrap_tool_result(render_result)
+
+                local_tool = server.mcp._tool_manager.get_tool("open_paper_selection_page")
+                local_result = asyncio.run(
+                    local_tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                local_payload = unwrap_tool_result(local_result)
+                server.detect_host.cache_clear()
+
+        self.assertIsInstance(render_result, CallToolResult)
+        self.assertEqual(render_result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_payload["detected_host"], "claude_code_desktop")
+        self.assertTrue(render_payload["app_widget_supported"])
+        self.assertFalse(render_payload["selection_surface"]["app_widget_confirmed"])
+        self.assertEqual(render_payload["selection_surface"]["surface"], "hybrid")
+        self.assertEqual(local_payload["interaction"], "local_browser_checkbox")
+        self.assertTrue(local_payload["opened"])
+        open_mock.assert_called_once()
 
     def test_registered_open_selection_page_opens_local_fallback_for_codex_vscode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3302,6 +3436,14 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertIn("unwrapToolOutput", html)
         self.assertIn("value?.result", html)
         self.assertGreaterEqual(html.count("const downloadAndParse"), 1)
+
+    def test_paper_selection_widget_prompts_parse_after_download_only_completion(self):
+        html = asyncio.run(server.paper_selection_widget())
+        self.assertIn("function isParseReadyPrompt(prompt)", html)
+        self.assertIn("Number(prompt.parse_ready_total || 0) > 0", html)
+        self.assertIn("Boolean(recommended)", html)
+        self.assertIn("isParseReadyPrompt(prompt)", html)
+        self.assertNotIn("body.parse_prompt.parse_decision_required) {\n            startParseDecision", html)
 
     def test_open_paper_selection_page_serves_checkbox_page_and_posts_selection(self):
         async def fake_download_and_parse(**kwargs):
