@@ -205,10 +205,10 @@ mcp = FastMCP("paper_search_server")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Idle timeout: exit the process after 30 minutes of inactivity so that
+# Idle timeout: exit the process after 3 minutes of inactivity so that
 # orphaned stdio processes do not accumulate indefinitely.
 # ---------------------------------------------------------------------------
-_IDLE_TIMEOUT_SECONDS = 5 * 60  # 5 minutes
+_IDLE_TIMEOUT_SECONDS = 3 * 60  # 3 minutes
 _last_activity_time = time.time()
 _ACTIVITY_LOCK = threading.Lock()
 
