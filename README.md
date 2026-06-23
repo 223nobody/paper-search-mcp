@@ -106,6 +106,30 @@ Agent 会自动调用 `paper_research_workflow` 完成全流程，返回 `job_id
 
 ---
 
+## 🎬 演示
+
+### MCP Apps 论文选择器（仅 Codex Desktop 支持）
+
+> ⚠️ **当前状态**：内置 MCP Apps（checkbox 论文选择器、MinerU API Key 配置弹窗等）目前**仅 Codex Desktop** 可以完整渲染。其他 MCP Host（VS Code、Claude Desktop、Claude Code 等）暂不支持 MCP Apps 内嵌渲染，会自动降级为本地浏览器 fallback 或编号列表选择。
+
+| Codex Desktop — MCP Apps 原生渲染 | Codex 插件面板 |
+|:---:|:---:|
+| ![Codex Desktop MCP Apps](docs/images/codex_desktop.png) | ![Codex Plugin](docs/images/codex_plugin.png) |
+
+**各平台 MCP Apps 支持情况：**
+
+| 平台 | MCP Apps 渲染 | 降级方案 |
+|------|:------------:|---------|
+| **Codex Desktop** | ✅ 完整支持 | — |
+| VS Code（Codex / Copilot） | ❌ 不支持 | 本地浏览器 checkbox 页面 |
+| Claude Desktop | ❌ 不支持 | 编号列表 fallback |
+| Claude Code（CLI） | ❌ 不支持 | 编号列表 fallback / TUI 选择器 |
+| Cursor | ❌ 不支持 | 编号列表 fallback |
+
+> 💡 当 `render_paper_selection_app` 返回但未显示 checkbox UI 时，Agent 会自动调用 `open_paper_selection_page` 在系统浏览器中打开选择页面。
+
+---
+
 ## 📦 安装与本地运行
 
 推荐在当前源码目录运行：

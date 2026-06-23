@@ -726,7 +726,25 @@ We welcome contributions! Here's how to get started:
 
 ## 🎬 Demo
 
-<img src="docs\images\demo.png" alt="Demo" width="800">
+### MCP Apps Paper Selector (Codex Desktop Only)
+
+> ⚠️ **Current Status**: The built-in MCP Apps (checkbox paper selector, MinerU API Key setup form, etc.) can only be **fully rendered in Codex Desktop**. Other MCP Hosts (VS Code, Claude Desktop, Claude Code, etc.) do not yet support embedded MCP Apps rendering and will automatically fall back to a local browser page or numbered list selection.
+
+| Codex Desktop — Native MCP Apps Rendering | Codex Plugin Panel |
+|:---:|:---:|
+| ![Codex Desktop MCP Apps](docs/images/codex_desktop.png) | ![Codex Plugin](docs/images/codex_plugin.png) |
+
+**MCP Apps Support by Platform:**
+
+| Platform | MCP Apps Rendering | Fallback |
+|----------|:------------------:|---------|
+| **Codex Desktop** | ✅ Full support | — |
+| VS Code (Codex / Copilot) | ❌ Not supported | Local browser checkbox page |
+| Claude Desktop | ❌ Not supported | Numbered list fallback |
+| Claude Code (CLI) | ❌ Not supported | Numbered list fallback / TUI selector |
+| Cursor | ❌ Not supported | Numbered list fallback |
+
+> 💡 When `render_paper_selection_app` returns but no checkbox UI appears, the Agent will automatically call `open_paper_selection_page` to open the selection page in the system browser.
 
 ---
 

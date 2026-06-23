@@ -955,6 +955,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
     const clientInstanceId = ((window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : String(Date.now()) + Math.random())).replace(/[^a-zA-Z0-9._-]/g, "");
     let restoreAttempted = false;
     let saveStateTimer = null;
+    let readyReported = false;
 
     /* ── Stage icon map ── */
     const STAGE_CLASS = {
@@ -1124,6 +1125,20 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
           applySelectedIndices(body.selected_indices);
         }
       } catch (_) {}
+    }
+
+    async function reportAppReady() {
+      if (readyReported || !data.selection_token) return;
+      readyReported = true;
+      try {
+        await callTool("report_paper_selection_app_ready", {
+          selection_token: data.selection_token || "",
+          client_instance_id: clientInstanceId,
+          app_attempt_id: data.app_attempt_id || "",
+        });
+      } catch (_) {
+        readyReported = false;
+      }
     }
 
     function updateSelectionCount() {
@@ -1858,15 +1873,18 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
           data = normalizeSelectionData(unwrapToolOutput(ctx.toolOutput));
         }
         render();
+        await reportAppReady();
         startHiddenSelectionTimeout();
       } else if (HAS_OPENAI) {
         /* ── Codex / OpenAI path (existing logic, unchanged) ── */
         data = normalizeSelectionData(unwrapToolOutput(window.openai.toolOutput));
         render();
+        await reportAppReady();
         startHiddenSelectionTimeout();
       } else {
         /* ── Pure postMessage fallback ── */
         render();
+        await reportAppReady();
         startHiddenSelectionTimeout();
       }
     }

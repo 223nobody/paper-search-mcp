@@ -50,6 +50,7 @@ SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
 DOWNLOAD_TIMEOUT_ENV = "DOWNLOAD_TIMEOUT_SECONDS"
 AUTO_OPEN_SELECTION_UI_ENV = "AUTO_OPEN_SELECTION_UI"
 SELECTION_UI_MODE_ENV = "SELECTION_UI_MODE"
+MCP_APP_FALLBACK_TIMEOUT_SECONDS_ENV = "MCP_APP_FALLBACK_TIMEOUT_SECONDS"
 SAVED_PDF_BATCH_PROMPT_ENV = "SAVED_PDF_BATCH_PROMPT"
 SAVED_PDF_BATCH_WINDOW_ENV = "SAVED_PDF_BATCH_WINDOW_SECONDS"
 PARSE_PROMPT_TIMEOUT_SECONDS_ENV = "PARSE_PROMPT_TIMEOUT_SECONDS"
@@ -59,6 +60,7 @@ PARSE_PROMPT_ALLOW_REOPEN_ENV = "PARSE_PROMPT_ALLOW_REOPEN"
 
 _DEFAULT_PARSE_PROMPT_TIMEOUT_SECONDS = 180
 _DEFAULT_PARSE_PROMPT_TIMEOUT_PER_PAPER_SECONDS = 15
+DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS = 8
 
 PAPER_SELECTION_WIDGET_URI = "ui://paper-search/paper-selection.html"
 PAPER_SELECTION_WIDGET_TOOL = "render_paper_selection_app"
@@ -570,12 +572,14 @@ def _selection_ui_mode() -> str:
     }:
         return "local_browser"
     # ── Auto-detect ──
-    # Confirmed MCP Apps hosts (codex, claude_desktop): "app_only"
-    # Tentative MCP Apps hosts (claude_code_desktop, claude_code_vscode):
+    # Confirmed MCP Apps hosts (codex, claude_desktop, claude_code_desktop):
+    #   "app_only" — widget only, no local_browser
+    # Tentative MCP Apps hosts (claude_code_vscode):
     #   "auto" — widget _meta is sent AND local_browser opens as fallback
     if not raw or normalized == "auto":
+        from ..utils import detect_host  # noqa: PLC0415
         from ..utils import host_mcp_apps_confirmed  # noqa: PLC0415
-        if host_mcp_apps_confirmed():
+        if host_mcp_apps_confirmed() and detect_host() != "claude_code_desktop":
             return "app_only"
     return "auto"
 
@@ -586,17 +590,33 @@ def _selection_ui_should_open(*, force_open: bool = False) -> bool:
         return False
     if mode == "local_browser":
         return True
-    from ..utils import host_mcp_apps_confirmed  # noqa: PLC0415
+    from ..utils import detect_host, host_mcp_apps_confirmed  # noqa: PLC0415
     if mode == "app_only":
         return bool(force_open and not host_mcp_apps_confirmed())
-    # Only CONFIRMED MCP Apps hosts (codex, claude_desktop) skip
-    # the local browser.  Tentative hosts (claude_code_desktop,
-    # claude_code_vscode) open local_browser as a fallback.
+    if detect_host() == "claude_code_desktop":
+        return False
+    # Only CONFIRMED MCP Apps hosts (codex, claude_desktop,
+    # claude_code_desktop) skip the local browser.  Tentative hosts
+    # (claude_code_vscode) open local_browser as a fallback.
     if host_mcp_apps_confirmed():
         return False
     if force_open:
         return True
     return _env_flag_enabled(AUTO_OPEN_SELECTION_UI_ENV, default="false")
+
+
+def _mcp_app_fallback_timeout_seconds() -> int:
+    raw = (
+        get_env(
+            MCP_APP_FALLBACK_TIMEOUT_SECONDS_ENV,
+            str(DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS),
+        ).strip()
+        or str(DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS)
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS
 
 
 def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
@@ -608,15 +628,15 @@ def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
     Scenario                   MCP App       Local Brwsr
     ========================= ============= ============
     Codex Desktop              ✅ (default)  ❌
+    Claude Desktop             ✅ (default)  ❌
+    Claude Code Desktop        ✅ (default)  ❌
     Codex VS Code plugin       ❌            ✅ (default)
-    Claude Code Desktop        ✅ (hybrid)*  ✅ (fallback)
     Claude Code VS Code ext.   ✅ (hybrid)*  ✅ (fallback)
     ========================= ============= ============
 
     * Hybrid mode: ``_meta`` is always sent (so MCP Apps widget
     can render if supported), AND the local browser page is opened
-    as a working fallback.  ``claude_code_desktop`` is NOT in
-    ``MCP_APPS_CONFIRMED_HOSTS``.
+    as a working fallback.
 
     The ``SELECTION_UI_MODE`` env var can override: ``off``, ``app_only``,
     ``local_browser``, ``auto`` (default).  In forced user-confirmation flows,
@@ -640,7 +660,7 @@ def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
     # support → fall back to localhost browser checkbox.
     _HOST_DEFAULT_SURFACE: Dict[str, str] = {
         "codex": "mcp_app",
-        "claude_code_desktop": "hybrid",
+        "claude_code_desktop": "mcp_app_then_local",
         "claude_desktop": "mcp_app",
         "codex_vscode": "local_browser",
         "claude_code_vscode": "hybrid",
@@ -671,6 +691,9 @@ def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
     elif mode == "local_browser":
         surface = "local_browser"
         reason = "local_browser_configured"
+    elif host == "claude_code_desktop" and app_supported:
+        surface = "mcp_app_then_local"
+        reason = "host_claude_code_desktop_try_mcp_app_then_local_fallback"
     elif app_confirmed:
         surface = "mcp_app"
         reason = f"host_{host}_supports_mcp_app_sandbox"
@@ -695,6 +718,15 @@ def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
         "app_widget_supported": app_supported,
         "app_widget_confirmed": app_confirmed,
         "local_browser_should_open": local_should_open,
+        "fallback_after_seconds": _mcp_app_fallback_timeout_seconds()
+        if surface == "mcp_app_then_local"
+        else 0,
+        "fallback_tool": "open_paper_selection_page"
+        if surface in {"mcp_app_then_local", "hybrid", "local_browser"}
+        else "",
+        "status_tool": "get_paper_selection_surface_status"
+        if surface == "mcp_app_then_local"
+        else "",
     }
 
 
@@ -920,14 +952,14 @@ def _recommended_display_candidates(
             break
         _append(candidate)
 
-    # Phase 3 — fallback: fill remaining slots with non-downloadable
-    # papers so the shortlist always reaches requested_count.  These are
-    # ranked below downloadable papers by the scoring profile (-10 or -5
-    # penalty) and are only shown when the downloadable pool is too small.
-    # Downstream download tools receive ``_fallback_download=True`` and can
-    # attempt Sci-Hub / Libgen fallback chains.
+    # Phase 3 — fallback: when downloadable papers fall short of
+    #     requested_count, include at most 2 non-downloadable candidates
+    #     so the user still sees a few fallback options without the
+    #     shortlist being dominated by papers that can't be downloaded.
+    extra_limit = min(2, max(0, requested_count - len(selected)))
+    fallback_limit = min(requested_count, len(selected) + extra_limit)
     for candidate in non_downloadable:
-        if len(selected) >= requested_count:
+        if len(selected) >= fallback_limit:
             break
         candidate["_fallback_download"] = True
         _append(candidate)
@@ -1225,13 +1257,15 @@ def _promote_paper_selection_app(result: Dict[str, Any]) -> Dict[str, Any]:
                 surface = nested_surface
     if isinstance(surface, dict) and surface.get("surface") not in {
         "mcp_app",
+        "mcp_app_then_local",
         "hybrid",
     }:
         return result
 
     # ── Set _meta for MCP Apps surfaces, including tentative hybrid hosts.
-    # Confirmed hosts: widget-only mode (surface = "mcp_app").
-    # Tentative hosts (Claude Code Desktop/VSCode): hybrid mode —
+    # Confirmed hosts (codex, claude_desktop, claude_code_desktop):
+    #   widget-only mode (surface = "mcp_app").
+    # Tentative hosts (Claude Code VSCode): hybrid mode —
     #   _meta is sent so the client CAN render the widget, AND a
     #   local_browser page is opened as a fallback.
     from ..utils import host_supports_mcp_apps_widget  # noqa: PLC0415

@@ -46,6 +46,7 @@ _LOCAL_SELECTION_SERVER: Optional[ThreadingHTTPServer] = None
 _LOCAL_SELECTION_THREAD: Optional[threading.Thread] = None
 _LOCAL_SELECTION_BASE_URL = ""
 _LOCAL_SELECTION_PAGES: Dict[str, Dict[str, Any]] = {}
+_LOCAL_SELECTION_TOKEN_PAGES: Dict[str, str] = {}
 
 
 def _download_selection_timeout_seconds(num_papers: int = 0) -> int:
@@ -147,6 +148,12 @@ def _local_selection_page_url(page_id: str) -> str:
     return f"{_LOCAL_SELECTION_BASE_URL}{LOCAL_PAPER_SELECTION_PATH}/{page_id}"
 
 
+def mark_local_selection_page_opened(page_id: str) -> None:
+    page = _LOCAL_SELECTION_PAGES.get(page_id)
+    if isinstance(page, dict):
+        page["opened_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def _ensure_local_selection_server() -> None:
     global _LOCAL_SELECTION_BASE_URL, _LOCAL_SELECTION_SERVER, _LOCAL_SELECTION_THREAD
     with _LOCAL_SELECTION_LOCK:
@@ -186,7 +193,25 @@ def _create_local_selection_page(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     parse_execution: str = "background",
+    force_reopen: bool = False,
 ) -> Dict[str, Any]:
+    existing_page_id = _LOCAL_SELECTION_TOKEN_PAGES.get(selection_token)
+    if existing_page_id and not force_reopen:
+        existing = _LOCAL_SELECTION_PAGES.get(existing_page_id)
+        if isinstance(existing, dict):
+            return {
+                "page_id": existing_page_id,
+                "url": _local_selection_page_url(existing_page_id),
+                "selection_timeout_seconds": int(
+                    existing.get("selection_timeout_seconds") or 0
+                ),
+                "selection_expires_at": str(
+                    existing.get("selection_expires_at") or ""
+                ),
+                "reused": True,
+                "already_opened": bool(existing.get("opened_at")),
+            }
+
     page_id = secrets.token_urlsafe(16)
     confirmation_token = secrets.token_urlsafe(24)
     semantics = _selection_semantics_name(selection_semantics)
@@ -230,7 +255,9 @@ def _create_local_selection_page(
             else ""
         ),
         "selection_expired": False,
+        "opened_at": "",
     }
+    _LOCAL_SELECTION_TOKEN_PAGES[selection_token] = page_id
     return {
         "page_id": page_id,
         "url": _local_selection_page_url(page_id),
@@ -240,6 +267,8 @@ def _create_local_selection_page(
             if _is_download_selection_semantics(semantics)
             else ""
         ),
+        "reused": False,
+        "already_opened": False,
     }
 
 
@@ -257,6 +286,7 @@ async def open_paper_selection_page(
     open_browser: bool = True,
     requested_count: int = 0,
     full_total: int = 0,
+    force_reopen: bool = False,
 ) -> Dict[str, Any]:
     """Create a local browser checkbox page for paper selection."""
     requested_count = max(0, int(requested_count or 0))
@@ -277,11 +307,18 @@ async def open_paper_selection_page(
         custom_save_path_confirmed=custom_save_path_confirmed,
         selection_semantics=selection_semantics,
         parse_execution=parse_execution,
+        force_reopen=force_reopen,
     )
     opened = False
-    if open_browser:
+    if open_browser and not bool(page.get("already_opened")):
         from ..utils import open_url_in_host
         opened = bool(await asyncio.to_thread(open_url_in_host, page["url"]))
+        if opened:
+            _LOCAL_SELECTION_PAGES.get(page["page_id"], {})["opened_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+    elif bool(page.get("already_opened")):
+        opened = True
     host, port = _LOCAL_SELECTION_SERVER.server_address[:2] if _LOCAL_SELECTION_SERVER else ("", 0)
     return {
         "status": "ok",
@@ -290,6 +327,8 @@ async def open_paper_selection_page(
         "url": page["url"],
         "page_id": page["page_id"],
         "opened": opened,
+        "reused": bool(page.get("reused")),
+        "already_opened": bool(page.get("already_opened")),
         "selection_timeout_seconds": int(
             _LOCAL_SELECTION_PAGES.get(page["page_id"], {}).get("selection_timeout_seconds")
             or 0

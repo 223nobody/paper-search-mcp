@@ -41,6 +41,15 @@ before download. The response includes:
 Guide the user through selection before calling `download_selected_papers`. Do not
 auto-download when `status: "selection_required"` is returned.
 
+On Claude Code Desktop, prefer the MCP Apps path first:
+1. Call `render_paper_selection_app(selection_token=...)`.
+2. If no iframe appears, call `get_paper_selection_surface_status(selection_token=...)`.
+3. Only when `fallback_recommended: true` or the user says the iframe is not visible,
+   call `open_paper_selection_page(selection_token=...)`.
+
+The local page fallback is idempotent for the same `selection_token`; do not open
+multiple local pages unless `force_reopen=true` is explicitly needed.
+
 ## Parse Strategy
 
 - Default to **background** parsing (`parse_execution="background"`): returns immediately with a `job_id`.

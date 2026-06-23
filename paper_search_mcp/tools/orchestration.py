@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 import math
 import os
@@ -36,7 +35,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from mcp.server.fastmcp import Context
-from mcp.types import CallToolResult, TextContent
+from fastmcp.tools.base import ToolResult
 
 from ..config import env_file_path, get_env
 from ..utils import DEFAULT_SAVE_PATH, resolve_save_path
@@ -86,12 +85,14 @@ from ..engine.search import (
 # ---------------------------------------------------------------------------
 from ..engine.paper import (
     AGENT_SKILL_RANKING_PROFILE,
+    _agent_skill_profile_score,
     _dedupe_papers,
     _download_route_for_candidate,
     _extract_arxiv_id,
     _paper_arxiv_id,
     _paper_field,
     _paper_parse_candidate,
+    _paper_profile_text,
     _paper_unique_key,
     _paper_value,
     _rank_papers_for_profile,
@@ -238,34 +239,49 @@ def _prefer_local_selection_surface(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _to_widget_tool_result(result: Dict[str, Any]) -> Any:
-    """Promote ``_meta`` from the result dict to ``CallToolResult._meta``.
+    """Return the result dict unchanged, preserving ``_meta`` as a regular key.
 
     ``_promote_paper_selection_app`` sets ``result["_meta"]`` when the
-    selection surface is ``mcp_app``.  MCP hosts (Claude Desktop, claude.ai,
-    etc.) only look at ``CallToolResult._meta`` — the top-level protocol
-    metadata — to decide whether to render a sandboxed iframe.
+    selection surface is ``mcp_app``.  Previously this function wrapped the
+    dict in a FastMCP ``ToolResult`` so the framework's ``to_mcp_result()``
+    would promote ``meta`` to ``CallToolResult._meta`` on the wire.
 
-    This helper pops ``_meta`` from the dict (so it does not leak into
-    ``structuredContent``) and places it on the ``CallToolResult`` that
-    FastMCP sends over the wire.
+    However, FastMCP's auto-generated Pydantic output model (derived from
+    the ``-> Dict[str, Any]`` return annotation) rejects ``ToolResult``
+    instances because the model's ``result`` field expects a plain dict.
+    Returning the plain dict avoids the Pydantic validation error while
+    keeping the ``_meta`` data available in the JSON output for clients
+    that inspect ``result._meta``.
 
     When ``_meta`` is absent the dict is returned unchanged.
     """
     if not isinstance(result, dict):
         return result
-    meta = result.pop("_meta", None)
-    if not isinstance(meta, dict):
-        return result
-    return CallToolResult(
-        _meta=meta,
-        content=[
-            TextContent(
-                type="text",
-                text=json.dumps(result, ensure_ascii=False),
-            )
-        ],
-        structuredContent={"result": result},
-    )
+    # Keep _meta in the dict — FastMCP's Pydantic model expects a plain dict,
+    # not a ToolResult.  MCP Apps hosts can read _meta from the JSON payload.
+    return result
+
+
+def _unwrap_tool_result(value: Any) -> tuple:
+    """Unwrap a FastMCP ToolResult to (raw_dict, meta_dict_or_none).
+
+    When one MCP tool calls another internally, the callee may return a
+    ``ToolResult`` carrying widget metadata.  This helper extracts the
+    raw business dict and any ``_meta`` so the caller can read
+    ``.get("papers")``, ``.get("selection_token")``, etc.
+    """
+    if isinstance(value, ToolResult):
+        meta = dict(value.meta) if getattr(value, "meta", None) else None
+        structured = getattr(value, "structured_content", None)
+        if isinstance(structured, dict) and isinstance(
+            structured.get("result"), dict
+        ):
+            return structured["result"], meta
+        elif isinstance(structured, dict):
+            return structured, meta
+        else:
+            return {}, meta
+    return value, None
 
 
 def _split_env_csv(value: str) -> List[str]:
@@ -338,6 +354,17 @@ def _confirmed_large_batch_indices(session: Optional[Dict[str, Any]]) -> str:
     return str(metadata.get("confirmed_selected_indices") or "").strip()
 
 
+def _selected_indices_was_explicit(value: Any) -> bool:
+    """Return True only when a caller supplied a concrete selection."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
+    return True
+
+
 def _large_batch_confirmation_mismatch(
     session: Optional[Dict[str, Any]],
     indices: List[int],
@@ -373,6 +400,17 @@ def _should_require_large_batch_selection(
         return False
     if policy == "always":
         return item_count > 0
+    # ── Cross-batch gate: block when the ORIGINAL session requested_count
+    #     was above the limit even if this single call only picks ≤ 10 papers.
+    if isinstance(session, dict):
+        metadata = session.get("metadata")
+        if isinstance(metadata, dict):
+            try:
+                session_requested = max(0, int(metadata.get("requested_count") or 0))
+            except (TypeError, ValueError):
+                session_requested = 0
+            if session_requested > AUTO_PARSE_SAVED_PDF_LIMIT:
+                return True
     return item_count > AUTO_PARSE_SAVED_PDF_LIMIT
 
 
@@ -762,9 +800,10 @@ async def _create_paper_selection_result(
             selection_semantics=semantics,
             parse_execution=parse_execution,
         )
-    return _to_widget_tool_result(
-        _promote_paper_selection_app(_prefer_local_selection_surface(result))
-    )
+    # _meta is set on the dict by _promote_paper_selection_app.
+    # Callers that need a FastMCP ToolResult (MCP tool endpoints) must
+    # wrap the returned dict with _to_widget_tool_result themselves.
+    return _promote_paper_selection_app(_prefer_local_selection_surface(result))
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +939,13 @@ async def _attach_local_selection_ui(
     surface = _selection_surface_policy(force_open=force_open)
     prompt["selection_surface"] = surface
     if surface.get("surface") == "numbered_fallback":
+        return prompt
+    if surface.get("surface") == "mcp_app_then_local":
+        prompt["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
+        prompt["status_tool"] = "get_paper_selection_surface_status"
+        prompt["fallback_after_seconds"] = int(
+            surface.get("fallback_after_seconds") or 0
+        )
         return prompt
     # ── Hybrid mode: for tentative MCP Apps hosts (Claude Code Desktop/VSCode),
     #     create the local_browser fallback even though _meta is also set.
@@ -1536,9 +1582,7 @@ async def _pre_download_selection_prompt(
             selection_semantics=semantics,
             parse_execution=parse_execution,
         )
-    return _to_widget_tool_result(
-        _promote_paper_selection_app(_prefer_local_selection_surface(prompt))
-    )
+    return _promote_paper_selection_app(_prefer_local_selection_surface(prompt))
 
 
 # ===========================================================================
@@ -1549,7 +1593,7 @@ async def _pre_download_selection_prompt(
 async def _run_download_selected_papers(
     *,
     selection_token: str,
-    selected_indices: str = "all",
+    selected_indices: str = "",
     save_path: str = DEFAULT_SAVE_PATH,
     use_scihub: bool = False,
     download_strategy: str = "",
@@ -1584,6 +1628,7 @@ async def _run_download_selected_papers(
     })
     if bypass_large_batch_selection and _caller not in _TRUSTED_BYPASS_CALLERS:
         bypass_large_batch_selection = False
+    explicit_selection = _selected_indices_was_explicit(selected_indices)
     invalid_save_path = _invalid_mcp_save_path(
         save_path,
         custom_save_path_confirmed=custom_save_path_confirmed,
@@ -1603,6 +1648,18 @@ async def _run_download_selected_papers(
     papers = session.get("papers", [])
     if not isinstance(papers, list):
         papers = []
+
+    if not explicit_selection:
+        return {
+            "status": "no_selection",
+            "selection_token": selection_token,
+            "message": "No papers were selected. Choose papers in the selector before downloading.",
+            "total": len(papers),
+            "downloaded": 0,
+            "skipped_existing": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
 
     try:
         indices = _parse_selected_indices(selected_indices, len(papers))
@@ -1972,15 +2029,17 @@ def register_orchestration_tools(mcp, searchers):
             sources=sources,
             year=year,
         )
-        return await _create_paper_selection_result(
-            query=query,
-            max_results_per_source=max_results_per_source,
-            sources=sources,
-            year=year,
-            search_result=search_result,
-            interaction="backend_session_numbered_selection",
-            action_tool="parse_selected_papers",
-            action_verb="parse",
+        return _to_widget_tool_result(
+            await _create_paper_selection_result(
+                query=query,
+                max_results_per_source=max_results_per_source,
+                sources=sources,
+                year=year,
+                search_result=search_result,
+                interaction="backend_session_numbered_selection",
+                action_tool="parse_selected_papers",
+                action_verb="parse",
+            )
         )
 
     # =======================================================================
@@ -2086,18 +2145,20 @@ def register_orchestration_tools(mcp, searchers):
                 )
                 break
 
-        return await _create_paper_selection_result(
-            query=query,
-            max_results_per_source=max_results_per_source,
-            sources=effective_sources,
-            year=year,
-            search_result=combined_search_result,
-            interaction="crawl_papers_for_selection",
-            ranking_profile=ranking_profile,
-            action_tool="download_selected_papers",
-            action_verb="download",
-            selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
-            requested_count=requested_count,
+        return _to_widget_tool_result(
+            await _create_paper_selection_result(
+                query=query,
+                max_results_per_source=max_results_per_source,
+                sources=effective_sources,
+                year=year,
+                search_result=combined_search_result,
+                interaction="crawl_papers_for_selection",
+                ranking_profile=ranking_profile,
+                action_tool="download_selected_papers",
+                action_verb="download",
+                selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                requested_count=requested_count,
+            )
         )
 
     # =======================================================================
@@ -2129,6 +2190,10 @@ def register_orchestration_tools(mcp, searchers):
             sources=sources,
             year=year,
         )
+        # ── Unwrap ToolResult from search_papers_for_parsing ──────────────
+        session_result, _ = _unwrap_tool_result(session_result)
+        if not isinstance(session_result, dict):
+            session_result = {}
         candidates = session_result.get("papers", [])
         if not isinstance(candidates, list):
             candidates = []
@@ -2328,7 +2393,7 @@ def register_orchestration_tools(mcp, searchers):
     )
     async def download_selected_papers(
         selection_token: str,
-        selected_indices: str = "all",
+        selected_indices: str = "",
         save_path: str = DEFAULT_SAVE_PATH,
         use_scihub: bool = False,
         download_strategy: str = "",
@@ -2377,6 +2442,49 @@ def register_orchestration_tools(mcp, searchers):
         papers = session.get("papers", [])
         if not isinstance(papers, list):
             papers = []
+
+        if not _selected_indices_was_explicit(selected_indices):
+            candidates = [
+                _paper_parse_candidate(paper, index + 1)
+                for index, paper in enumerate(papers)
+            ]
+            surface = _selection_surface_policy(force_open=True)
+            prompt = {
+                "status": "selection_required",
+                "selection_token": selection_token,
+                "query": session.get("query", ""),
+                "sources": session.get("sources", ""),
+                **save_path_meta,
+                "papers": candidates,
+                "total": len(papers),
+                "downloaded": 0,
+                "skipped_existing": 0,
+                "skipped": 0,
+                "failed": 0,
+                "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
+                "recommended_selected_indices": "",
+                "selection_semantics": SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                "detected_host": surface.get("detected_host", "unknown"),
+                "app_widget_supported": surface.get("app_widget_supported", False),
+                "selection_surface": surface,
+                "message": (
+                    "No papers were selected. Render the paper selector and wait "
+                    "for a user-selected checkbox submission before downloading."
+                ),
+            }
+            prompt["app"] = _paper_selection_app_prompt(
+                selection_token=selection_token,
+                papers=candidates,
+                save_path=save_path,
+                use_scihub=use_scihub,
+                mode=mode,
+                backend=backend,
+                force=force,
+                custom_save_path_confirmed=custom_save_path_confirmed,
+                selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                parse_execution="none",
+            )
+            return _to_widget_tool_result(_promote_paper_selection_app(prompt))
 
         try:
             indices = _parse_selected_indices(selected_indices, len(papers))
@@ -2629,7 +2737,7 @@ def register_orchestration_tools(mcp, searchers):
             parse_prompt.get("app"), dict
         ):
             response["app"] = parse_prompt["app"]
-        return (
+        return _to_widget_tool_result(
             _promote_paper_selection_app(response)
             if _should_promote_paper_selection_app(parse_prompt)
             else response
@@ -2718,6 +2826,10 @@ def register_orchestration_tools(mcp, searchers):
             ranking_profile=ranking_profile,
             requested_count=limit,
         )
+        # ── Unwrap ToolResult from crawl_papers_for_selection ──────────────
+        selection, _ = _unwrap_tool_result(selection)
+        if not isinstance(selection, dict):
+            selection = {}
         papers = selection.get("papers", [])
         if not isinstance(papers, list) or not papers:
             return {
@@ -2816,6 +2928,10 @@ def register_orchestration_tools(mcp, searchers):
             bypass_large_batch_selection=False,
             ctx=ctx,
         )
+        # ── Unwrap ToolResult from download_selected_papers ──────────────────
+        download, _ = _unwrap_tool_result(download)
+        if not isinstance(download, dict):
+            download = {}
         status = (
             download.get("status", "unknown")
             if isinstance(download, dict)
@@ -2837,7 +2953,7 @@ def register_orchestration_tools(mcp, searchers):
             response["app"] = download["app"]
             if _should_promote_paper_selection_app(download):
                 _promote_paper_selection_app(response)
-        return response
+        return _to_widget_tool_result(response)
 
     # =======================================================================
     #  paper_research_workflow
@@ -2878,6 +2994,17 @@ def register_orchestration_tools(mcp, searchers):
         intent_name = _workflow_intent_name(intent)
         selection_mode_name = _workflow_intent_name(selection_mode)
         parse_execution_name = _workflow_parse_execution_name(parse_execution)
+
+        # ── Auto-detect agent-skill ranking profile when query matches ──
+        #     Without an explicit ranking_profile, queries about agent skills
+        #     don't trigger the multi-round progressive retry in
+        #     crawl_papers_for_selection, resulting in fewer downloadable
+        #     results.  Auto-detection activates the agent-skill profile
+        #     whenever the query text matches its topical vocabulary.
+        if not ranking_profile:
+            query_doc = {"title": query, "abstract": ""}
+            if _agent_skill_profile_score(query_doc) >= 0.5:
+                ranking_profile = AGENT_SKILL_RANKING_PROFILE
 
         search_only_intents = {
             "search",
@@ -2920,6 +3047,11 @@ def register_orchestration_tools(mcp, searchers):
             ranking_profile=ranking_profile,
             requested_count=count,
         )
+        # ── Unwrap FastMCP ToolResult from crawl_papers_for_selection ──────
+        # When called internally, crawl_papers_for_selection returns a
+        # ToolResult.  Unwrap to a plain dict so downstream code can read
+        # .get("papers"), .get("selection_token"), etc.
+        selection, _selection_widget_meta = _unwrap_tool_result(selection)
         papers = selection.get("papers", []) if isinstance(selection, dict) else []
         if not isinstance(papers, list) or not papers:
             return {
@@ -2960,6 +3092,14 @@ def register_orchestration_tools(mcp, searchers):
                 selection.get("app"), dict
             ):
                 response["app"] = selection["app"]
+            # ── Fallback: restore _meta from the crawl_papers_for_selection
+            #     ToolResult when the unwrapped app dict did not carry one.
+            if (
+                _selection_widget_meta
+                and isinstance(response.get("app"), dict)
+                and not isinstance(response["app"].get("_meta"), dict)
+            ):
+                response["app"]["_meta"] = _selection_widget_meta
             return _to_widget_tool_result(_promote_paper_selection_app(response))
 
         indices = _workflow_selection_indices(
@@ -3109,6 +3249,12 @@ def register_orchestration_tools(mcp, searchers):
             bypass_large_batch_selection=False,
             ctx=ctx,
         )
+        # ── Unwrap FastMCP ToolResult from download_selected_papers ──────────
+        # download_selected_papers may return a ToolResult when its own
+        # large-batch gate triggers (pre-download checkbox selection).
+        download, _download_widget_meta = _unwrap_tool_result(download)
+        if not isinstance(download, dict):
+            download = {}
 
         response = {
             "status": (
@@ -3148,7 +3294,7 @@ def register_orchestration_tools(mcp, searchers):
         parse_prompt = response.get("parse_prompt")
         if not should_apply_parse_policy or parse_execution_name == "none":
             response["workflow"]["next_tool"] = ""
-            return response
+            return _to_widget_tool_result(response)
 
         if isinstance(parse_prompt, dict) and isinstance(
             parse_prompt.get("parse_job"), dict

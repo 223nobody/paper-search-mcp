@@ -1,8 +1,9 @@
-import asyncio
+﻿import asyncio
 import json
 import os
 import re
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -14,6 +15,16 @@ from mcp.types import CallToolResult
 from paper_search_mcp import cache, server
 from paper_search_mcp.engine.parse import dismiss_parse_prompt_state
 from paper_search_mcp.widgets.response import unwrap_tool_result
+
+
+def _protocol_tool_result(result):
+    if isinstance(result, CallToolResult):
+        return result
+    if hasattr(result, "to_mcp_result"):
+        converted = result.to_mcp_result()
+        if isinstance(converted, CallToolResult):
+            return converted
+    raise AssertionError(f"Expected MCP CallToolResult-compatible object, got {type(result)!r}")
 
 
 def _local_page_confirmation_token(html: str) -> str:
@@ -175,11 +186,11 @@ class TestSelectionSessions(unittest.TestCase):
             loaded = cache.get_search_session(payload["selection_token"], cache_dir=tmp)
             server.detect_host.cache_clear()
 
-        self.assertIsInstance(result, CallToolResult)
-        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertTrue(result.meta["openai/widgetAccessible"])
+        protocol_result = _protocol_tool_result(result)
+        self.assertEqual(protocol_result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertTrue(protocol_result.meta["openai/widgetAccessible"])
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["total"], 11)
         self.assertEqual(len(payload["papers"]), 11)
@@ -236,7 +247,7 @@ class TestSelectionSessions(unittest.TestCase):
             loaded = cache.get_search_session(payload["selection_token"], cache_dir=tmp)
             server.detect_host.cache_clear()
 
-        self.assertIsInstance(result, CallToolResult)
+        _protocol_tool_result(result)
         self.assertEqual(payload["status"], "selection_required")
         self.assertEqual(payload["requested_count"], 12)
         self.assertEqual(payload["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
@@ -1335,6 +1346,65 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertEqual(result["parse_prompt"]["local_browser"]["interaction"], "local_browser_checkbox")
         self.assertEqual(result["parse_execution"], "none")
         self.assertEqual(result["parse_prompt"]["parse_execution"], "none")
+
+    def test_download_selected_papers_without_explicit_selection_does_not_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            papers = [
+                {
+                    "title": f"Ungated Paper {index + 1}",
+                    "source": "arxiv",
+                    "paper_id": f"2611.{index + 1:05d}",
+                    "pdf_url": f"https://example.org/ungated-{index + 1}.pdf",
+                }
+                for index in range(3)
+            ]
+            session = cache.create_search_session(
+                query="ungated download",
+                sources="arxiv",
+                papers=papers,
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_ALLOW_CUSTOM_SAVE_PATH": "true",
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                },
+            ), patch(
+                "paper_search_mcp.tools.orchestration._download_selected_session_paper_wrapper",
+                new=AsyncMock(side_effect=AssertionError("download must wait for explicit selection")),
+            ) as download_mock, patch(
+                "paper_search_mcp.utils.open_url_in_host",
+                side_effect=AssertionError("app_only Claude Code Desktop should not open localhost"),
+            ) as open_mock:
+                server.detect_host.cache_clear()
+                tool = server.mcp._tool_manager.get_tool("download_selected_papers")
+                result = asyncio.run(
+                    tool.run(
+                        {
+                            "selection_token": session["selection_token"],
+                            "save_path": tmp,
+                            "custom_save_path_confirmed": True,
+                        },
+                        convert_result=False,
+                    )
+                )
+                payload = unwrap_tool_result(result)
+                server.detect_host.cache_clear()
+
+        protocol_result = _protocol_tool_result(result)
+        self.assertEqual(protocol_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(payload["status"], "selection_required")
+        self.assertEqual(payload["downloaded"], 0)
+        self.assertEqual(payload["failed"], 0)
+        self.assertEqual(payload["recommended_tool"], server.PAPER_SELECTION_WIDGET_TOOL)
+        self.assertEqual(payload["selection_semantics"], server.SELECTION_SEMANTICS_DOWNLOAD_ONLY)
+        self.assertEqual(payload["selection_surface"]["surface"], "mcp_app")
+        self.assertNotIn("local_browser", payload)
+        download_mock.assert_not_awaited()
+        open_mock.assert_not_called()
 
     def test_download_selected_papers_over_limit_never_policy_still_requires_checkbox(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2454,7 +2524,7 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertEqual(result["selection_surface"]["surface"], "mcp_app")
         self.assertNotIn("local_browser", result)
 
-    def test_over_limit_prompt_app_only_tentative_host_keeps_local_fallback(self):
+    def test_over_limit_prompt_claude_code_desktop_app_only_keeps_app_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             papers = []
             for index in range(server.AUTO_PARSE_SAVED_PDF_LIMIT + 1):
@@ -2494,16 +2564,12 @@ class TestSelectionSessions(unittest.TestCase):
                 )
                 server.detect_host.cache_clear()
 
-        self.assertEqual(result["selection_surface"]["surface"], "hybrid")
+        self.assertEqual(result["selection_surface"]["surface"], "mcp_app")
         self.assertEqual(result["selection_surface"]["app_widget_supported"], True)
-        self.assertEqual(result["selection_surface"]["app_widget_confirmed"], False)
+        self.assertEqual(result["selection_surface"]["app_widget_confirmed"], True)
         self.assertIn("app", result)
-        self.assertEqual(result["interaction"], "mcp_app")
-        self.assertIn("local_browser", result)
-        self.assertEqual(result["local_browser"]["status"], "ok")
-        self.assertEqual(result["local_browser"]["interaction"], "local_browser_checkbox")
-        self.assertTrue(result["local_browser"]["opened"])
-        open_mock.assert_called_once()
+        self.assertNotIn("local_browser", result)
+        open_mock.assert_not_called()
 
     def test_over_limit_prompt_desktop_default_does_not_attach_local_browser_even_if_forced(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2846,11 +2912,11 @@ class TestSelectionSessions(unittest.TestCase):
                 )
                 payload = unwrap_tool_result(result)
 
-        self.assertIsInstance(result, CallToolResult)
-        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertTrue(result.meta["openai/widgetAccessible"])
+        protocol_result = _protocol_tool_result(result)
+        self.assertEqual(protocol_result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertTrue(protocol_result.meta["openai/widgetAccessible"])
         self.assertEqual(payload["interaction"], "mcp_app")
         self.assertEqual(payload["selection_token"], session["selection_token"])
         self.assertEqual(payload["papers"][0]["title"], "Widget Paper")
@@ -2887,11 +2953,11 @@ class TestSelectionSessions(unittest.TestCase):
                 )
                 payload = unwrap_tool_result(result)
 
-        self.assertIsInstance(result, CallToolResult)
-        self.assertEqual(result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertTrue(result.meta["openai/widgetAccessible"])
+        protocol_result = _protocol_tool_result(result)
+        self.assertEqual(protocol_result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(protocol_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertTrue(protocol_result.meta["openai/widgetAccessible"])
         self.assertEqual(payload["selection_token"], session["selection_token"])
         self.assertEqual(payload["papers"][0]["title"], "Registered Widget Paper")
 
@@ -2932,7 +2998,7 @@ class TestSelectionSessions(unittest.TestCase):
                 payload = unwrap_tool_result(result)
                 server.detect_host.cache_clear()
 
-        self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(payload["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertTrue(payload["app_widget_supported"])
         self.assertEqual(payload["detected_host"], "codex")
         self.assertEqual(payload["selection_surface"]["surface"], "mcp_app")
@@ -2976,7 +3042,7 @@ class TestSelectionSessions(unittest.TestCase):
                 payload = unwrap_tool_result(result)
                 server.detect_host.cache_clear()
 
-        self.assertIsInstance(result, CallToolResult)
+        self.assertEqual(payload["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
         self.assertFalse(payload["app_widget_supported"])
         self.assertEqual(payload["detected_host"], "codex_vscode")
         self.assertEqual(payload["selection_surface"]["surface"], "local_browser")
@@ -2985,7 +3051,7 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertNotIn("local_browser", payload)
         open_mock.assert_not_called()
 
-    def test_claude_code_desktop_render_meta_and_local_page_are_both_available(self):
+    def test_claude_code_desktop_render_meta_without_local_auto_open(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = cache.create_search_session(
                 query="claude hybrid widget",
@@ -3020,28 +3086,130 @@ class TestSelectionSessions(unittest.TestCase):
                     )
                 )
                 render_payload = unwrap_tool_result(render_result)
+                server.detect_host.cache_clear()
 
-                local_tool = server.mcp._tool_manager.get_tool("open_paper_selection_page")
-                local_result = asyncio.run(
-                    local_tool.run(
+        self.assertEqual(render_tool.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_tool.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_tool.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_payload["_meta"]["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
+        self.assertEqual(render_payload["detected_host"], "claude_code_desktop")
+        self.assertTrue(render_payload["app_widget_supported"])
+        self.assertTrue(render_payload["selection_surface"]["app_widget_confirmed"])
+        self.assertEqual(render_payload["selection_surface"]["surface"], "mcp_app_then_local")
+        self.assertEqual(render_payload["status_tool"], "get_paper_selection_surface_status")
+        self.assertEqual(render_payload["fallback_tool"], "open_paper_selection_page")
+        self.assertGreaterEqual(render_payload["fallback_after_seconds"], 1)
+        self.assertNotIn("local_browser", render_payload)
+        open_mock.assert_not_called()
+
+    def test_selection_surface_status_reports_ready_after_widget_callback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cache.create_search_session(
+                query="ready widget",
+                sources="arxiv",
+                papers=[
+                    {
+                        "title": "Ready Widget Paper",
+                        "source": "arxiv",
+                        "paper_id": "2601.00023",
+                        "pdf_url": "https://example.org/ready-widget.pdf",
+                    }
+                ],
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                },
+            ):
+                server.detect_host.cache_clear()
+                render_tool = server.mcp._tool_manager.get_tool("render_paper_selection_app")
+                ready_tool = server.mcp._tool_manager.get_tool("report_paper_selection_app_ready")
+                status_tool = server.mcp._tool_manager.get_tool("get_paper_selection_surface_status")
+                rendered = asyncio.run(
+                    render_tool.run(
                         {"selection_token": session["selection_token"]},
                         convert_result=False,
                     )
                 )
-                local_payload = unwrap_tool_result(local_result)
+                render_payload = unwrap_tool_result(rendered)
+                ready = asyncio.run(
+                    ready_tool.run(
+                        {
+                            "selection_token": session["selection_token"],
+                            "client_instance_id": "test-client",
+                            "app_attempt_id": render_payload["app_attempt_id"],
+                        },
+                        convert_result=False,
+                    )
+                )
+                status = asyncio.run(
+                    status_tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
                 server.detect_host.cache_clear()
 
-        self.assertIsInstance(render_result, CallToolResult)
-        self.assertEqual(render_result.meta["ui"]["resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(render_result.meta["ui/resourceUri"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(render_result.meta["openai/outputTemplate"], server.PAPER_SELECTION_WIDGET_URI)
-        self.assertEqual(render_payload["detected_host"], "claude_code_desktop")
-        self.assertTrue(render_payload["app_widget_supported"])
-        self.assertFalse(render_payload["selection_surface"]["app_widget_confirmed"])
-        self.assertEqual(render_payload["selection_surface"]["surface"], "hybrid")
-        self.assertEqual(local_payload["interaction"], "local_browser_checkbox")
-        self.assertTrue(local_payload["opened"])
-        open_mock.assert_called_once()
+        ready_payload = unwrap_tool_result(ready)
+        status_payload = unwrap_tool_result(status)
+        self.assertEqual(ready_payload["status"], "ok")
+        self.assertTrue(status_payload["app_ready"])
+        self.assertFalse(status_payload["fallback_recommended"])
+        self.assertEqual(status_payload["selection_surface"]["surface"], "mcp_app_then_local")
+
+    def test_selection_surface_status_recommends_local_fallback_after_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cache.create_search_session(
+                query="fallback widget",
+                sources="arxiv",
+                papers=[
+                    {
+                        "title": "Fallback Widget Paper",
+                        "source": "arxiv",
+                        "paper_id": "2601.00024",
+                        "pdf_url": "https://example.org/fallback-widget.pdf",
+                    }
+                ],
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                    "PAPER_SEARCH_MCP_MCP_APP_FALLBACK_TIMEOUT_SECONDS": "1",
+                },
+            ):
+                server.detect_host.cache_clear()
+                render_tool = server.mcp._tool_manager.get_tool("render_paper_selection_app")
+                status_tool = server.mcp._tool_manager.get_tool("get_paper_selection_surface_status")
+                asyncio.run(
+                    render_tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                state = cache.read_selection_ui_state(session["selection_token"], cache_dir=tmp)
+                state["app_render_attempted_at"] = time.time() - 2
+                state["fallback_after_seconds"] = 1
+                cache.write_selection_ui_state(session["selection_token"], state, cache_dir=tmp)
+                status = asyncio.run(
+                    status_tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                server.detect_host.cache_clear()
+
+        status_payload = unwrap_tool_result(status)
+        self.assertFalse(status_payload["app_ready"])
+        self.assertTrue(status_payload["fallback_recommended"])
+        self.assertEqual(status_payload["fallback_tool"], "open_paper_selection_page")
 
     def test_registered_open_selection_page_opens_local_fallback_for_codex_vscode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3083,6 +3251,56 @@ class TestSelectionSessions(unittest.TestCase):
         self.assertEqual(payload["interaction"], "local_browser_checkbox")
         self.assertTrue(payload["opened"])
         self.assertGreater(payload["local_port"], 0)
+        open_mock.assert_called_once()
+
+    def test_registered_open_selection_page_reuses_existing_local_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = cache.create_search_session(
+                query="reuse local",
+                sources="arxiv",
+                papers=[
+                    {
+                        "title": "Reuse Local Paper",
+                        "source": "arxiv",
+                        "paper_id": "2601.00025",
+                        "pdf_url": "https://example.org/reuse-local.pdf",
+                    }
+                ],
+                cache_dir=tmp,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PAPER_SEARCH_MCP_CACHE_DIR": tmp,
+                    "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
+                },
+            ), patch(
+                "paper_search_mcp.utils.open_url_in_host",
+                return_value=True,
+            ) as open_mock:
+                server.detect_host.cache_clear()
+                tool = server.mcp._tool_manager.get_tool("open_paper_selection_page")
+                first = asyncio.run(
+                    tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                second = asyncio.run(
+                    tool.run(
+                        {"selection_token": session["selection_token"]},
+                        convert_result=False,
+                    )
+                )
+                server.detect_host.cache_clear()
+
+        first_payload = unwrap_tool_result(first)
+        second_payload = unwrap_tool_result(second)
+        self.assertEqual(second_payload["page_id"], first_payload["page_id"])
+        self.assertFalse(first_payload["reused"])
+        self.assertTrue(second_payload["reused"])
+        self.assertTrue(second_payload["already_opened"])
         open_mock.assert_called_once()
 
     def test_registered_paper_selection_state_survives_rerender(self):
@@ -4321,3 +4539,4 @@ class TestSelectionSessions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

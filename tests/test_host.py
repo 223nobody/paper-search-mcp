@@ -89,14 +89,14 @@ def test_detect_claude_code_cli():
         assert host_is_claude_code() is True
 
 
-def test_detect_claude_code_desktop_is_tentative_apps_host():
-    """Claude Code Desktop gets Apps metadata plus localhost fallback."""
+def test_detect_claude_code_desktop_is_confirmed_apps_host():
+    """Claude Code Desktop gets Apps metadata without localhost auto-open."""
     env = {"CLAUDECODE": "1", "CLAUDE_CODE_DESKTOP": "1"}
     with mock.patch.dict(os.environ, env, clear=True):
         detect_host.cache_clear()
         assert detect_host() == "claude_code_desktop"
         assert host_supports_mcp_apps_widget() is True
-        assert host_mcp_apps_confirmed() is False
+        assert host_mcp_apps_confirmed() is True
         assert host_is_claude_code() is True
         detect_host.cache_clear()
 
@@ -454,18 +454,16 @@ class TestSelectionUiMode:
             assert _selection_ui_should_open(force_open=True) is True
 
             policy = _selection_surface_policy(force_open=True)
-            assert policy == {
-                "surface": "local_browser",
-                "reason": "host_codex_vscode_without_mcp_app_sandbox",
-                "detected_host": "codex_vscode",
-                "ui_mode": "auto",
-                "app_widget_supported": False,
-                "app_widget_confirmed": False,
-                "local_browser_should_open": True,
-            }
+            assert policy["surface"] == "local_browser"
+            assert policy["reason"] == "host_codex_vscode_without_mcp_app_sandbox"
+            assert policy["detected_host"] == "codex_vscode"
+            assert policy["ui_mode"] == "auto"
+            assert policy["app_widget_supported"] is False
+            assert policy["app_widget_confirmed"] is False
+            assert policy["local_browser_should_open"] is True
             detect_host.cache_clear()
 
-    def test_claude_code_desktop_auto_uses_hybrid_surface(self):
+    def test_claude_code_desktop_auto_uses_app_first_surface(self):
         env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop"}
         with mock.patch.dict(os.environ, env, clear=True):
             detect_host.cache_clear()
@@ -476,20 +474,21 @@ class TestSelectionUiMode:
             )
 
             assert _selection_ui_mode() == "auto"
-            assert _selection_ui_should_open(force_open=True) is True
+            assert _selection_ui_should_open(force_open=True) is False
 
             policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "hybrid"
-            assert policy["reason"] == (
-                "host_claude_code_desktop_tentative_mcp_app_with_local_browser_fallback"
-            )
+            assert policy["surface"] == "mcp_app_then_local"
+            assert policy["reason"] == "host_claude_code_desktop_try_mcp_app_then_local_fallback"
             assert policy["detected_host"] == "claude_code_desktop"
             assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is False
-            assert policy["local_browser_should_open"] is True
+            assert policy["app_widget_confirmed"] is True
+            assert policy["local_browser_should_open"] is False
+            assert policy["fallback_tool"] == "open_paper_selection_page"
+            assert policy["status_tool"] == "get_paper_selection_surface_status"
+            assert policy["fallback_after_seconds"] >= 1
             detect_host.cache_clear()
 
-    def test_claude_code_desktop_app_only_misconfig_still_forces_hybrid(self):
+    def test_claude_code_desktop_app_only_mode_keeps_mcp_app(self):
         env = {
             "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
             "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "app_only",
@@ -503,17 +502,15 @@ class TestSelectionUiMode:
             )
 
             assert _selection_ui_mode() == "app_only"
-            assert _selection_ui_should_open(force_open=True) is True
+            assert _selection_ui_should_open(force_open=True) is False
             assert _selection_ui_should_open(force_open=False) is False
 
             policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "hybrid"
-            assert policy["reason"] == (
-                "app_only_unsupported_host_claude_code_desktop_using_hybrid_fallback"
-            )
+            assert policy["surface"] == "mcp_app"
+            assert policy["reason"] == "app_only_configured"
             assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is False
-            assert policy["local_browser_should_open"] is True
+            assert policy["app_widget_confirmed"] is True
+            assert policy["local_browser_should_open"] is False
             detect_host.cache_clear()
 
     def test_claude_code_vscode_auto_uses_hybrid_surface(self):

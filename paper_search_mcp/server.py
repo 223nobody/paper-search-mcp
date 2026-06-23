@@ -3230,6 +3230,32 @@ async def render_paper_selection_app(
     )
 
 
+async def report_paper_selection_app_ready(
+    selection_token: str,
+    client_instance_id: str = "",
+    app_attempt_id: str = "",
+) -> Dict[str, Any]:
+    """Record that the MCP App iframe rendered and can call server tools."""
+    from .tools.widgets import _handle_report_paper_selection_app_ready
+
+    return await _handle_report_paper_selection_app_ready(
+        selection_token=selection_token,
+        client_instance_id=client_instance_id,
+        app_attempt_id=app_attempt_id,
+    )
+
+
+async def get_paper_selection_surface_status(
+    selection_token: str,
+) -> Dict[str, Any]:
+    """Return MCP App readiness and whether local fallback is recommended."""
+    from .tools.widgets import _handle_get_paper_selection_surface_status
+
+    return await _handle_get_paper_selection_surface_status(
+        selection_token=selection_token,
+    )
+
+
 async def open_paper_selection_page(
     selection_token: str,
     papers: Optional[List[Dict[str, Any]]] = None,
@@ -3242,6 +3268,7 @@ async def open_paper_selection_page(
     selection_semantics: str = "",
     parse_execution: str = "",
     open_browser: bool = True,
+    force_reopen: bool = False,
 ) -> Dict[str, Any]:
     """Open a local browser checkbox selector for clients without MCP Apps UI."""
     from .tools.widgets import _handle_open_paper_selection_page
@@ -3251,7 +3278,9 @@ async def open_paper_selection_page(
         mode=mode, backend=backend, force=force,
         custom_save_path_confirmed=custom_save_path_confirmed,
         selection_semantics=selection_semantics,
-        parse_execution=parse_execution, open_browser=open_browser,
+        parse_execution=parse_execution,
+        open_browser=open_browser,
+        force_reopen=force_reopen,
     )
 
 
@@ -3443,7 +3472,7 @@ async def download_with_fallback(
 
 async def download_selected_papers(
     selection_token: str,
-    selected_indices: str = "all",
+    selected_indices: str = "",
     save_path: str = DEFAULT_SAVE_PATH,
     use_scihub: bool = False,
     concurrency: int = 0,
@@ -3849,6 +3878,13 @@ async def _attach_local_selection_ui(
     surface = _selection_surface_policy(force_open=force_open)
     prompt["selection_surface"] = surface
     if surface.get("surface") == "numbered_fallback":
+        return prompt
+    if surface.get("surface") == "mcp_app_then_local":
+        prompt["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
+        prompt["status_tool"] = "get_paper_selection_surface_status"
+        prompt["fallback_after_seconds"] = int(
+            surface.get("fallback_after_seconds") or 0
+        )
         return prompt
     if surface.get("surface") == "mcp_app":
         from .utils import host_mcp_apps_confirmed  # noqa: PLC0415
