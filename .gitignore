@@ -13,8 +13,7 @@ scratch/
 **/CLAUDE.local.md
 
 # Local configuration and secrets
-.env
-*/.env
+
 !.env.example
 !.env.sample
 !.env.template

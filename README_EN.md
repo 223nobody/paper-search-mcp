@@ -15,6 +15,10 @@
   🌐 <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
 </p>
 
+<p align="center">
+  <img src="docs/images/workflow.png" alt="Paper Search MCP workflow overview">
+</p>
+
 ---
 
 ## 🤖 One-Click AI Install
@@ -65,6 +69,7 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 - [📖 Overview](#-overview)
 - [🎯 Project Principles](#-project-principles)
 - [✨ Features](#-features)
+- [🧭 Visual Guide](#-visual-guide)
 - [📊 Platform Capability Matrix](#-platform-capability-matrix)
 - [🔑 Credential & API Key Requirements](#-credential--api-key-requirements)
 - [📡 Data Source Configuration](#-data-source-configuration)
@@ -114,6 +119,22 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 - 🕐 **Background Parsing Jobs**: Long selected-paper parses can be submitted with `submit_parse_job`, then tracked with `get_parse_job_status`, `list_parse_jobs`, and `cancel_parse_job`.
 - 🔌 **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
 - 🧩 **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
+
+---
+
+## 🧭 Visual Guide
+
+### System Architecture
+
+<p align="center">
+  <img src="docs/images/system.png" alt="Paper Search MCP system architecture">
+</p>
+
+### Multi-Source Retrieval Network
+
+<p align="center">
+  <img src="docs/images/network_graph.png" alt="Paper Search MCP multi-source retrieval network">
+</p>
 
 ---
 

@@ -6,6 +6,10 @@
 
 <p align="center">🌐 <a href="README.md">中文</a> | <a href="README_EN.md">English</a></p>
 
+<p align="center">
+  <img src="docs/images/workflow.png" alt="Paper Search MCP 工作流总览">
+</p>
+
 ---
 
 ## 🤖 一键 AI 安装
@@ -103,6 +107,22 @@ Agent 会自动调用 `paper_research_workflow` 完成全流程，返回 `job_id
 - 🕐 **后台解析任务**：长时间批量解析可用 `submit_parse_job` 提交，再用 `get_parse_job_status`、`list_parse_jobs`、`cancel_parse_job` 管理。
 - 🪶 **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session、下载健康统计和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
 - 🔌 **MCP 优先、CLI 兜底**：自然语言 Agent 场景优先通过 MCP 工具调用；命令行工具保留给手动验证、脚本和 MCP 不可用时的兜底。
+
+---
+
+## 🧭 项目图示
+
+### 系统架构
+
+<p align="center">
+  <img src="docs/images/system.png" alt="Paper Search MCP 系统架构图">
+</p>
+
+### 多源论文检索网络
+
+<p align="center">
+  <img src="docs/images/network_graph.png" alt="Paper Search MCP 多源论文检索网络图">
+</p>
 
 ---
 
