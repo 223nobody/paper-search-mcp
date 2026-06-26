@@ -4,7 +4,7 @@
 
 `paper-search-mcp` 是一个面向论文检索、PDF 下载和论文解析的 MCP Server，也提供 `paper-search` 命令行工具。当前版本在原始多源论文检索能力上，补齐了“检索/下载 PDF -> 解析提示或后台 MinerU 解析任务 -> PDF 同目录解析产物与轻量缓存”的完整链路。
 
-<p align="center">🌐 <a href="README.md">中文</a> | <a href="README_EN.md">English</a></p>
+<p align="center">🌐 <a href="README.md">Chinese</a> | <a href="README_EN.md">English</a></p>
 
 <p align="center">
   <img src="docs/images/workflow.png" alt="Paper Search MCP 工作流总览">
@@ -107,6 +107,7 @@ Agent 会自动调用 `paper_research_workflow` 完成全流程，返回 `job_id
 - 🕐 **后台解析任务**：长时间批量解析可用 `submit_parse_job` 提交，再用 `get_parse_job_status`、`list_parse_jobs`、`cancel_parse_job` 管理。
 - 🪶 **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session、下载健康统计和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
 - 🔌 **MCP 优先、CLI 兜底**：自然语言 Agent 场景优先通过 MCP 工具调用；命令行工具保留给手动验证、脚本和 MCP 不可用时的兜底。
+- 🏢 **出版商发行版下载（MCP Chaining）**：通过内置的 scansci-pdf MCP Chaining 集成，将已下载的 arXiv 论文自动升级为出版商最终发行版 PDF（Nature、Elsevier、Springer 等）。自动安装、零配置、按需使用，所有现有功能不受影响。
 
 ---
 
@@ -610,6 +611,9 @@ job_xxx 之前中断了，帮我恢复继续解析。
 - `parse_pdf_with_mineru`：解析本地 PDF。
 - `mineru_health_check`：检查 MinerU extract/API/CLI/pypdf 可用性。
 - `list_parsed_papers` / `get_parsed_paper` / `search_parsed_paper` / `get_paper_assets`：按 `paper_key` 读取和检索 PDF 同目录解析产物。
+- `download_publisher_version`：通过 scansci-pdf MCP Chaining 下载 arXiv 论文的出版商最终发行版 PDF（单篇）。
+- `batch_download_publisher_versions`：批量下载多篇 arXiv 论文的出版商发行版。
+- `check_publisher_setup`：检查 scansci-pdf 环境（安装状态、Tor、CloakBrowser、API Key 配置）。
 
 ---
 
@@ -702,6 +706,36 @@ job_xxx 之前中断了，帮我恢复继续解析。
 清理解析缓存中 PDF 已失效的条目（先 dry-run 看看）。
 重建解析缓存的 FTS 索引。
 ```
+
+### 🏢 获取出版商发行版 PDF（进阶）
+
+将缓存的 arXiv 论文升级为出版商最终发行版（Nature、Elsevier、Springer 等正式排版版本）。通过内置 scansci-pdf MCP Chaining 自动调用反检测浏览器、Tor 代理和 13+ 下载源。
+
+**首次使用自动安装**，无需手动配置。`download_publisher_version` 内部自动启动 Tor、检查 CloakBrowser、探测可用源。如需更好的成功率，可配置免费 Elsevier API Key（1-2s 直下 ScienceDirect 论文）。
+
+**推荐工具**：`download_publisher_version`（单篇）、`batch_download_publisher_versions`（批量）、`check_publisher_setup`（诊断）。
+
+```text
+# 单篇下载出版商版本
+帮我下载 paper_key 为 arxiv_1706.03762 这篇论文的出版商最终发行版
+
+# 先搜索，后下载出版商版本
+搜索论文 "Chain-of-Thought Prompting Elicits Reasoning"，下载并解析 arXiv 版本，然后帮我获取出版商最终发行版
+
+# 下载后重新用 MinerU 解析出版商 PDF
+用 download_publisher_version 下载 arxiv_1810.04805 的 publisher 版本，下载后同时用 MinerU 解析
+
+# 批量下载出版商版本
+我已经解析了 5 篇 arXiv 论文，paper_keys 是 arxiv_2301, arxiv_2302, arxiv_2303，帮我批量下载它们的出版商发行版
+
+# 检查配置后下载
+先帮我检查一下 publisher 下载的环境配置是否就绪，然后下载 arxiv_1706.03762 的出版商版本
+
+# 列出所有 arXiv 论文并全部下载出版商版本
+列出我所有已解析的 arXiv 论文，然后全部下载出版商版本
+```
+
+> 💡 **工作原理**：paper-search-mcp 通过 MCP Chaining 技术，在工具内部启动 scansci-pdf 子进程，提取论文的 DOI 或 arXiv ID 后调用 `scansci_pdf_smart_download`。scansci-pdf 并发尝试出版商直链、Elsevier API、Unpaywall、Sci-Hub 等 13+ 源，返回成功下载的 PDF。scansci-pdf 首次使用自动通过 pip 安装，Tor 自动下载配置，完全无感。
 
 ### 🔬 排查解析质量
 

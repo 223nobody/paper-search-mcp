@@ -2968,6 +2968,7 @@ from .tools.widgets import register_widget_tools
 from .tools.core import register_core_tools
 from .tools.orchestration import register_orchestration_tools
 from .tools.sources import register_source_tools
+from .tools.publisher import register_publisher_tools
 
 register_cache_tools(mcp)
 register_parse_tools(mcp)
@@ -2975,6 +2976,7 @@ register_widget_tools(mcp)
 register_core_tools(mcp)
 register_orchestration_tools(mcp, _SEARCHERS)
 register_source_tools(mcp, _SEARCHERS)
+register_publisher_tools(mcp)
 
 # Re-export search_papers for CLI backward compatibility.
 # The function is set at module level in orchestration.py during registration.

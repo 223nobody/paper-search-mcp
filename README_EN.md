@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  🌐 <a href="README.md">中文</a> | <a href="README_EN.md">English</a>
+  🌐 <a href="README.md">Chinese</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -79,6 +79,7 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 - [⚖️ Sci-Hub Notice](#️-sci-hub-notice)
 - [📦 Installation](#-installation)
 - [🧪 MinerU Parsing Workflow](#-mineru-parsing-workflow)
+- [🏢 Publisher-Version Download (MCP Chaining)](#-publisher-version-download-mcp-chaining)
 - [🤝 Contributing](#-contributing)
 - [🎬 Demo](#-demo)
 - [📋 TODO](#-todo)
@@ -118,6 +119,7 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 - 🔎 **Fast Parsed-Paper Search**: Parsed blocks are indexed into `.paper_search_cache/parsed_index.sqlite3` with SQLite FTS when available, while file-based search remains the fallback.
 - 🕐 **Background Parsing Jobs**: Long selected-paper parses can be submitted with `submit_parse_job`, then tracked with `get_parse_job_status`, `list_parse_jobs`, and `cancel_parse_job`.
 - 🔌 **MCP Integration**: Compatible with MCP clients for LLM context enhancement.
+- 🏢 **Publisher-Version Download (MCP Chaining)**: Built-in scansci-pdf MCP Chaining integration upgrades cached arXiv papers to publisher final versions (Nature, Elsevier, Springer, etc.). Auto-install, zero-config, on-demand — all existing features remain unaffected.
 - 🧩 **Extensible Design**: Easily add new academic platforms by extending the `academic_platforms` module.
 
 ---
@@ -708,6 +710,16 @@ Downloads also keep lightweight method health stats in
 `.paper_search_cache/download_health.json`; inspect them with
 `get_download_health_stats` or `paper-search cache download-health`.
 
+### 🏢 Publisher-Version Tools (MCP Chaining)
+
+Three tools are available for downloading publisher final versions of cached arXiv papers via scansci-pdf MCP Chaining:
+
+- `download_publisher_version` — download the publisher final version for a single cached arXiv paper.
+- `batch_download_publisher_versions` — batch download publisher versions for multiple papers (comma-separated or `"all"`).
+- `check_publisher_setup` — check scansci-pdf environment (installation, Tor, CloakBrowser, API Keys).
+
+See the [Publisher-Version Download section](#-publisher-version-download-mcp-chaining) above for prompt examples and usage.
+
 Local optimization checks can be run without network access:
 
 ```bash
@@ -718,6 +730,38 @@ The benchmark reports first-parse time, cache-hit parse time, FTS rebuild/search
 time, legacy file-search time, and the measured speedups as JSON.
 
 ---
+
+### 🏢 Publisher-Version Download (MCP Chaining)
+
+Upgrade cached arXiv papers to publisher final versions (Nature, Elsevier, Springer, etc.). Uses built-in scansci-pdf MCP Chaining with anti-detection browser (CloakBrowser), Tor proxy, and 13+ parallel download sources.
+
+**Auto-install on first use** — no manual setup. The tool automatically starts Tor, checks CloakBrowser availability, and probes reachable sources. For even better results, configure a free Elsevier API Key (1-2s direct ScienceDirect downloads).
+
+**Key tools**: `download_publisher_version` (single), `batch_download_publisher_versions` (batch), `check_publisher_setup` (diagnostics).
+
+```text
+# Single paper
+Download the publisher final version for paper_key arxiv_1706.03762.
+
+# Search → download arXiv → get publisher version
+Search for "Chain-of-Thought Prompting", download and parse the arXiv version,
+then fetch the publisher final version.
+
+# Re-parse publisher PDF with MinerU
+Download the publisher version of arxiv_1810.04805 and re-parse with MinerU.
+
+# Batch download
+I have 3 arXiv papers cached: arxiv_2301, arxiv_2302, arxiv_2303.
+Batch download their publisher versions.
+
+# Diagnostics before download
+Check the publisher download setup first, then download arxiv_1706.03762.
+
+# Download all cached arXiv papers
+List all my parsed arXiv papers and download publisher versions for all of them.
+```
+
+> 💡 **How it works**: paper-search-mcp launches scansci-pdf as a subprocess via MCP Chaining (FastMCP Client + StdioTransport). It extracts the paper's DOI or arXiv ID from the cache and calls `scansci_pdf_smart_download`, which races 13+ sources in parallel. scansci-pdf is auto-installed via pip on first use; Tor is auto-downloaded and configured. Completely transparent to the user.
 
 ## 🤝 Contributing
 

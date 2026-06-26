@@ -50,6 +50,7 @@ from ..cache import (
     read_parse_prompt_state as _cache_read_parse_prompt_state,
     read_json,
     read_session_download_state as _cache_read_session_download_state,
+    update_search_session_metadata as _cache_update_search_session_metadata,
     write_parse_prompt_state as _cache_write_parse_prompt_state,
     write_session_download_state as _cache_write_session_download_state,
     _session_path as cache_session_path,
@@ -144,6 +145,7 @@ from ..engine.parse import (
     _selection_semantics_name,
     _should_promote_paper_selection_app,
     _strip_widget_meta,
+    _format_selected_indices,
     _workflow_parse_execution_name,
     dismiss_parse_prompt_state as _dismiss_parse_prompt_state,
 )
@@ -428,7 +430,10 @@ def _merge_search_results(
     ``papers`` (concatenated; cross-round dedup is handled upstream).
     """
     merged = dict(base)
-    merged["papers"] = base.get("papers", []) + additional.get("papers", [])
+    merged["papers"] = _dedupe_papers(
+        base.get("papers", []) + additional.get("papers", []),
+        query="",
+    )
 
     # Merge source_results — take the higher count per source
     base_sr = dict(base.get("source_results", {}))
@@ -1478,7 +1483,12 @@ async def _pre_download_selection_prompt(
     selection_semantics: str = SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE,
     skip_local_ui: bool = False,
 ) -> Dict[str, Any]:
-    """Pre-download selection prompt for large batches."""
+    """Pre-download selection prompt for large batches.
+
+    On repeated calls with the same *selection_token*, this function
+    reuses a previously-created pre-download parse session so that
+    only ONE local browser page is opened per download context.
+    """
     semantics = _selection_semantics_name(selection_semantics)
     source_papers = session.get("papers", [])
     if not isinstance(source_papers, list):
@@ -1491,21 +1501,90 @@ async def _pre_download_selection_prompt(
         ):
             selected_papers.append(source_papers[index - 1])
 
-    parse_session = await asyncio.to_thread(
-        _cache_create_search_session,
-        session.get("query", ""),
-        session.get("sources", ""),
-        selected_papers,
-        {
-            "interaction": "pre_download_selection",
-            "trigger": "pre_download_batch_threshold",
-            "download_selection_token": selection_token,
-            "save_path": resolve_save_path(save_path),
-            "selected_source_indices": indices,
-            "selection_semantics": semantics,
-            "parse_execution": _workflow_parse_execution_name(parse_execution),
-        },
+    # ── Reuse an existing pending pre-download session when one exists ──
+    _reused_session = False
+    download_session = await asyncio.to_thread(
+        _cache_get_search_session, selection_token
     )
+    pending_token = (
+        download_session.get("metadata", {})
+        .get("pending_pre_download_token", "")
+        .strip()
+        if isinstance(download_session, dict)
+        else ""
+    )
+    if pending_token:
+        existing = await asyncio.to_thread(
+            _cache_get_search_session, pending_token
+        )
+        # Also verify the parse prompt hasn't already been resolved
+        parse_prompt_state = await asyncio.to_thread(
+            _cache_read_parse_prompt_state, selection_token
+        )
+        if (
+            isinstance(parse_prompt_state, dict)
+            and str(parse_prompt_state.get("state") or "")
+            in TERMINAL_PARSE_PROMPT_STATES
+        ):
+            # Prompt was already dismissed or timed out — clear stale
+            # reference so a fresh session/page can be created.
+            await asyncio.to_thread(
+                _cache_update_search_session_metadata,
+                selection_token,
+                {"pending_pre_download_token": ""},
+            )
+            pending_token = ""
+        elif (
+            isinstance(existing, dict)
+            and existing.get("selection_token") == pending_token
+        ):
+            # Reuse the existing session — don't create a new one or
+            # open another browser page.
+            parse_session = existing
+            _reused_session = True
+        else:
+            # Stale reference — clear it
+            await asyncio.to_thread(
+                _cache_update_search_session_metadata,
+                selection_token,
+                {"pending_pre_download_token": ""},
+            )
+            pending_token = ""
+            parse_session = None
+    else:
+        parse_session = None
+
+    if parse_session is None:
+        parse_session = await asyncio.to_thread(
+            _cache_create_search_session,
+            session.get("query", ""),
+            session.get("sources", ""),
+            selected_papers,
+            {
+                "interaction": "pre_download_selection",
+                "trigger": "pre_download_batch_threshold",
+                "download_selection_token": selection_token,
+                "save_path": resolve_save_path(save_path),
+                "selected_source_indices": indices,
+                "selection_semantics": semantics,
+                "parse_execution": _workflow_parse_execution_name(parse_execution),
+            },
+        )
+        # Record the back-reference so subsequent calls reuse this session
+        try:
+            await asyncio.to_thread(
+                _cache_update_search_session_metadata,
+                selection_token,
+                {
+                    "pending_pre_download_token": parse_session["selection_token"],
+                },
+            )
+        except Exception:
+            logger.debug(
+                "Failed to store pending_pre_download_token on session %s",
+                selection_token,
+                exc_info=True,
+            )
 
     candidates = [
         _paper_parse_candidate(paper, index + 1)
@@ -1566,7 +1645,7 @@ async def _pre_download_selection_prompt(
         selection_semantics=semantics,
         parse_execution=parse_execution,
     )
-    if not skip_local_ui:
+    if not skip_local_ui and not _reused_session:
         await _attach_local_selection_ui(
             prompt,
             selection_token=parse_session["selection_token"],
@@ -2406,6 +2485,7 @@ def register_orchestration_tools(mcp, searchers):
         force: bool = False,
         custom_save_path_confirmed: bool = False,
         large_batch_selection: str = "auto",
+        bypass_large_batch_selection: bool = False,
         resume: bool = False,
         ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
@@ -2799,6 +2879,7 @@ def register_orchestration_tools(mcp, searchers):
         force: bool = False,
         custom_save_path_confirmed: bool = False,
         large_batch_selection: str = "auto",
+        bypass_large_batch_selection: bool = False,
         ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
         """Compatibility workflow: search, download top-ranked papers, then apply the parse policy.
@@ -2967,7 +3048,7 @@ def register_orchestration_tools(mcp, searchers):
         sources: str = "",
         year: Optional[str] = None,
         ranking_profile: str = "",
-        selection_mode: str = "manual",
+        selection_mode: str = "auto_top",
         selected_indices: str = "",
         save_path: str = DEFAULT_SAVE_PATH,
         use_scihub: bool = False,
@@ -2978,6 +3059,7 @@ def register_orchestration_tools(mcp, searchers):
         download_concurrency: int = 0,
         custom_save_path_confirmed: bool = False,
         large_batch_selection: str = "auto",
+        bypass_large_batch_selection: bool = False,
         ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
         """Preferred MCP-first natural-language workflow for paper research.
