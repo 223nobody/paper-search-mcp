@@ -8,7 +8,7 @@ version = "0.1.4"
 authors = [{ name = "P.S Zhang", email = "pengsongzhang96@gmail.com" }]
 description = "A MCP server for searching and downloading academic papers from multiple sources."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 keywords = [
     "mcp",

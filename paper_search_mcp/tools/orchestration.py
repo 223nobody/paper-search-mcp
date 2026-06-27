@@ -70,6 +70,7 @@ from ..engine.search import (
     SEARCH_SOURCE_TIMEOUT_ENV,
     SEARCH_TIMEOUT_ENV,
     SOURCE_CAPABILITIES,
+    _source_reliability_score,
     _cached_search_result as _cached_search_result,
     _env_float,
     _env_int,
@@ -87,12 +88,14 @@ from ..engine.search import (
 from ..engine.paper import (
     AGENT_SKILL_RANKING_PROFILE,
     _agent_skill_profile_score,
+    _classify_query_intent,
     _dedupe_papers,
     _download_route_for_candidate,
     _extract_arxiv_id,
     _paper_arxiv_id,
     _paper_field,
     _paper_parse_candidate,
+    _paper_year,
     _paper_profile_text,
     _paper_unique_key,
     _paper_value,
@@ -390,6 +393,7 @@ def _should_require_large_batch_selection(
     bypass_large_batch_selection: bool = False,
     session: Optional[Dict[str, Any]] = None,
     public_call: bool = False,
+    explicit_user_selection: bool = False,
 ) -> bool:
     if _large_batch_selection_satisfied(session):
         return False
@@ -404,15 +408,18 @@ def _should_require_large_batch_selection(
         return item_count > 0
     # ── Cross-batch gate: block when the ORIGINAL session requested_count
     #     was above the limit even if this single call only picks ≤ 10 papers.
-    if isinstance(session, dict):
-        metadata = session.get("metadata")
-        if isinstance(metadata, dict):
-            try:
-                session_requested = max(0, int(metadata.get("requested_count") or 0))
-            except (TypeError, ValueError):
-                session_requested = 0
-            if session_requested > AUTO_PARSE_SAVED_PDF_LIMIT:
-                return True
+    #     Skip this gate when the user has explicitly chosen which papers to
+    #     download (e.g. via numbered fallback indices "1,3,5").
+    if not explicit_user_selection:
+        if isinstance(session, dict):
+            metadata = session.get("metadata")
+            if isinstance(metadata, dict):
+                try:
+                    session_requested = max(0, int(metadata.get("requested_count") or 0))
+                except (TypeError, ValueError):
+                    session_requested = 0
+                if session_requested > AUTO_PARSE_SAVED_PDF_LIMIT:
+                    return True
     return item_count > AUTO_PARSE_SAVED_PDF_LIMIT
 
 
@@ -1980,14 +1987,29 @@ def register_orchestration_tools(mcp, searchers):
             task_map[source] = _async_search(searcher, query, max_results_per_source, **kwargs)
 
         source_names = list(task_map.keys())
-        per_source_timeout = _env_float(SEARCH_SOURCE_TIMEOUT_ENV, 12.0, minimum=0.0)
+        base_timeout = _env_float(SEARCH_SOURCE_TIMEOUT_ENV, 12.0, minimum=0.0)
         overall_timeout = _env_float(SEARCH_TIMEOUT_ENV, 18.0, minimum=0.0)
-        source_tasks = [
-            asyncio.create_task(
-                _search_source_with_timeout(source, task_map[source], per_source_timeout)
+        # ── Adaptive per-source timeout ───────────────────────────────
+        # Reliable sources (arxiv: 95, openalex: 82) get full budget.
+        # Less reliable sources (google_scholar: 20, ssrn: 24) get
+        # proportionally less time so they don't steal budget from
+        # fast/reliable sources that produce actual PDFs.
+        source_tasks = []
+        for source in source_names:
+            reliability = _source_reliability_score(source)
+            if reliability >= 60:
+                timeout = base_timeout
+            elif reliability >= 40:
+                timeout = base_timeout * 0.75
+            elif reliability >= 20:
+                timeout = base_timeout * 0.5
+            else:
+                timeout = max(base_timeout * 0.3, 3.0)
+            source_tasks.append(
+                asyncio.create_task(
+                    _search_source_with_timeout(source, task_map[source], timeout)
+                )
             )
-            for source in source_names
-        ]
         try:
             if overall_timeout > 0:
                 source_outputs = await asyncio.wait_for(
@@ -2058,6 +2080,26 @@ def register_orchestration_tools(mcp, searchers):
                 merged_papers.append(paper)
 
         deduped_papers = _dedupe_papers(merged_papers, query=query)
+
+        # ── Post-filter by year ──────────────────────────────────────
+        # Only semantic natively supports year filtering; other sources
+        # return all years.  Apply a client-side filter so that the
+        # `year` parameter works reliably across every source.
+        if year is not None:
+            try:
+                target_year = str(year).strip()
+            except Exception:
+                target_year = ""
+            if target_year:
+                before = len(deduped_papers)
+                deduped_papers = [
+                    p for p in deduped_papers
+                    if _paper_year(p) == target_year
+                ]
+                logger.debug(
+                    "Year filter %s: %d → %d papers",
+                    target_year, before, len(deduped_papers),
+                )
 
         result = {
             "query": query,
@@ -2152,17 +2194,29 @@ def register_orchestration_tools(mcp, searchers):
 
         # ── Progressive retry rounds ─────────────────────────────────
         # Each round specifies (source_profile, oversample_multiplier).
-        # Rounds 2 & 3 are only used for the agent-skill profile where
-        # metadata-only sources (crossref, openalex) are known to produce
-        # many non-downloadable candidates.
+        # When requested_count > 0 and the first round under-yields,
+        # progressively broader profiles are tried until the target is
+        # met or all rounds are exhausted.  This was previously gated to
+        # agent-skill only but now applies to all profiles.
         RETRY_ROUNDS: List[tuple] = [
             (effective_sources, 2.5),
         ]
-        if is_agent_skill:
-            RETRY_ROUNDS.extend([
-                ("agent-skill-broad", 5.0),
-                ("deep", 8.0),
-            ])
+        if requested_count > 0:
+            if is_agent_skill:
+                RETRY_ROUNDS.extend([
+                    ("agent-skill-broad", 5.0),
+                    ("agent-skill-broad", 3.0),
+                ])
+            else:
+                # Generic progressive broadening: fast → fast (higher oversample)
+                # We intentionally avoid "deep" here because it includes
+                # low-reliability sources (google_scholar, citeseerx, ssrn,
+                # base) that are prone to anti-bot blocking and timeouts.
+                # The second round uses "fast" with higher oversampling
+                # instead of broadening to unreliable sources.
+                RETRY_ROUNDS.extend([
+                    ("fast", 5.0),
+                ])
 
         all_ranked_papers: List[Dict[str, Any]] = []
         seen_keys: set = set()
@@ -2432,8 +2486,30 @@ def register_orchestration_tools(mcp, searchers):
             libgen_base_url=libgen_base_url,
             _searchers=searchers,
         )
-        legal_status = "source_native_or_open_access"
+        if isinstance(result, dict) and result.get("status") == "ok":
+            pdf_path = result.get("pdf_path", "")
+            if pdf_path and os.path.exists(pdf_path):
+                legal_status = "source_native_or_open_access"
+                if use_scihub and "sci" in Path(pdf_path).name.lower():
+                    legal_status = "user_opt_in_scihub"
+
+                from ..engine.parse import _after_saved_pdf
+
+                return await _after_saved_pdf(
+                    pdf_path,
+                    source=routed_source or source.strip().lower(),
+                    paper_id=routed_paper_id or paper_id,
+                    doi=routed_doi or doi,
+                    title=title,
+                    save_path=save_path,
+                    downloader="download_with_fallback",
+                    legal_status=legal_status,
+                    ctx=ctx,
+                    _attach_local_selection_ui_fn=_attach_local_selection_ui,
+                )
+        # Legacy string return from older engine or scihub path
         if isinstance(result, str) and os.path.exists(result):
+            legal_status = "source_native_or_open_access"
             if use_scihub and "sci" in Path(result).name.lower():
                 legal_status = "user_opt_in_scihub"
 
@@ -2629,12 +2705,17 @@ def register_orchestration_tools(mcp, searchers):
                 "downloaded": 0,
                 "failed": 0,
             }
+        _explicit = (
+            _selected_indices_was_explicit(selected_indices)
+            and str(selected_indices).strip().lower() not in {"all", "*"}
+        )
         if _should_require_large_batch_selection(
             len(indices),
             large_batch_selection=large_batch_selection,
             bypass_large_batch_selection=False,
             session=session,
             public_call=True,
+            explicit_user_selection=_explicit,
         ):
             selection_semantics = (
                 SELECTION_SEMANTICS_DOWNLOAD_ONLY
@@ -3055,7 +3136,7 @@ def register_orchestration_tools(mcp, searchers):
         parse_mode: str = "auto",
         backend: str = "",
         force: bool = False,
-        parse_execution: str = "none",
+        parse_execution: str = "prompt",
         download_concurrency: int = 0,
         custom_save_path_confirmed: bool = False,
         large_batch_selection: str = "auto",
@@ -3068,7 +3149,7 @@ def register_orchestration_tools(mcp, searchers):
         select, download, or parse papers. It coordinates the lower-level MCP tools
         directly and only returns CLI instructions as a fallback for unavailable
         host capabilities. By default, it downloads selected PDFs and asks before
-        MinerU parsing; set parse_execution explicitly to parse in the same flow.
+        MinerU parsing; set parse_execution="none" to skip the parse prompt.
 
         When more than 10 papers are requested, a real checkbox UI confirmation
         is required.  Programmatic bypass is not available through this public entry point.
@@ -3077,16 +3158,20 @@ def register_orchestration_tools(mcp, searchers):
         selection_mode_name = _workflow_intent_name(selection_mode)
         parse_execution_name = _workflow_parse_execution_name(parse_execution)
 
-        # ── Auto-detect agent-skill ranking profile when query matches ──
-        #     Without an explicit ranking_profile, queries about agent skills
-        #     don't trigger the multi-round progressive retry in
-        #     crawl_papers_for_selection, resulting in fewer downloadable
-        #     results.  Auto-detection activates the agent-skill profile
-        #     whenever the query text matches its topical vocabulary.
+        # ── Auto-detect ranking profile from query text ────────────────
+        #     When no explicit ranking_profile is given, classify the query
+        #     against all registered profiles.  The top match (if confidence
+        #     ≥ 2.0) is auto-selected.  Falls back to agent-skill detection
+        #     for backward compatibility when the classifier is uncertain.
         if not ranking_profile:
-            query_doc = {"title": query, "abstract": ""}
-            if _agent_skill_profile_score(query_doc) >= 0.5:
-                ranking_profile = AGENT_SKILL_RANKING_PROFILE
+            intents = _classify_query_intent(query, top_k=1)
+            if intents and intents[0][1] >= 2.0:
+                ranking_profile = intents[0][0]
+            else:
+                # Legacy fallback: check agent-skill vocabulary
+                query_doc = {"title": query, "abstract": ""}
+                if _agent_skill_profile_score(query_doc) >= 0.5:
+                    ranking_profile = AGENT_SKILL_RANKING_PROFILE
 
         search_only_intents = {
             "search",

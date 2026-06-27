@@ -51,10 +51,14 @@ class ACMSearcher(PaperSource):
     def __init__(self) -> None:
         self.api_key: str = get_env("ACM_API_KEY", "")
         if not self.api_key:
+            self.api_key = get_env("PAPER_SEARCH_MCP_ACM_API_KEY", "")
+        if not self.api_key:
             logger.warning(
                 "ACMSearcher initialised without PAPER_SEARCH_MCP_ACM_API_KEY/ACM_API_KEY.  "
                 "All calls will raise NotImplementedError until the key is set."
             )
+        else:
+            logger.info("ACMSearcher initialised with API key.")
 
     # ------------------------------------------------------------------
     # Public helpers

@@ -118,9 +118,8 @@ from .engine.paper import (
     _arxiv_category_venue, _searcher_for_source, _source_from_identifier,
     _env_bool, PREFER_ARXIV_ENV,
     AGENT_SKILL_RANKING_PROFILE, AGENT_SKILL_PROFILE_ALIASES,
-    AGENT_SKILL_BOOST_PHRASES, AGENT_SKILL_AGENT_TERMS, AGENT_SKILL_SKILL_TERMS,
-    AGENT_SKILL_NEGATIVE_PHRASES,
     GENERIC_PUBLICATION_VENUES, ARXIV_CATEGORY_VENUES, ARXIV_ID_RE, ARXIV_DOI_RE,
+    register_profile, get_profile, list_profiles, ProfileSpec,
 )
 from .engine.search import (
     async_search, _parse_sources, _disabled_sources,
@@ -270,7 +269,6 @@ _LOCAL_SELECTION_SERVER: Optional[ThreadingHTTPServer] = None
 _LOCAL_SELECTION_THREAD: Optional[threading.Thread] = None
 _LOCAL_SELECTION_BASE_URL = ""
 _LOCAL_SELECTION_PAGES: Dict[str, Dict[str, Any]] = {}
-_SEARCH_RESULT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def _large_batch_selection_policy_name(value: str) -> str:
@@ -1774,7 +1772,13 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
         finally:
             progress_unsubscribe(job_id, q)
 
-PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
+# ── Paper selection widget HTML ──────────────────────────────────────────
+# The template lives in ui/html_templates.py so it can be shared between
+# server.py and the localhost selection server without duplicating ~700 lines
+# of CSS/HTML/JS inline.
+from .ui.html_templates import PAPER_SELECTION_WIDGET_HTML  # noqa: E402
+
+MINERU_KEY_WIDGET_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -2639,11 +2643,6 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
   </script>
 </body>
 </html>"""
-
-from .ui.html_templates import PAPER_SELECTION_WIDGET_HTML as _SHARED_PAPER_SELECTION_WIDGET_HTML
-
-PAPER_SELECTION_WIDGET_HTML = _SHARED_PAPER_SELECTION_WIDGET_HTML
-
 MINERU_KEY_WIDGET_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -3570,7 +3569,7 @@ async def paper_research_workflow(
     parse_mode: str = "auto",
     backend: str = "",
     force: bool = False,
-    parse_execution: str = "none",
+    parse_execution: str = "prompt",
     download_concurrency: int = 0,
     custom_save_path_confirmed: bool = False,
     large_batch_selection: str = "auto",
@@ -3788,8 +3787,8 @@ SOURCE_RELIABILITY_SCORES: Dict[str, Dict[str, Any]] = {
 # Set PAPER_SEARCH_MCP_IEEE_API_KEY / PAPER_SEARCH_MCP_ACM_API_KEY to activate
 # (legacy IEEE_API_KEY / ACM_API_KEY are also supported).
 # ---------------------------------------------------------------------------
-_ieee_api_key = get_env("IEEE_API_KEY", "")
-_acm_api_key = get_env("ACM_API_KEY", "")
+_ieee_api_key = get_env("IEEE_API_KEY", "") or get_env("PAPER_SEARCH_MCP_IEEE_API_KEY", "")
+_acm_api_key = get_env("ACM_API_KEY", "") or get_env("PAPER_SEARCH_MCP_ACM_API_KEY", "")
 
 if _ieee_api_key:
     from .academic_platforms.ieee import IEEESearcher
@@ -4480,7 +4479,13 @@ async def _download_with_fallback_path(
             errors.append(f"libgen: {libgen_result['error']}")
 
     if not use_scihub:
-        return "Download failed after OA fallback chain. Details: " + " | ".join(errors)
+        return {
+            "status": "download_failed",
+            "message": "Download failed after OA fallback chain.",
+            "tried_methods": ["oa_race", "paper_fetch"],
+            "errors": errors,
+            "doi": doi or "",
+        }
 
     fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
     identifier = (doi or "").strip() or (title or "").strip() or paper_id
@@ -4496,7 +4501,13 @@ async def _download_with_fallback_path(
             legal_status="user_opt_in_scihub",
         )
         return str(fallback)
-    return "Sci-Hub fallback also failed."
+    return {
+        "status": "download_failed",
+        "message": "All download methods failed, including Sci-Hub.",
+        "tried_methods": ["oa_race", "paper_fetch", "scihub"],
+        "errors": errors,
+        "doi": doi or "",
+    }
 
 
 async def _resolve_session_paper_pdf(
@@ -4876,6 +4887,153 @@ def _workflow_selection_indices(
     return ",".join(str(index) for index in range(1, limit + 1))
 
 
+# ---------------------------------------------------------------------------
+# Helper: route source-native download NotImplementedError → publisher download
+# ---------------------------------------------------------------------------
+
+async def _route_source_to_publisher_download(
+    *,
+    searcher: Any,
+    source: str,
+    paper_id: str,
+    save_path: str,
+    fallback_result: str,
+) -> Dict[str, Any]:
+    """When a source's native download raises NotImplementedError, try to
+    find the paper's DOI via the source's search endpoint and route through
+    scansci-pdf publisher download.
+
+    Args:
+        searcher: The source searcher instance (e.g. ieee_searcher).
+        source: Source name (e.g. ``"ieee"``, ``"acm"``).
+        paper_id: Source-native paper identifier.
+        save_path: Directory to save the downloaded PDF.
+        fallback_result: The original error message to return if routing fails.
+
+    Returns:
+        A dict with ``status`` and optionally ``publisher_pdf``, or the
+        original *fallback_result* string when no route is available.
+    """
+    # Only route when the error is a NotImplementedError from the source
+    if "NotImplementedError" not in str(fallback_result):
+        return fallback_result
+
+    # Try to find the paper via the source's search endpoint to get a DOI
+    try:
+        papers = await async_search(searcher, paper_id, max_results=3)
+    except NotImplementedError:
+        logger.debug(
+            "%s search also unavailable for paper_id %s — "
+            "cannot route to publisher download.",
+            source, paper_id,
+        )
+        return {
+            "status": "not_implemented",
+            "source": source,
+            "paper_id": paper_id,
+            "message": (
+                f"{source.upper()} PDF download is not available through the "
+                "public API (requires institutional access). "
+                "No DOI could be resolved for publisher-download routing."
+            ),
+            "original_error": str(fallback_result),
+        }
+    except Exception as exc:
+        logger.debug(
+            "%s search failed for paper_id %s: %s", source, paper_id, exc,
+        )
+        return {
+            "status": "error",
+            "source": source,
+            "paper_id": paper_id,
+            "message": (
+                f"Could not search {source.upper()} for paper metadata. "
+                f"Error: {exc}"
+            ),
+        }
+
+    if not papers:
+        return {
+            "status": "not_found",
+            "source": source,
+            "paper_id": paper_id,
+            "message": (
+                f"No {source.upper()} paper found for identifier '{paper_id}'. "
+                "Cannot route to publisher download without a DOI."
+            ),
+        }
+
+    # Find the first paper with a DOI
+    doi = ""
+    title = ""
+    for paper in papers:
+        if isinstance(paper, dict):
+            doi = str(paper.get("doi") or "").strip()
+            title = str(paper.get("title") or "").strip()
+        else:
+            doi = str(getattr(paper, "doi", "") or "").strip()
+            title = str(getattr(paper, "title", "") or "").strip()
+        if doi:
+            break
+
+    if not doi:
+        return {
+            "status": "no_doi",
+            "source": source,
+            "paper_id": paper_id,
+            "papers_found": len(papers),
+            "message": (
+                f"Found {len(papers)} {source.upper()} paper(s) but none "
+                "had a DOI. Cannot route to publisher download."
+            ),
+        }
+
+    # Route to scansci-pdf publisher download via the publisher module
+    try:
+        from .tools.publisher import _download_publisher_by_doi
+
+        logger.info(
+            "Routing %s paper %s (DOI: %s) → scansci-pdf publisher download.",
+            source, paper_id, doi,
+        )
+        pub_result = await _download_publisher_by_doi(
+            doi=doi,
+            save_path=save_path,
+            title=title,
+        )
+        pub_result["source"] = source
+        pub_result["paper_id"] = paper_id
+        pub_result["routed_from"] = f"{source}_not_implemented"
+        return pub_result
+    except ImportError as exc:
+        logger.warning(
+            "Cannot import publisher module for %s routing: %s", source, exc,
+        )
+        return {
+            "status": "unavailable",
+            "source": source,
+            "paper_id": paper_id,
+            "doi": doi,
+            "message": (
+                f"Found DOI {doi} for {source.upper()} paper, but "
+                "scansci-pdf publisher download is not available. "
+                "Install: pip install scansci-pdf[cloakbrowser]"
+            ),
+        }
+    except Exception as exc:
+        logger.exception(
+            "Publisher-download routing failed for %s paper %s", source, paper_id,
+        )
+        return {
+            "status": "error",
+            "source": source,
+            "paper_id": paper_id,
+            "doi": doi,
+            "message": (
+                f"Publisher-download routing failed for {source.upper()} "
+                f"paper with DOI {doi}: {exc}"
+            ),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -4908,13 +5066,25 @@ if ieee_searcher is not None:
         Returns:
             str: Path to saved PDF or error message.
         """
-        return await _download_source_pdf(
+        # Try source-native download first
+        result = await _download_source_pdf(
             ieee_searcher,
             source="ieee",
             paper_id=paper_id,
             save_path=save_path,
             ctx=ctx,
         )
+        # If source-native download raised NotImplementedError (no institutional
+        # access), route through scansci-pdf publisher download using the DOI.
+        if isinstance(result, str):
+            return await _route_source_to_publisher_download(
+                searcher=ieee_searcher,
+                source="ieee",
+                paper_id=paper_id,
+                save_path=save_path,
+                fallback_result=result,
+            )
+        return result
 
     @mcp.tool()
     async def read_ieee_paper(
@@ -4930,13 +5100,54 @@ if ieee_searcher is not None:
         Returns:
             str: Extracted text content.
         """
-        return await _read_source_paper(
+        # Try source-native read first
+        result = await _read_source_paper(
             ieee_searcher,
             source="ieee",
             paper_id=paper_id,
             save_path=save_path,
             ctx=ctx,
         )
+        # On NotImplementedError, try publisher download then parse
+        if isinstance(result, str):
+            pub_result = await _route_source_to_publisher_download(
+                searcher=ieee_searcher,
+                source="ieee",
+                paper_id=paper_id,
+                save_path=save_path,
+                fallback_result=result,
+            )
+            if isinstance(pub_result, dict) and pub_result.get("status") == "ok":
+                pdf_path = pub_result.get("publisher_pdf", "")
+                if pdf_path:
+                    try:
+                        parse_result = await asyncio.to_thread(
+                            run_parse_pdf_with_mineru,
+                            pdf_path,
+                            paper_key_hint=f"ieee_{paper_id.replace('/', '_')}",
+                            source="ieee",
+                            paper_id=paper_id,
+                            title=pub_result.get("title", ""),
+                        )
+                        return {
+                            **pub_result,
+                            "parse_result": parse_result,
+                            "message": (
+                                "IEEE paper downloaded via publisher route "
+                                "and parsed with MinerU."
+                            ),
+                        }
+                    except Exception as exc:
+                        return {
+                            **pub_result,
+                            "parse_error": str(exc),
+                            "message": (
+                                "IEEE paper downloaded via publisher route, "
+                                "but parsing failed."
+                            ),
+                        }
+            return pub_result
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -4969,13 +5180,24 @@ if acm_searcher is not None:
         Returns:
             str: Path to saved PDF or error message.
         """
-        return await _download_source_pdf(
+        # Try source-native download first
+        result = await _download_source_pdf(
             acm_searcher,
             source="acm",
             paper_id=paper_id,
             save_path=save_path,
             ctx=ctx,
         )
+        # If NotImplementedError, route through scansci-pdf publisher download
+        if isinstance(result, str):
+            return await _route_source_to_publisher_download(
+                searcher=acm_searcher,
+                source="acm",
+                paper_id=paper_id,
+                save_path=save_path,
+                fallback_result=result,
+            )
+        return result
 
     @mcp.tool()
     async def read_acm_paper(
@@ -4991,19 +5213,144 @@ if acm_searcher is not None:
         Returns:
             str: Extracted text content.
         """
-        return await _read_source_paper(
+        # Try source-native read first
+        result = await _read_source_paper(
             acm_searcher,
             source="acm",
             paper_id=paper_id,
             save_path=save_path,
             ctx=ctx,
         )
+        # On NotImplementedError, try publisher download then parse
+        if isinstance(result, str):
+            pub_result = await _route_source_to_publisher_download(
+                searcher=acm_searcher,
+                source="acm",
+                paper_id=paper_id,
+                save_path=save_path,
+                fallback_result=result,
+            )
+            if isinstance(pub_result, dict) and pub_result.get("status") == "ok":
+                pdf_path = pub_result.get("publisher_pdf", "")
+                if pdf_path:
+                    try:
+                        parse_result = await asyncio.to_thread(
+                            run_parse_pdf_with_mineru,
+                            pdf_path,
+                            paper_key_hint=f"acm_{paper_id.replace('/', '_')}",
+                            source="acm",
+                            paper_id=paper_id,
+                            title=pub_result.get("title", ""),
+                        )
+                        return {
+                            **pub_result,
+                            "parse_result": parse_result,
+                            "message": (
+                                "ACM paper downloaded via publisher route "
+                                "and parsed with MinerU."
+                            ),
+                        }
+                    except Exception as exc:
+                        return {
+                            **pub_result,
+                            "parse_error": str(exc),
+                            "message": (
+                                "ACM paper downloaded via publisher route, "
+                                "but parsing failed."
+                            ),
+                        }
+            return pub_result
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Background scansci-pdf subprocess warmup (runs once at server startup)
+# ---------------------------------------------------------------------------
+
+def _warmup_scansci_pdf() -> None:
+    """Pre-warm the scansci-pdf MCP subprocess in a background thread.
+
+    The first ``_get_scansci_client()`` call takes 2-5 s because it starts
+    a ``python -m scansci_pdf.main run`` subprocess and waits for all
+    imports to complete.  Running this at startup moves that delay out of
+    the user's first publisher-download request.
+    """
+    import asyncio as _asyncio
+
+    async def _warm() -> None:
+        try:
+            from .tools.publisher import _get_scansci_client
+            logger.info("Pre-warming scansci-pdf subprocess …")
+            client = await _get_scansci_client()
+            if client is not None:
+                logger.info("scansci-pdf subprocess pre-warmed successfully.")
+            else:
+                logger.debug(
+                    "scansci-pdf warmup skipped (package not installed)."
+                )
+        except Exception as exc:
+            logger.debug("scansci-pdf warmup failed (non-blocking): %s", exc)
+
+    try:
+        _asyncio.run(_warm())
+    except Exception:
+        # Warmup failures are non-fatal — the first publisher-download
+        # request will create the client on demand as before.
+        pass
+
+
+def _startup_diagnostics() -> None:
+    """Log a one-line summary of configuration state on server start.
+
+    Writes to stderr (and logger) so it never pollutes the stdio MCP
+    transport channel.
+    """
+    from .engine.search import _parse_sources, _disabled_sources
+    from .config import get_env as _diag_env
+
+    profile = _diag_env("SEARCH_PROFILE", "fast").strip() or "fast"
+    enabled = _parse_sources("")
+    disabled = _disabled_sources()
+    mineru_key = bool((_diag_env("MINERU_API_KEY", "") or "").strip())
+    semsch_key = bool((_diag_env("SEMANTIC_SCHOLAR_API_KEY", "") or "").strip())
+    ieee_key = bool((_diag_env("IEEE_API_KEY", "") or "").strip())
+    acm_key = bool((_diag_env("ACM_API_KEY", "") or "").strip())
+    publisher_extra = False
+    try:
+        import scansci_pdf  # noqa: F401
+        publisher_extra = True
+    except ImportError:
+        pass
+
+    lines = [
+        "=" * 60,
+        "  paper-search-mcp v0.1.4  startup diagnostics",
+        f"  profile: {profile}  |  enabled sources: {', '.join(enabled) if enabled else '(none)'}",
+        f"  disabled sources: {', '.join(sorted(disabled)) if disabled else '(none)'}",
+        f"  mineru key: {'configured' if mineru_key else 'NOT SET (pypdf-only fallback)'}",
+        f"  semantic scholar key: {'configured' if semsch_key else 'not set (rate-limited)'}",
+        f"  ieee key: {'configured' if ieee_key else 'not set'}  |  acm key: {'configured' if acm_key else 'not set'}",
+        f"  publisher (scansci-pdf): {'installed' if publisher_extra else 'NOT INSTALLED (uv sync --extra publisher)'}",
+        "=" * 60,
+    ]
+    for line in lines:
+        print(line, file=__import__("sys").stderr)
+        logger.info(line.strip())
 
 
 def main():
     # Start idle-timeout monitor (daemon thread, shared across all transports).
     _monitor = threading.Thread(target=_idle_timeout_monitor, daemon=True, name="idle-timeout")
     _monitor.start()
+
+    # Pre-warm scansci-pdf subprocess in the background so the first
+    # publisher-download call does not pay the 2-5 s startup penalty.
+    _warmup = threading.Thread(
+        target=_warmup_scansci_pdf,
+        daemon=True,
+        name="scansci-warmup",
+    )
+    _warmup.start()
 
     # Wrap mcp.call_tool so every tool invocation refreshes the idle clock.
     _original_call_tool = mcp.call_tool
@@ -5013,6 +5360,8 @@ def main():
         return await _original_call_tool(name, arguments)
 
     mcp.call_tool = _tracked_call_tool  # type: ignore[method-assign]
+
+    _startup_diagnostics()
 
     transport = get_env("TRANSPORT", "stdio").strip().lower() or "stdio"
     if transport in {"http", "streamable_http", "streamable-http"}:

@@ -78,14 +78,14 @@ def register_parse_tools(
         download_strategy: str = "",
         use_libgen: Optional[bool] = None,
         libgen_base_url: str = "",
-    ) -> str:
+    ) -> Dict[str, Any]:
         fn = _download_with_fallback_path_fn
         if fn is None:
             from ..server import (  # noqa: PLC0415
                 _download_with_fallback_path as _fn,
             )
             fn = _fn
-        return await fn(
+        result = await fn(
             source=source,
             paper_id=paper_id,
             doi=doi,
@@ -97,6 +97,12 @@ def register_parse_tools(
             use_libgen=use_libgen,
             libgen_base_url=libgen_base_url,
         )
+        # Normalise legacy string returns from older server.py duplicate
+        if isinstance(result, str):
+            if os.path.exists(result):
+                return {"status": "ok", "pdf_path": result, "download_method": "fallback"}
+            return {"status": "download_failed", "message": result}
+        return result
 
     def _lazy_invalid_mcp_save_path(
         save_path: str,
@@ -269,7 +275,7 @@ def register_parse_tools(
         if invalid_save_path:
             return invalid_save_path
 
-        pdf_path = await _lazy_download_with_fallback_path(
+        result = await _lazy_download_with_fallback_path(
             source=source,
             paper_id=paper_id,
             doi=doi,
@@ -280,14 +286,29 @@ def register_parse_tools(
             use_libgen=use_libgen,
             libgen_base_url=libgen_base_url,
         )
-        if not isinstance(pdf_path, str) or not os.path.exists(pdf_path):
+        if isinstance(result, dict):
+            if result.get("status") != "ok":
+                return {
+                    "status": "download_failed",
+                    "source": source,
+                    "paper_id": paper_id,
+                    "doi": doi,
+                    "title": title,
+                    "message": result.get("message", "Download failed"),
+                    "tried_methods": result.get("tried_methods", []),
+                    "available_options": result.get("available_options", []),
+                }
+            pdf_path = result.get("pdf_path", "")
+        else:
+            pdf_path = result
+        if not pdf_path or not os.path.exists(str(pdf_path)):
             return {
                 "status": "download_failed",
                 "source": source,
                 "paper_id": paper_id,
                 "doi": doi,
                 "title": title,
-                "message": pdf_path,
+                "message": f"Download did not produce a valid file: {pdf_path}",
             }
 
         parse_result = await parse_pdf_with_mineru(

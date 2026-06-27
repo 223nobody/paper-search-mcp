@@ -93,7 +93,7 @@ def _search_cache_key(
 
 def _cached_search_result(cache_key: str) -> Optional[Dict[str, Any]]:
     """Return a cached search payload if it exists and is within TTL."""
-    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 60, minimum=0)
+    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)
     if ttl <= 0:
         return None
     entry = SEARCH_RESULT_CACHE.get(cache_key)
@@ -109,13 +109,21 @@ def _cached_search_result(cache_key: str) -> Optional[Dict[str, Any]]:
 
 
 def _store_search_result(cache_key: str, payload: Dict[str, Any]) -> None:
-    """Persist a search result payload in the in-memory cache."""
-    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 60, minimum=0)
+    """Persist a search result payload in the in-memory LRU-bounded cache."""
+    ttl = _env_int(SEARCH_CACHE_TTL_ENV, 300, minimum=0)
     if ttl <= 0:
         return
     papers = payload.get("papers", [])
     if not papers and payload.get("timed_out_sources"):
         return
+    # ── LRU eviction: keep at most 128 entries ──────────────────────
+    _MAX_CACHE_SIZE = 128
+    if len(SEARCH_RESULT_CACHE) >= _MAX_CACHE_SIZE:
+        oldest = min(
+            SEARCH_RESULT_CACHE,
+            key=lambda k: SEARCH_RESULT_CACHE[k].get("stored_at", 0),
+        )
+        SEARCH_RESULT_CACHE.pop(oldest, None)
     SEARCH_RESULT_CACHE[cache_key] = {
         "stored_at": time.time(),
         "payload": copy.deepcopy(payload),

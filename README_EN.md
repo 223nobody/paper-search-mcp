@@ -66,6 +66,7 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 ## 📑 Table of Contents
 
 - [🤖 One-Click AI Install](#-one-click-ai-install)
+- [📋 Quick Start & Core Docs](#-quick-start--core-docs)
 - [📖 Overview](#-overview)
 - [🎯 Project Principles](#-project-principles)
 - [✨ Features](#-features)
@@ -85,6 +86,22 @@ This writes the MCP server config to `~/.claude/mcp.json`, so it works from any 
 - [📋 TODO](#-todo)
 - [📜 License](#-license)
 - [🙏 Acknowledgements](#-acknowledgements)
+
+---
+
+## 📋 Quick Start & Core Docs
+
+Once the MCP is running, describe your needs in natural language. Example:
+
+> Search for 5 papers on "LLM agent skill", download PDFs and parse them in the background.
+
+> 📖 **[MCP 使用示例提示词.md](docs/MCP使用示例提示词.md)**  
+> **11 scenario-based** prompt templates — full workflow, search-only, publisher downloads, IEEE/ACM, local PDF parsing, diagnostics, and more. Includes parameter quick-reference and source configuration guide.
+
+> 🗂️ **[数据源配置指南.md](docs/数据源配置指南.md)**  
+> Complete reference for all 21 data sources — capability matrix, reliability scores, search profiles (fast/pdf-cs/agent-skill-fast/deep), API key setup, 5 recommended configurations, download fallback chain, full environment variable reference.
+
+**🔴 Read both documents before use** to get the best results from the MCP.
 
 ---
 
@@ -368,7 +385,15 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
     "paper-search-mcp": {
       "command": "uvx",
       "args": ["paper-search-mcp"],
-      "env": { "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com", "PAPER_SEARCH_MCP_CORE_API_KEY": "", "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "", "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "", "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "", "PAPER_SEARCH_MCP_IEEE_API_KEY": "", "PAPER_SEARCH_MCP_ACM_API_KEY": "" }
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
+        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
+        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
+        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
+      }
     }
   }
 }
@@ -390,7 +415,15 @@ uv tool install paper-search-mcp
     "paper-search-mcp": {
       "command": "uv",
       "args": ["tool", "run", "paper-search-mcp"],
-      "env": { "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com", "PAPER_SEARCH_MCP_CORE_API_KEY": "", "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "", "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "", "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "", "PAPER_SEARCH_MCP_IEEE_API_KEY": "", "PAPER_SEARCH_MCP_ACM_API_KEY": "" }
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
+        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
+        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
+        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
+      }
     }
   }
 }
@@ -412,7 +445,15 @@ pip install paper-search-mcp
     "paper-search-mcp": {
       "command": "python",
       "args": ["-m", "paper_search_mcp.server"],
-      "env": { "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com", "PAPER_SEARCH_MCP_CORE_API_KEY": "", "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "", "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "", "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "", "PAPER_SEARCH_MCP_IEEE_API_KEY": "", "PAPER_SEARCH_MCP_ACM_API_KEY": "" }
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
+        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
+        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
+        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
+      }
     }
   }
 }
@@ -466,7 +507,15 @@ docker run --rm -i \
     "paper-search-mcp": {
       "command": "docker",
       "args": ["run", "--rm", "-i", "paper-search-mcp"],
-      "env": { "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com", "PAPER_SEARCH_MCP_CORE_API_KEY": "", "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "", "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "", "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "", "PAPER_SEARCH_MCP_IEEE_API_KEY": "", "PAPER_SEARCH_MCP_ACM_API_KEY": "" }
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
+        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
+        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
+        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
+      }
     }
   }
 }
@@ -504,7 +553,15 @@ uv run -m paper_search_mcp.server
         "-m",
         "paper_search_mcp.server"
       ],
-      "env": { "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com", "PAPER_SEARCH_MCP_CORE_API_KEY": "", "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "", "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "", "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "", "PAPER_SEARCH_MCP_IEEE_API_KEY": "", "PAPER_SEARCH_MCP_ACM_API_KEY": "" }
+      "env": {
+        "PAPER_SEARCH_MCP_UNPAYWALL_EMAIL": "your@email.com",
+        "PAPER_SEARCH_MCP_CORE_API_KEY": "",
+        "PAPER_SEARCH_MCP_SEMANTIC_SCHOLAR_API_KEY": "",
+        "PAPER_SEARCH_MCP_ZENODO_ACCESS_TOKEN": "",
+        "PAPER_SEARCH_MCP_GOOGLE_SCHOLAR_PROXY_URL": "",
+        "PAPER_SEARCH_MCP_IEEE_API_KEY": "",
+        "PAPER_SEARCH_MCP_ACM_API_KEY": ""
+      }
     }
   }
 }
@@ -718,7 +775,7 @@ Three tools are available for downloading publisher final versions of cached arX
 - `batch_download_publisher_versions` — batch download publisher versions for multiple papers (comma-separated or `"all"`).
 - `check_publisher_setup` — check scansci-pdf environment (installation, Tor, CloakBrowser, API Keys).
 
-See the [Publisher-Version Download section](#-publisher-version-download-mcp-chaining) above for prompt examples and usage.
+For prompt examples, see [MCP 使用示例提示词.md](MCP使用示例提示词.md).
 
 Local optimization checks can be run without network access:
 
@@ -739,27 +796,7 @@ Upgrade cached arXiv papers to publisher final versions (Nature, Elsevier, Sprin
 
 **Key tools**: `download_publisher_version` (single), `batch_download_publisher_versions` (batch), `check_publisher_setup` (diagnostics).
 
-```text
-# Single paper
-Download the publisher final version for paper_key arxiv_1706.03762.
-
-# Search → download arXiv → get publisher version
-Search for "Chain-of-Thought Prompting", download and parse the arXiv version,
-then fetch the publisher final version.
-
-# Re-parse publisher PDF with MinerU
-Download the publisher version of arxiv_1810.04805 and re-parse with MinerU.
-
-# Batch download
-I have 3 arXiv papers cached: arxiv_2301, arxiv_2302, arxiv_2303.
-Batch download their publisher versions.
-
-# Diagnostics before download
-Check the publisher download setup first, then download arxiv_1706.03762.
-
-# Download all cached arXiv papers
-List all my parsed arXiv papers and download publisher versions for all of them.
-```
+> 📖 For detailed usage prompts, see [MCP 使用示例提示词.md](MCP使用示例提示词.md).
 
 > 💡 **How it works**: paper-search-mcp launches scansci-pdf as a subprocess via MCP Chaining (FastMCP Client + StdioTransport). It extracts the paper's DOI or arXiv ID from the cache and calls `scansci_pdf_smart_download`, which races 13+ sources in parallel. scansci-pdf is auto-installed via pip on first use; Tor is auto-downloaded and configured. Completely transparent to the user.
 
@@ -795,76 +832,21 @@ We welcome contributions! Here's how to get started:
 
 > ⚠️ **Current Status**: The built-in MCP Apps (checkbox paper selector, MinerU API Key setup form, etc.) can only be **fully rendered in Codex Desktop**. Other MCP Hosts (VS Code, Claude Desktop, Claude Code, etc.) do not yet support embedded MCP Apps rendering and will automatically fall back to a local browser page or numbered list selection.
 
-| Codex Desktop — Native MCP Apps Rendering | Codex Plugin Panel |
-|:---:|:---:|
+|        Codex Desktop — Native MCP Apps Rendering         |              Codex Plugin Panel               |
+| :------------------------------------------------------: | :-------------------------------------------: |
 | ![Codex Desktop MCP Apps](docs/images/codex_desktop.png) | ![Codex Plugin](docs/images/codex_plugin.png) |
 
 **MCP Apps Support by Platform:**
 
-| Platform | MCP Apps Rendering | Fallback |
-|----------|:------------------:|---------|
-| **Codex Desktop** | ✅ Full support | — |
-| VS Code (Codex / Copilot) | ❌ Not supported | Local browser checkbox page |
-| Claude Desktop | ❌ Not supported | Numbered list fallback |
-| Claude Code (CLI) | ❌ Not supported | Numbered list fallback / TUI selector |
-| Cursor | ❌ Not supported | Numbered list fallback |
+| Platform                  | MCP Apps Rendering | Fallback                              |
+| ------------------------- | :----------------: | ------------------------------------- |
+| **Codex Desktop**         |  ✅ Full support   | —                                     |
+| VS Code (Codex / Copilot) |  ❌ Not supported  | Local browser checkbox page           |
+| Claude Desktop            |  ❌ Not supported  | Numbered list fallback                |
+| Claude Code (CLI)         |  ❌ Not supported  | Numbered list fallback / TUI selector |
+| Cursor                    |  ❌ Not supported  | Numbered list fallback                |
 
 > 💡 When `render_paper_selection_app` returns but no checkbox UI appears, the Agent will automatically call `open_paper_selection_page` to open the selection page in the system browser.
-
----
-
-## 📋 TODO
-
-### ✅ Planned Academic Platforms
-
-- [x] arXiv
-- [x] PubMed
-- [x] bioRxiv
-- [x] medRxiv
-- [x] Google Scholar
-- [x] IACR ePrint Archive
-- [x] Semantic Scholar
-- [x] Crossref
-- [x] PubMed Central (PMC)
-- [x] CORE
-- [x] Europe PMC
-- [x] Sci-Hub warning and enablement docs
-
-### ✅ Development Tasks
-
-- [x] Fix Async search bugs and ensure reliable fast MCP events
-- [x] End-to-End full pipeline testing script (search, parse, download)
-- [x] Establish two-layer federated architecture (Layer 1 tool: `search_papers`)
-- [x] Ensure pervasive DOI extraction across metadata fields & abstract fallbacks
-- [ ] Citation graph & Paper relation context feature
-- [x] Expand full-stack OpenAlex provider
-
-### ✅ Priority Free and Open Sources
-
-- [x] PubMed Central (PMC)
-- [x] CORE
-- [x] OpenAlex
-- [x] Europe PMC
-- [x] OpenAIRE
-- [x] dblp
-- [x] CiteSeerX
-- [x] DOAJ
-- [x] BASE
-- [x] Zenodo
-- [x] HAL
-- [x] SSRN (discovery + best-effort full-text)
-- [x] Unpaywall (standalone DOI search source)
-
-### 🔜 Optional and Non-Core Integrations
-
-- [ ] ResearchGate
-- [ ] JSTOR
-- [ ] ScienceDirect
-- [ ] Springer Link
-- [x] IEEE Xplore (optional skeleton — activate with `IEEE_API_KEY`)
-- [x] ACM Digital Library (optional skeleton — activate with `ACM_API_KEY`)
-- [ ] Web of Science
-- [ ] Scopus
 
 ---
 
@@ -909,7 +891,7 @@ This fork and extension benefited from the following open-source projects and pr
 | [Rimagination/scansci-pdf](https://github.com/Rimagination/scansci-pdf)             | Reference ideas for scientific PDF processing and extraction-oriented workflows                              |
 | [yilewang/llm-for-zotero](https://github.com/yilewang/llm-for-zotero)               | Reference implementation direction for integrating MinerU-style PDF parsing into a research-reading workflow |
 | [opendatalab/MinerU](https://github.com/opendatalab/MinerU)                         | The document parsing engine used for high-quality PDF-to-Markdown/JSON/assets extraction                     |
-| [mcp-use/mcp-use](https://github.com/mcp-use/mcp-use)                               | Reference for MCP server architecture and best practices                                                    |
+| [mcp-use/mcp-use](https://github.com/mcp-use/mcp-use)                               | Reference for MCP server architecture and best practices                                                     |
 
 ---
 

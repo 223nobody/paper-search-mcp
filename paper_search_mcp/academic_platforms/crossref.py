@@ -4,23 +4,39 @@ from datetime import datetime
 import requests
 import time
 from ..paper import Paper
+from ..config import get_env
 from .base import PaperSource
 import logging
 
 logger = logging.getLogger(__name__)
 
+_CROSSREF_MAILTO = "mailto:paper-search@example.org"
+
+
+def _crossref_mailto() -> str:
+    """Return the CrossRef polite-pool email, preferring UNPAYWALL_EMAIL."""
+    email = (get_env("UNPAYWALL_EMAIL") or "").strip()
+    if email:
+        return f"mailto:{email}"
+    email = (get_env("PAPER_SEARCH_MCP_UNPAYWALL_EMAIL") or "").strip()
+    if email:
+        return f"mailto:{email}"
+    return _CROSSREF_MAILTO
+
+
 class CrossRefSearcher(PaperSource):
     """Searcher for CrossRef database papers"""
-    
+
     BASE_URL = "https://api.crossref.org"
-    
-    # User agent for polite API usage as per CrossRef etiquette
-    USER_AGENT = "paper-search-mcp/0.1.3 (https://github.com/Dragonatorul/paper-search-mcp; mailto:paper-search@example.org)"
-    
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': self.USER_AGENT,
+            'User-Agent': (
+                "paper-search-mcp/0.1.4 "
+                "(https://github.com/openags/paper-search-mcp; "
+                f"{_crossref_mailto()})"
+            ),
             'Accept': 'application/json'
         })
     
@@ -53,7 +69,7 @@ class CrossRefSearcher(PaperSource):
                 params['order'] = kwargs['order']
                 
             # Add polite pool parameter
-            params['mailto'] = 'paper-search@example.org'
+            params['mailto'] = _crossref_mailto().removeprefix("mailto:")
             
             url = f"{self.BASE_URL}/works"
             response = self.session.get(url, params=params, timeout=30)
@@ -274,7 +290,7 @@ class CrossRefSearcher(PaperSource):
         """
         try:
             url = f"{self.BASE_URL}/works/{doi}"
-            params = {'mailto': 'paper-search@example.org'}
+            params = {'mailto': _crossref_mailto().removeprefix("mailto:")}
             
             response = self.session.get(url, params=params, timeout=30)
             

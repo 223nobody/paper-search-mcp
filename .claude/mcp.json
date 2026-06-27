@@ -5,6 +5,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--frozen",
         "--directory",
         "C:\\code\\paper-search-mcp",
         "-m",

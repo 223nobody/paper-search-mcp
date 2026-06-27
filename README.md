@@ -25,60 +25,52 @@ git clone https://github.com/223nobody/paper-search-mcp.git ~/code/paper-search-
 
 ## 2. 检测平台并安装依赖
 - 检查是否安装了 uv（Python 包管理器），如未安装则先安装。
-- 进入项目目录，运行 `uv sync` 安装依赖。
+- 进入项目目录，运行 `uv sync` 安装核心依赖。
+- 运行 `uv sync --extra publisher` 安装 scansci-pdf。
+  如果 scansci-pdf 在首次使用时自动安装失败，可手动执行：
+  `uv pip install scansci-pdf[cloakbrowser]`
+  `playwright install chromium`
 
 ## 3. 配置 .env
 - 如果 .env 不存在，从 .env.example 复制一份。
 - 引导用户填写必要的 API Key：
-  - MinerU API Key（重要——高质量 PDF 解析，免费注册 https://mineru.net）
-  - Semantic Scholar API Key（可选——提升搜索速率限制）
+  - MinerU API Key（免费注册入口 https://mineru.net）
+  - Semantic Scholar API Key（提升搜索速率限制，出版商 DOI 查找也依赖此 Key）
   - CORE API Key（可选——下载回退）
-- 其余保持默认。
+  - Elsevier API Key（可选——爬取 Elsevier/ScienceDirect 出版物，提升出版商下载成功率）
+- 其余保持默认即可。默认的 pdf-cs 搜索 profile 只启用 arxiv/crossref/openalex/dblp 四个源（CS 领域优先）。
+  如需启用更多数据源（如 semantic、pubmed），修改 PAPER_SEARCH_MCP_DISABLED_SOURCES 去掉对应源名称。
 
 ## 4. 注册为全局 MCP Server
 运行安装脚本 `python scripts/install-mcp-global.py`。
 这会将 MCP Server 配置写入 `~/.claude/mcp.json`，之后从任意工作区打开 Claude Code 都能使用，无需手动编辑 JSON。
 （可选参数：`--dry-run` 预览变更、`--force` 强制覆盖、`--uninstall` 卸载）
 
-## 5. 安装 Skill（可选但推荐）
+## 5. 安装 Skill
 - Claude Code：将 .claude/skills/paper-search/SKILL.md 复制到 ~/.claude/skills/paper-search/SKILL.md
 - Codex：将 .codex/skills/paper-search/SKILL.md 复制到 ~/.codex/skills/paper-search/SKILL.md
 
 ## 6. 验证安装
 - 运行 `uv run -m paper_search_mcp.server` 确认服务启动成功。
 - 看到工具注册列表后，告知安装完成，列出核心功能，并提供几个示例 prompt。
+- 建议首次使用时调用 `diagnose_paper_sources` 和 `mineru_health_check` 确认环境配置状态。
 ```
 
 > 💡 **原理**：以上 prompt 就是给 AI Agent 的"安装脚本"。你不需要手动执行任何步骤——只需粘贴到 Claude Code，AI 会自动检测平台、克隆代码、配置环境、注册 MCP、验证安装。
 
 ---
 
-### 安装后使用
+## 📋 快速开始 & 核心文档
 
-MCP 可用后，只需用自然语言描述需求即可：
+MCP 可用后，只需用自然语言描述需求即可，Agent 会自动调用对应工具。
 
-```text
-# 最常用：检索 → 下载 → 解析，一句话搞定
-帮我找 5 篇关于 "large language model agent" 的论文，下载 PDF 并后台解析。
-```
+> 📖 **[MCP 使用示例提示词.md](docs/MCP使用示例提示词.md)**  
+> **11 个场景**的精确提示词模板 —— 一站式全流程、只检索、出版商下载、IEEE/ACM 搜索、解析本地 PDF、环境诊断等。附带参数速查表和搜索源配置说明。
 
-Agent 会自动调用 `paper_research_workflow` 完成全流程，返回 `job_id` 后用 `get_parse_job_status` 查询解析进度。
+> 🗂️ **[数据源配置指南.md](docs/数据源配置指南.md)**  
+> 21 个数据源的完整说明 —— 能力矩阵、可靠性评分、搜索配置文件（fast/pdf-cs/agent-skill-fast/deep）、API Key 配置汇总、5 种推荐配置方案、下载 Fallback 链详解、环境变量完整参考。
 
-```text
-# 只检索，先看看有什么
-帮我搜索 "knowledge graph reasoning" 的论文，从 arxiv 和 semantic 各找 5 篇。
-
-# 手动挑选后再下载解析
-帮我搜索 "federated learning privacy" 论文 10 篇，让我挑选后再下载解析。
-
-# 解析本地 PDF
-帮我把桌面上的 paper.pdf 用 MinerU 解析了。
-
-# 搜索已解析的论文内容
-在我解析过的论文里搜索 "attention mechanism"。
-```
-
-> 更多提示词示例见下方 [MCP 提示词示例](#mcp-提示词示例) 章节。
+**🔴 使用前务必阅读以上两份文档，让 AI Agent 最大程度发挥本 MCP 的全部能力。**
 
 ---
 
@@ -133,19 +125,19 @@ Agent 会自动调用 `paper_research_workflow` 完成全流程，返回 `job_id
 
 > ⚠️ **当前状态**：内置 MCP Apps（checkbox 论文选择器、MinerU API Key 配置弹窗等）目前**仅 Codex Desktop** 可以完整渲染。其他 MCP Host（VS Code、Claude Desktop、Claude Code 等）暂不支持 MCP Apps 内嵌渲染，会自动降级为本地浏览器 fallback 或编号列表选择。
 
-| Codex Desktop — MCP Apps 原生渲染 | Codex 插件面板 |
-|:---:|:---:|
+|            Codex Desktop — MCP Apps 原生渲染             |                Codex 插件面板                 |
+| :------------------------------------------------------: | :-------------------------------------------: |
 | ![Codex Desktop MCP Apps](docs/images/codex_desktop.png) | ![Codex Plugin](docs/images/codex_plugin.png) |
 
 **各平台 MCP Apps 支持情况：**
 
-| 平台 | MCP Apps 渲染 | 降级方案 |
-|------|:------------:|---------|
-| **Codex Desktop** | ✅ 完整支持 | — |
-| VS Code（Codex / Copilot） | ❌ 不支持 | 本地浏览器 checkbox 页面 |
-| Claude Desktop | ❌ 不支持 | 编号列表 fallback |
-| Claude Code（CLI） | ❌ 不支持 | 编号列表 fallback / TUI 选择器 |
-| Cursor | ❌ 不支持 | 编号列表 fallback |
+| 平台                       | MCP Apps 渲染 | 降级方案                       |
+| -------------------------- | :-----------: | ------------------------------ |
+| **Codex Desktop**          |  ✅ 完整支持  | —                              |
+| VS Code（Codex / Copilot） |   ❌ 不支持   | 本地浏览器 checkbox 页面       |
+| Claude Desktop             |   ❌ 不支持   | 编号列表 fallback              |
+| Claude Code（CLI）         |   ❌ 不支持   | 编号列表 fallback / TUI 选择器 |
+| Cursor                     |   ❌ 不支持   | 编号列表 fallback              |
 
 > 💡 当 `render_paper_selection_app` 返回但未显示 checkbox UI 时，Agent 会自动调用 `open_paper_selection_page` 在系统浏览器中打开选择页面。
 
@@ -356,46 +348,23 @@ C:\Users\<你的用户名>\Desktop\papers
 
 对 VS Code Copilot Agent Mode、Claude Desktop、Claude Code 等 MCP Host，推荐优先调用 `paper_research_workflow`，它把检索、排序、下载和解析任务都留在 MCP 内完成，避免 Agent 打开终端或执行 CLI 命令。
 
-**提示词示例**：
-
-```text
-# 一站式全流程（最常用）
-帮我找 5 篇关于 "agentic spatial reasoning" 的论文，从 arxiv 和 semantic 找，下载并后台解析。
-
-# 其他场景
-搜索 "multi-agent reinforcement learning" 论文，先看看有哪些，暂不下载。
-从 arxiv 找 3 篇 "transformer model compression" 的论文，下载 PDF，不需要解析。
-搜索 "diffusion model safety" 论文 10 篇，让我手动挑选需要下载解析的。
-找 2 篇 "quantum error correction" 论文，下载并同步解析，我要立刻看。
-帮我找 2024 年以来关于 "mamba state space model" 的高引论文 5 篇，下载并解析。
-```
-
-常用参数：`intent="search_only"` 仅检索；`intent="search_download"` 检索并下载；`intent="search_download_parse"` 检索下载并后台解析；`selection_mode="manual"` 先选后下载；`parse_execution="background"` 后台解析（返回 job_id）；`parse_execution="sync"` 同步等待解析；`parse_execution="none"/"skip"` 只下载不解析。
+常用参数：`intent="search_only"` 仅检索；`intent="search_download"` 检索并下载；`intent="search_download_parse"` 检索下载并后台解析；`selection_mode="manual"` 先选后下载；`parse_execution="background"` 后台解析（返回 job_id）；`parse_execution="sync"` 同步等待解析；`parse_execution="none"` 只下载不解析。`ranking_profile="agent-skill"` 适用 LLM Agent/Skill 领域。
 
 除非用户明确指定目录，不要传 `save_path`；默认保存到 `~/Desktop/papers`。
+
+> 提示词示例见 [MCP 使用示例提示词.md](MCP使用示例提示词.md)
 
 ### 2. 🔍 只检索论文
 
 适合只想拿到论文条目、标题、作者、DOI、PDF 链接等元数据的场景。
 
-**提示词示例**：
-
-```text
-搜索 "multi objective reinforcement learning" 论文，arxiv 和 semantic 各 3 篇。
-帮我搜一下最近 "code generation with LLM" 的论文，从 dblp 和 crossref 找。
-全面搜索 "neural radiance field" 相关论文，用 deep 来源。
-```
+> 提示词示例见 [MCP 使用示例提示词.md](MCP使用示例提示词.md) 场景 2。
 
 ### 3. ✅ 检索后弹出多选解析
 
 如果 MCP 客户端支持 Elicitation，例如 VS Code Copilot Agent Mode，并且客户端把 `array + enum` 渲染为多选控件，就可以看到 checkbox 或多选列表。用户选择论文后，MCP Server 会下载并解析所选条目。
 
-**提示词示例**：
-
-```text
-搜索 "agentic spatial reasoning" 论文，弹出多选让我挑选要解析的。
-帮我找几篇 "prompt engineering" 的论文，让我勾选需要下载解析的。
-```
+> 提示词示例见 [MCP 使用示例提示词.md](MCP使用示例提示词.md) 场景 3。
 
 ### 3. 🖥️ MCP Apps checkbox UI
 
@@ -406,13 +375,6 @@ C:\Users\<你的用户名>\Desktop\papers
 ### 4. 🔢 无 checkbox UI 时的编号选择
 
 先生成后端选择 session，获得 `selection_token` 和编号后的论文列表，然后按编号解析。
-
-**提示词示例**：
-
-```text
-搜索 "chain of thought prompting" 论文，给我一个编号列表，我选好编号后下载解析。
-帮我检索 "parameter efficient fine-tuning" 的论文并编号，我选第 1、3、5 篇来解析。
-```
 
 `selected_indices` 支持：
 
@@ -428,14 +390,6 @@ C:\Users\<你的用户名>\Desktop\papers
 - 各平台 `read_*` 工具中发生 PDF 下载的情况。
 - `download_with_fallback`。
 
-**提示词示例**：
-
-```text
-帮我下载这篇 arXiv 论文 2301.12345。
-下载这篇论文并解析：10.1038/s41586-023-06967-4。
-帮我下载论文 "Attention Is All You Need"，优先走开放获取渠道，获取不到就用 Sci-Hub。
-```
-
 保存后的处理规则：
 
 - 单篇/≤10 篇自动解析所有可解析 PDF（`parse_prompt.interaction` 为 `auto_parse_saved_pdfs`）。
@@ -445,147 +399,43 @@ C:\Users\<你的用户名>\Desktop\papers
 
 如果你已经有本地 PDF，可以直接调用 `parse_pdf_with_mineru`。
 
-**提示词示例**：
-
-```text
-帮我把桌面上的 paper.pdf 用 MinerU 解析了。
-解析 C:\Users\me\Desktop\draft.pdf，paper_key 设为 my_draft，用 extract 模式。
-把 ~/Desktop/papers/ 下面所有 PDF 都批量解析了。
-```
-
 解析完成后在 PDF 同目录生成 `example_mineru/`，开启 `PAPER_SEARCH_MCP_MINERU_EXPORT_ZIP=true` 时额外生成同名 zip。`.paper_search_cache` 只保留轻量索引。
 
 ---
 
-## 📝 MCP 提示词示例
+## 📝 MCP 使用提示词
 
-在与 LLM Agent（如 Claude Code、Claude Desktop、VS Code Copilot）对话时，可以直接用自然语言描述需求，Agent 会自动调用对应的 MCP 工具。以下按功能分类给出提示词参考。
-
-### 🔍 检索论文
+快速上手示例，直接粘贴到 Claude Code / VS Code Copilot 中使用：
 
 ```text
-# 基础检索
-帮我搜索关于 "multi-agent reinforcement learning" 的论文，从 arxiv 和 semantic scholar 各找 5 篇。
+# 一站式：搜索 LLM agent skill 论文 → 下载 PDF → 后台解析
+用 paper-search-mcp 搜索 5 篇 "LLM agent skill" 论文，下载并后台解析。
 
-# 限定时段 / 指定多个来源
-帮我找 2024 年以来关于 "diffusion model image generation" 的高引用论文。
-搜索 "large language model reasoning" 相关论文，来源覆盖 arxiv、semantic、dblp 和 crossref。
+# 只看不下载：先浏览再决定
+用 paper-search-mcp 搜索 "multi-agent reinforcement learning"，
+只看结果不下载。
 
-# 广泛检索 / 只看不下载
-全面搜索 "federated learning privacy" 相关论文，使用 deep 来源覆盖。
-帮我搜一下 "graph neural network" 的最新论文，先看看有哪些，暂不下载。
+# 按年份过滤 + 手动挑选
+用 paper-search-mcp 搜索 "federated learning" 2024 年的论文，
+让我手动挑选后再下载解析。
+
+# 已知 arXiv ID 直接下载
+用 paper-search-mcp 下载 arXiv 论文 2301.12345。
+
+# 批量获取出版商正式版（Nature/Elsevier/Springer）
+用 paper-search-mcp 批量下载这些论文的出版商版本：
+arxiv_1706.03762, arxiv_1810.04805
+
+# 解析本地已有 PDF
+用 paper-search-mcp 解析 ~/Desktop/paper.pdf，mode='auto'。
+
+# 全文搜索已解析的论文
+用 paper-search-mcp 在我已解析的论文中搜索 "attention mechanism"。
 ```
 
-### 🚀 一站式检索 + 下载 + 解析
+完整的场景化提示词模板、参数说明和源配置速查已整理为独立文档：
 
-```text
-# 自动完成全流程（最常用）
-帮我找 5 篇关于 "agentic spatial reasoning" 的论文，下载 PDF 并解析。
-
-# 指定来源和数量 / 只下载不解析
-搜索 "transformer model compression" 相关论文，从 arxiv 和 semantic 各找 3 篇，下载并后台解析。
-帮我找 3 篇 "continual learning" 的论文并下载 PDF，不需要解析。
-
-# 同步等待 / 限定年份
-搜索 "quantum machine learning" 论文 2 篇，下载后同步解析，我要立刻看结果。
-帮我找 2023 年以来关于 "instruction tuning" 的 5 篇论文，下载并解析。
-```
-
-### ✅ 手动选择论文后解析
-
-```text
-# 先搜再选
-帮我搜索 "retrieval augmented generation" 的论文，让我手动选择哪些需要下载解析。
-
-# 从候选列表中选择
-搜索 "knowledge graph reasoning" 论文 10 篇，列出让我挑选后再下载解析。
-```
-
-### 📥 下载指定论文
-
-```text
-# 按不同方式下载
-帮我下载这篇 arXiv 论文：2301.12345。
-下载这篇论文：10.1038/s41586-023-06967-4。
-帮我下载论文 "Attention Is All You Need"，优先走开放获取，获取不到就用 Sci-Hub 试试。
-```
-
-### 🧪 解析已有 PDF
-
-```text
-帮我把桌面上的 example.pdf 用 MinerU 解析一下。
-帮我把 ~/Desktop/papers/ 目录下所有 PDF 都解析了。
-用 MinerU extract 模式解析 C:\Users\me\Desktop\paper.pdf，paper_key 设为 my_paper。
-帮我把这个 PDF 的文本提取出来就行，不用版面分析：~/Desktop/draft.pdf
-```
-
-### 📖 查看已解析论文
-
-```text
-我有哪些论文已经解析过了？
-帮我把 my_paper 这篇论文的解析结果展示出来。
-把 example 论文的 content_list.json 给我看看。
-列出 example 论文解析出的图片和表格资源。
-```
-
-### 🔎 搜索已解析内容
-
-```text
-在我已解析的所有论文中搜索 "contrastive learning"。
-在 example 这篇论文中搜索 "experiment setup"。
-重建解析缓存索引，然后搜索 "attention mechanism"。
-```
-
-### 🕐 后台任务管理
-
-```text
-论文解析任务 job_xxx 完成了吗？
-当前有哪些后台解析任务在运行？
-取消 job_xxx 这个解析任务。
-job_xxx 之前中断了，帮我恢复继续解析。
-```
-
-### 💾 管理缓存
-
-```text
-帮我清理一下解析缓存中已经失效的条目（先 dry-run 看看）。
-确认清理那些 PDF 已经不存在的缓存条目。
-删除 example 这篇论文的解析缓存。
-重建解析缓存的全量 FTS 索引。
-```
-
-### 🩺 环境检查与配置
-
-```text
-检查一下 MinerU 解析环境是否正常。
-诊断一下当前各学术来源的 API key 配置和可用状态。
-列出所有支持的学术来源及其搜索/下载能力。
-帮我配置 MinerU API Key。
-查看下载健康统计，哪些下载渠道成功率最高。
-```
-
-### 🚀 进阶用法
-
-```text
-# 指定排序策略
-搜索 "LLM agent tool use" 论文 5 篇，用 agent-skill 排序策略。
-
-# 指定来源组合
-搜索 "program synthesis" 论文，只从 arxiv、dblp 和 semantic 找。
-搜索 "protein structure prediction" 论文，从 pubmed、biorxiv 和 europepmc 找。
-
-# 批量操作与断点续传
-恢复上次中断的下载任务，继续下载 session search_20260610_xxxxxxxx 中的论文。
-解析 session search_20260610_xxxxxxxx 中编号 1 到 10 的论文，用 extract 模式后台执行。
-后台解析任务 job_xxx 中断了，帮我恢复继续解析剩余论文。
-
-# 缓存维护
-清理解析缓存中 PDF 已失效的条目，先 dry-run 让我看看哪些会被删除。
-确认清理，执行 apply 删除那些失效条目。
-重建解析缓存的 FTS 索引。
-```
-
----
+> 📖 **[MCP 使用示例提示词.md](MCP使用示例提示词.md)** — 包含 11 个场景的精确提示词、`paper_research_workflow` / `download_publisher_version` 等工具的参数表、搜索源配置速查。
 
 ---
 
@@ -619,43 +469,23 @@ job_xxx 之前中断了，帮我恢复继续解析。
 
 ## 🎬 典型使用场景
 
-下面按使用场景列出推荐的工具调用方式和对应的自然语言提示词。
+以下列出各场景的推荐工具调用方式。完整提示词见 [MCP 使用示例提示词.md](MCP使用示例提示词.md)。
 
 ### 🔍 快速找论文（只看不下载）
 
 **推荐方式**：`paper_research_workflow(intent="search_only")` 或直接调用 `search_papers`。
 
-```text
-帮我搜索 "multi-agent reinforcement learning" 的论文，从 arxiv 和 semantic 各找 5 篇，先看看有什么。
-帮我搜一下最近关于 "LLM agent tool use" 的论文，暂不下载。
-```
-
 ### 🚀 找论文 + 下载 + 解析（全自动）
 
 **推荐方式**：`paper_research_workflow(intent="search_download_parse", parse_execution="background")`，返回 `job_id` 后用 `get_parse_job_status` 查询。
-
-```text
-帮我找 5 篇关于 "diffusion model image generation" 的论文，下载 PDF 并后台解析。
-搜索 "instruction tuning" 论文 3 篇，从 arxiv 和 semantic 找，下载后解析。
-```
 
 ### ✅ 找论文 + 手动选择后再解析
 
 **推荐方式**：`paper_research_workflow(selection_mode="manual")` 或 `search_papers_for_parsing` + checkbox/编号。
 
-```text
-帮我搜索 "retrieval augmented generation" 的论文 10 篇，让我手动选择哪些需要下载解析。
-搜索 "graph neural network" 论文，列出候选让我挑选。
-```
-
 ### ⚡ 保存 PDF 后自动解析 / 大批量选择
 
 调用单篇 `download_*`、`download_with_fallback` 或 `download_selected_papers` 时，≤10 篇可自动提交 MinerU 后台解析；>10 篇先返回 checkbox 或编号 fallback，不会提前下载。用户提交选择后，下载-only 只下载；下载并解析会走 `download_and_parse_selected_papers`，下载选中 PDF 后立即启动 MinerU。
-
-```text
-帮我下载这篇 arXiv 论文 2301.12345。
-下载这篇论文并解析：10.1038/s41586-023-06967-4。
-```
 
 ### 🖥️ 客户端 UI 适配
 
@@ -667,45 +497,21 @@ job_xxx 之前中断了，帮我恢复继续解析。
 
 **推荐方式**：`parse_pdf_with_mineru` 或 `parse_pdfs_with_mineru`。
 
-```text
-帮我把桌面上的 example.pdf 用 MinerU 解析一下。
-把 ~/Desktop/papers/ 下所有 PDF 都解析了。
-```
-
 ### 📖 查看已解析论文
 
 **推荐方式**：`list_parsed_papers` / `get_parsed_paper` / `get_paper_assets`。
-
-```text
-我有哪些论文已经解析过了？把 example 的解析结果展示出来。列出 example 的图片和表格。
-```
 
 ### 🔎 搜索已解析内容（构建知识库）
 
 **推荐方式**：`search_parsed_papers` / `search_parsed_paper`。
 
-```text
-在我已解析的所有论文中搜索 "contrastive learning" 相关内容。
-```
-
 ### 🩺 环境配置与诊断
 
-**推荐方式**：`mineru_setup_status` / `mineru_health_check` / `diagnose_paper_sources`。
-
-```text
-检查一下 MinerU 解析环境是否正常，API Key 配好了吗？
-诊断一下各学术来源的可用状态。
-帮我配置 MinerU API Key。
-```
+**推荐方式**：`mineru_setup_status` / `mineru_health_check` / `diagnose_paper_sources` / `check_publisher_setup`。
 
 ### 💾 缓存维护
 
 **推荐方式**：`cleanup_stale_cache_entries` / `cleanup_redundant_cache_artifacts` / `index_parsed_cache`。
-
-```text
-清理解析缓存中 PDF 已失效的条目（先 dry-run 看看）。
-重建解析缓存的 FTS 索引。
-```
 
 ### 🏢 获取出版商发行版 PDF（进阶）
 
@@ -715,36 +521,11 @@ job_xxx 之前中断了，帮我恢复继续解析。
 
 **推荐工具**：`download_publisher_version`（单篇）、`batch_download_publisher_versions`（批量）、`check_publisher_setup`（诊断）。
 
-```text
-# 单篇下载出版商版本
-帮我下载 paper_key 为 arxiv_1706.03762 这篇论文的出版商最终发行版
-
-# 先搜索，后下载出版商版本
-搜索论文 "Chain-of-Thought Prompting Elicits Reasoning"，下载并解析 arXiv 版本，然后帮我获取出版商最终发行版
-
-# 下载后重新用 MinerU 解析出版商 PDF
-用 download_publisher_version 下载 arxiv_1810.04805 的 publisher 版本，下载后同时用 MinerU 解析
-
-# 批量下载出版商版本
-我已经解析了 5 篇 arXiv 论文，paper_keys 是 arxiv_2301, arxiv_2302, arxiv_2303，帮我批量下载它们的出版商发行版
-
-# 检查配置后下载
-先帮我检查一下 publisher 下载的环境配置是否就绪，然后下载 arxiv_1706.03762 的出版商版本
-
-# 列出所有 arXiv 论文并全部下载出版商版本
-列出我所有已解析的 arXiv 论文，然后全部下载出版商版本
-```
-
 > 💡 **工作原理**：paper-search-mcp 通过 MCP Chaining 技术，在工具内部启动 scansci-pdf 子进程，提取论文的 DOI 或 arXiv ID 后调用 `scansci_pdf_smart_download`。scansci-pdf 并发尝试出版商直链、Elsevier API、Unpaywall、Sci-Hub 等 13+ 源，返回成功下载的 PDF。scansci-pdf 首次使用自动通过 pip 安装，Tor 自动下载配置，完全无感。
 
 ### 🔬 排查解析质量
 
-优先检查 `<pdf 文件名>_mineru/manifest.json`，确认使用的后端是 `extract`、`local_api`、`cli` 还是 `pypdf`。可查看下载健康统计了解各渠道成功率。
-
-```text
-查一下这篇论文是用什么后端解析的。
-查看下载健康统计，哪个渠道成功率最高？
-```
+优先检查 `<pdf 文件名>_mineru/manifest.json`，确认使用的后端是 `extract`、`local_api`、`cli` 还是 `pypdf`。可调用 `get_download_health_stats` 查看下载健康统计了解各渠道成功率。
 
 ---
 

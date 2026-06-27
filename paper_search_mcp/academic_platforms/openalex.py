@@ -3,10 +3,24 @@ from datetime import datetime
 import requests
 import logging
 from ..paper import Paper
+from ..config import get_env
 from .base import PaperSource
 from ..utils import extract_doi
 
 logger = logging.getLogger(__name__)
+
+_OPENALEX_DEFAULT_MAILTO = "mailto:openags@example.com"
+
+
+def _openalex_mailto() -> str:
+    """Return the OpenAlex polite-pool email, preferring UNPAYWALL_EMAIL."""
+    email = (get_env("UNPAYWALL_EMAIL") or "").strip()
+    if email:
+        return f"mailto:{email}"
+    email = (get_env("PAPER_SEARCH_MCP_UNPAYWALL_EMAIL") or "").strip()
+    if email:
+        return f"mailto:{email}"
+    return _OPENALEX_DEFAULT_MAILTO
 
 
 class OpenAlexSearcher(PaperSource):
@@ -18,7 +32,7 @@ class OpenAlexSearcher(PaperSource):
         self.session = requests.Session()
         # OpenAlex encourages providing an email in User-Agent for the "polite pool"
         self.session.headers.update(
-            {"User-Agent": "paper-search-mcp/1.0 (mailto:openags@example.com)"}
+            {"User-Agent": f"paper-search-mcp/1.0 ({_openalex_mailto()})"}
         )
 
     def _reconstruct_abstract(self, inverted_index: dict) -> str:

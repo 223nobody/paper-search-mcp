@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 from typing import Any, Dict, List
 
 from .config import get_env
@@ -119,28 +118,6 @@ def _parse_sources(sources: str) -> List[str]:
     return [source for source in _engine_parse_sources(sources) if source in SEARCHERS]
 
 
-def _paper_unique_key(paper: Dict[str, Any]) -> str:
-    doi = (paper.get("doi") or "").strip().lower()
-    if doi:
-        return f"doi:{doi}"
-    title = (paper.get("title") or "").strip().lower()
-    authors = (paper.get("authors") or "").strip().lower()
-    if title:
-        return f"title:{title}|authors:{authors}"
-    return f"id:{(paper.get('paper_id') or '').strip().lower()}"
-
-
-def _dedupe(papers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[Dict[str, Any]] = []
-    for p in papers:
-        k = _paper_unique_key(p)
-        if k not in seen:
-            seen.add(k)
-            out.append(p)
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Async helpers
 # ---------------------------------------------------------------------------
@@ -151,49 +128,6 @@ async def _async_search(searcher: Any, query: str, max_results: int, **kwargs) -
     else:
         papers = await asyncio.to_thread(searcher.search, query, max_results=max_results)
     return [p.to_dict() for p in papers]
-
-
-def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
-    raw = get_env(name, str(default)).strip()
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, value)
-
-
-async def _search_source_with_timeout(
-    source: str,
-    operation: Any,
-    timeout_seconds: float,
-) -> Dict[str, Any]:
-    started = time.perf_counter()
-    try:
-        if timeout_seconds > 0:
-            output = await asyncio.wait_for(operation, timeout=timeout_seconds)
-        else:
-            output = await operation
-        return {
-            "source": source,
-            "output": output or [],
-            "error": "",
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-        }
-    except asyncio.TimeoutError:
-        return {
-            "source": source,
-            "output": [],
-            "error": f"timed out after {timeout_seconds:g}s",
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-            "timed_out": True,
-        }
-    except Exception as exc:
-        return {
-            "source": source,
-            "output": [],
-            "error": str(exc),
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-        }
 
 
 # ---------------------------------------------------------------------------

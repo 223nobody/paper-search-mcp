@@ -832,7 +832,14 @@ async def _download_with_fallback_path(
     repository_searchers: Optional[List[tuple[str, Any]]] = None,
     unpaywall_resolver: Any = None,
     client: Optional[httpx.AsyncClient] = None,
-) -> str:
+) -> Dict[str, Any]:
+    """Attempt to download a paper PDF through the OA-fallback chain.
+
+    Returns a structured dict with keys:
+    * On success: ``{"status": "ok", "pdf_path": str, "download_method": str}``
+    * On failure: ``{"status": "download_failed", "message": str,
+      "tried_methods": [...], "available_options": [...]}``
+    """
     save_path = resolve_save_path(save_path)
     sn = source.strip().lower()
     sn, pid, pdoi = _source_from_identifier(sn, paper_id, doi)
@@ -840,16 +847,20 @@ async def _download_with_fallback_path(
     arxiv_id = _extract_arxiv_id(paper_id, doi, title)
     if arxiv_id:
         sn, paper_id = "arxiv", arxiv_id
+    tried_methods: List[str] = []
     result, errors = await _race_oa_downloads(
         source_name=sn, paper_id=paper_id, doi=doi, title=title, save_path=save_path,
         searchers=searchers or {}, repository_searchers=repository_searchers,
         unpaywall_resolver=unpaywall_resolver, client=client,
         strategy=download_strategy, use_libgen=use_libgen, libgen_base_url=libgen_base_url,
     )
+    tried_methods.append("oa_race")
     if result and isinstance(result.get("path"), str):
-        return result["path"]
+        return {"status": "ok", "pdf_path": result["path"],
+                "download_method": result.get("method", "oa_race")}
     strategy_name = _download_strategy(download_strategy)
     if strategy_name != "sequential":
+        tried_methods.append("paper_fetch")
         paper_fetch_result = await _try_paper_fetch_download(
             source_name=sn,
             paper_id=paper_id,
@@ -858,10 +869,12 @@ async def _download_with_fallback_path(
             save_path=save_path,
         )
         if isinstance(paper_fetch_result.get("path"), str):
-            return paper_fetch_result["path"]
+            return {"status": "ok", "pdf_path": paper_fetch_result["path"],
+                    "download_method": "paper_fetch"}
         if paper_fetch_result.get("error"):
             errors.append(f"paper_fetch: {paper_fetch_result['error']}")
         if _libgen_enabled(use_libgen) and strategy_name == "oa_first":
+            tried_methods.append("libgen")
             libgen_result = await _try_libgen_download(
                 source_name=sn,
                 paper_id=paper_id,
@@ -871,11 +884,44 @@ async def _download_with_fallback_path(
                 libgen_base_url=libgen_base_url,
             )
             if isinstance(libgen_result.get("path"), str):
-                return libgen_result["path"]
+                return {"status": "ok", "pdf_path": libgen_result["path"],
+                        "download_method": "libgen"}
             if libgen_result.get("error"):
                 errors.append(f"libgen: {libgen_result['error']}")
+
+    # ── Build available-options guidance ─────────────────────────────
+    available_options: List[Dict[str, Any]] = []
+    if doi:
+        available_options.append({
+            "method": "publisher_download",
+            "description": "Try publisher version via scansci-pdf (may need setup)",
+            "tool": "download_publisher_version",
+        })
     if not use_scihub:
-        return "Download failed after OA fallback chain. Details: " + " | ".join(errors)
+        available_options.append({
+            "method": "scihub",
+            "description": "Opt-in Sci-Hub fallback",
+            "tool": "download_with_fallback",
+            "param": "use_scihub=true",
+        })
+    if not _libgen_enabled(use_libgen):
+        available_options.append({
+            "method": "libgen",
+            "description": "Opt-in LibGen fallback",
+            "env": "PAPER_SEARCH_MCP_LIBGEN_ENABLED=true",
+        })
+
+    if not use_scihub:
+        return {
+            "status": "download_failed",
+            "message": "Download failed after OA fallback chain.",
+            "tried_methods": tried_methods,
+            "errors": errors,
+            "doi": doi or "",
+            "available_options": available_options,
+        }
+
+    tried_methods.append("scihub")
     from ..academic_platforms.sci_hub import SciHubFetcher
     ident = (doi or "").strip() or (title or "").strip() or paper_id
     fetcher = SciHubFetcher(base_url=scihub_base_url, output_dir=save_path)
@@ -883,8 +929,15 @@ async def _download_with_fallback_path(
     if fb and os.path.exists(fb):
         record_download(pdf_path=fb, source=sn, paper_id=paper_id, doi=doi, title=title,
                        downloader="scihub", legal_status="user_opt_in_scihub")
-        return str(fb)
-    return "Sci-Hub fallback also failed."
+        return {"status": "ok", "pdf_path": str(fb), "download_method": "scihub"}
+    return {
+        "status": "download_failed",
+        "message": "All download methods failed, including Sci-Hub.",
+        "tried_methods": tried_methods,
+        "errors": errors,
+        "doi": doi or "",
+        "available_options": available_options,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1075,14 +1128,22 @@ async def _resolve_session_paper_pdf(
             record_download(pdf_path=dp, source=s, paper_id=pid, doi=doi, title=title,
                            downloader="search_result_pdf_url", legal_status="search_result_open_access_pdf_url")
             return {"index": index, "status": "ready", "candidate": candidate, "download_method": "search_result_pdf_url", "pdf_path": dp}
-    fp = await _download_with_fallback_path(source=s, paper_id=dl_id, doi=doi, title=title, save_path=save_path,
+    fb_result = await _download_with_fallback_path(source=s, paper_id=dl_id, doi=doi, title=title, save_path=save_path,
                                             use_scihub=use_scihub, searchers=searchers,
                                             repository_searchers=repository_searchers, unpaywall_resolver=unpaywall_resolver,
                                             download_strategy=download_strategy, use_libgen=use_libgen,
                                             libgen_base_url=libgen_base_url)
-    if not fp or not os.path.exists(fp):
-        return {"index": index, "status": "download_failed", "candidate": candidate, "message": str(fp)}
-    return {"index": index, "status": "ready", "candidate": candidate, "download_method": "download_with_fallback", "pdf_path": fp}
+    if fb_result.get("status") != "ok":
+        return {"index": index, "status": "download_failed", "candidate": candidate,
+                "message": fb_result.get("message", "Download failed"),
+                "tried_methods": fb_result.get("tried_methods", []),
+                "available_options": fb_result.get("available_options", [])}
+    fp = fb_result["pdf_path"]
+    if not os.path.exists(fp):
+        return {"index": index, "status": "download_failed", "candidate": candidate,
+                "message": f"Download reported ok but file not found: {fp}"}
+    return {"index": index, "status": "ready", "candidate": candidate,
+            "download_method": fb_result.get("download_method", "download_with_fallback"), "pdf_path": fp}
 
 
 async def _download_selected_session_paper(
@@ -1118,13 +1179,20 @@ async def _download_selected_session_paper(
             await asyncio.to_thread(record_download, pdf_path=dp, source=s, paper_id=pid, doi=doi, title=title,
                                    downloader="search_result_pdf_url", legal_status="search_result_open_access_pdf_url")
             return {"index": index, "status": "downloaded", "candidate": candidate, "download_method": "search_result_pdf_url", **_pdf_result_metadata(dp)}
-    fp = await _download_with_fallback_path(source=s, paper_id=dl_id, doi=doi, title=title, save_path=save_path,
+    fb_result = await _download_with_fallback_path(source=s, paper_id=dl_id, doi=doi, title=title, save_path=save_path,
                                             use_scihub=use_scihub, searchers=searchers,
                                             repository_searchers=repository_searchers, unpaywall_resolver=unpaywall_resolver,
                                             client=client, download_strategy=download_strategy,
                                             use_libgen=use_libgen, libgen_base_url=libgen_base_url)
-    if not fp or not os.path.exists(fp):
-        return {"index": index, "status": "download_failed", "candidate": candidate, "message": str(fp)}
+    if fb_result.get("status") != "ok":
+        return {"index": index, "status": "download_failed", "candidate": candidate,
+                "message": fb_result.get("message", "Download failed"),
+                "tried_methods": fb_result.get("tried_methods", []),
+                "available_options": fb_result.get("available_options", [])}
+    fp = fb_result["pdf_path"]
+    if not os.path.exists(fp):
+        return {"index": index, "status": "download_failed", "candidate": candidate,
+                "message": f"Download reported ok but file not found: {fp}"}
     if not _is_valid_pdf_file(fp):
         return {"index": index, "status": "invalid_pdf", "candidate": candidate, "download_method": "download_with_fallback", "pdf_path": fp, "message": "Downloaded file failed PDF validation."}
     return {"index": index, "status": "downloaded", "candidate": candidate, "download_method": "download_with_fallback", **_pdf_result_metadata(fp)}

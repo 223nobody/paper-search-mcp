@@ -55,6 +55,8 @@ class ParseResult:
     assets_dir: str
     result_zip_path: str
     message: str = ""
+    degraded: bool = False
+    quality_hint: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,11 +71,51 @@ class ParseResult:
             "assets_dir": self.assets_dir,
             "result_zip_path": self.result_zip_path,
             "message": self.message,
+            "degraded": self.degraded,
+            "quality_hint": self.quality_hint,
         }
+
+
+def _parse_quality_hint(mode: str) -> str:
+    """Return a human-readable quality hint for a given parse mode."""
+    if mode in {"extract", "cloud_api"}:
+        return "full_markdown_with_assets"
+    if mode in {"local_api", "cli"}:
+        return "markdown_with_assets"
+    if mode == "pypdf":
+        return "basic_text_only"
+    return "unknown"
 
 
 class MinerUParser:
     """MinerU adapter using the official extract API by default."""
+
+    # ── Module-level health check cache ────────────────────────────
+    # Cached results of ``health_check()`` keyed by (mode, api_key_prefix).
+    # TTL of 300 s avoids probing local_api / CLI on every parse call.
+    _backend_health_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+
+    @classmethod
+    def _cached_health_check(cls, api_key: str, base_url: str, mode: str) -> Optional[Dict[str, Any]]:
+        """Return a cached health-check payload if it is still fresh."""
+        cache_key = f"{mode}|{api_key[:8]}|{base_url}"
+        entry = cls._backend_health_cache.get(cache_key)
+        if entry is None:
+            return None
+        stored_at, payload = entry
+        if time.time() - stored_at > 300:
+            cls._backend_health_cache.pop(cache_key, None)
+            return None
+        return payload
+
+    @classmethod
+    def _store_health_check(cls, api_key: str, base_url: str, mode: str, payload: Dict[str, Any]) -> None:
+        cache_key = f"{mode}|{api_key[:8]}|{base_url}"
+        cls._backend_health_cache[cache_key] = (time.time(), payload)
+        # Keep cache size bounded
+        if len(cls._backend_health_cache) > 32:
+            oldest_key = min(cls._backend_health_cache, key=lambda k: cls._backend_health_cache[k][0])
+            cls._backend_health_cache.pop(oldest_key, None)
 
     def __init__(
         self,
@@ -121,9 +163,11 @@ class MinerUParser:
         force: bool = False,
     ) -> Dict[str, Any]:
         pdf = Path(pdf_path).expanduser().resolve()
-        if not pdf.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf}")
 
+        # Compute the paper key early so we can look up the cache for a
+        # fallback path when the supplied pdf_path doesn't resolve (e.g.
+        # the file was saved under a different name, or the Desktop path
+        # differs between the download and parse steps).
         key = paper_key(
             paper_key_hint=paper_key_hint,
             doi=doi,
@@ -132,6 +176,19 @@ class MinerUParser:
             title=title,
             pdf_path=str(pdf),
         )
+
+        if not pdf.exists():
+            # Try to locate the PDF via cache metadata
+            parsed_paths = resolved_parsed_paths(key, self.cache_dir)
+            alt = parsed_paths.get("pdf_path", "")
+            if alt and Path(alt).exists():
+                pdf = Path(alt)
+                pdf_path = str(pdf)
+            else:
+                raise FileNotFoundError(
+                    f"PDF not found: {pdf}"
+                    + (f" (also checked cache key '{key}')" if key else "")
+                )
         directory = paper_dir(key, self.cache_dir)
         mineru_dir = directory / "mineru"
         paths = get_cached_paths(key, self.cache_dir)
@@ -142,18 +199,23 @@ class MinerUParser:
         cached_md = Path(parsed_paths["full_md"])
         cached_manifest = Path(parsed_paths["manifest"])
         if not force and cached_md.exists() and cached_manifest.exists():
+            _cached_mode = read_json(cached_manifest, {}).get("mode", self.mode)
+            _cached_degraded = _cached_mode in {"pypdf"}
+            _cached_quality = _parse_quality_hint(_cached_mode)
             result = ParseResult(
                 paper_key=key,
                 status="cached",
                 parser=read_json(cached_manifest, {}).get("parser", "mineru"),
                 backend=read_json(cached_manifest, {}).get("backend", self.backend),
-                mode=read_json(cached_manifest, {}).get("mode", self.mode),
+                mode=_cached_mode,
                 full_md_path=visible_paths["full_md"],
                 content_list_path=visible_paths["content_list"],
                 manifest_path=visible_paths["manifest"],
                 assets_dir=visible_paths["assets_dir"],
                 result_zip_path=visible_paths["result_zip"],
                 message="Using existing parsed cache.",
+                degraded=_cached_degraded,
+                quality_hint=_cached_quality,
             )
             result_dict = result.to_dict()
             write_json(directory / "status.json", result_dict)
@@ -200,6 +262,7 @@ class MinerUParser:
                     mode=mode,
                     result_zip_path=result_zip_path,
                 )
+                _ok_degraded = mode in {"pypdf"}
                 result = ParseResult(
                     paper_key=key,
                     status="ok",
@@ -211,7 +274,9 @@ class MinerUParser:
                     manifest_path=visible_paths["manifest"],
                     assets_dir=visible_paths["assets_dir"],
                     result_zip_path=visible_paths["result_zip"],
-                    message="; ".join(errors),
+                    message="; ".join(errors) if errors else "",
+                    degraded=_ok_degraded,
+                    quality_hint=_parse_quality_hint(mode),
                 )
                 result_dict = result.to_dict()
                 write_json(directory / "status.json", result_dict)
@@ -234,6 +299,8 @@ class MinerUParser:
             assets_dir=visible_paths["assets_dir"],
             result_zip_path=visible_paths["result_zip"],
             message=" | ".join(errors) if errors else "No parser mode attempted.",
+            degraded=True,
+            quality_hint="all_parsers_failed",
         )
         result_dict = result.to_dict()
         write_json(directory / "status.json", result_dict)
@@ -348,6 +415,8 @@ class MinerUParser:
                         manifest_path=visible_paths["manifest"],
                         assets_dir=visible_paths["assets_dir"],
                         result_zip_path=visible_paths["result_zip"],
+                        degraded=False,
+                        quality_hint="full_markdown_with_assets",
                     ).to_dict()
                     write_json(directory / "status.json", result)
                     self._export_visible_artifacts(key=key, visible_paths=visible_paths, result=result)
@@ -370,6 +439,11 @@ class MinerUParser:
         return [cached_results.get(index) or batch_results[index] for index in range(len(normalized))]
 
     def health_check(self) -> Dict[str, Any]:
+        # ── Return cached result when still fresh ───────────────────
+        _cached = self._cached_health_check(self.api_key, self.base_url, self.mode)
+        if _cached is not None:
+            return _cached
+
         result: Dict[str, Any] = {
             "mode": self.mode,
             "base_url": self.base_url,
@@ -417,6 +491,7 @@ class MinerUParser:
         except Exception as exc:
             result["pypdf"] = {"ok": False, "message": str(exc)}
 
+        self._store_health_check(self.api_key, self.base_url, self.mode, result)
         return result
 
     def _mode_order(self) -> List[str]:
@@ -427,7 +502,16 @@ class MinerUParser:
             elif self.api_key:
                 modes = ["extract", "local_api", "cli", "pypdf"]
             else:
-                modes = ["local_api", "cli", "pypdf"]
+                # No API key: skip backends that are guaranteed to be unavailable
+                # to avoid wasting time on connection-refused / command-not-found
+                # errors on every parse call.  Users with a local MinerU service
+                # should set PAPER_SEARCH_MCP_MINERU_BASE_URL or use
+                # PAPER_SEARCH_MCP_MINERU_AUTO_ORDER to re-enable local_api / cli.
+                has_explicit_base_url = bool(get_env("MINERU_BASE_URL", "").strip())
+                if has_explicit_base_url:
+                    modes = ["local_api", "cli", "pypdf"]
+                else:
+                    modes = ["pypdf"]
             deduped: List[str] = []
             for mode in modes:
                 if mode in SUPPORTED_MODES and mode != "auto" and mode not in deduped:
@@ -1151,6 +1235,16 @@ class MinerUParser:
 
         Path(visible_paths["full_md"]).write_text(markdown or "", encoding="utf-8")
         write_json(visible_paths["content_list"], content_list)
+
+        # ── Also write to cache paths for durable FTS indexing and offline
+        #    reading.  The visible path (beside the source PDF) is the
+        #    primary location, but when the user moves or cleans up the
+        #    PDF directory the cache copy keeps search and get_parsed_paper
+        #    working (P0 fix: FTS index rebuild / search / read all empty).
+        cache_full_md = Path(paths["full_md"])
+        cache_full_md.parent.mkdir(parents=True, exist_ok=True)
+        cache_full_md.write_text(markdown or "", encoding="utf-8")
+        write_json(paths["content_list"], content_list)
 
         manifest = {
             "paper_key": key,

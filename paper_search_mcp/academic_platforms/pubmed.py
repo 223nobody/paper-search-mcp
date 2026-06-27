@@ -1,11 +1,15 @@
 # paper_search_mcp/sources/pubmed.py
 from typing import List
 import requests
+import logging
 from xml.etree import ElementTree as ET
 from datetime import datetime
 from ..paper import Paper
 from ..utils import extract_doi
 from .base import PaperSource
+
+logger = logging.getLogger(__name__)
+
 
 class PubMedSearcher(PaperSource):
     """Searcher for PubMed papers"""
@@ -87,7 +91,8 @@ class PubMedSearcher(PaperSource):
                     keywords=[],
                     doi=doi
                 ))
-            except Exception:
+            except Exception as exc:
+                logger.debug("PubMed article parse skipped: %s", exc)
                 continue
         return papers
 

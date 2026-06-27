@@ -53,10 +53,14 @@ class IEEESearcher(PaperSource):
     def __init__(self) -> None:
         self.api_key: str = get_env("IEEE_API_KEY", "")
         if not self.api_key:
+            self.api_key = get_env("PAPER_SEARCH_MCP_IEEE_API_KEY", "")
+        if not self.api_key:
             logger.warning(
                 "IEEESearcher initialised without PAPER_SEARCH_MCP_IEEE_API_KEY/IEEE_API_KEY.  "
                 "All calls will raise NotImplementedError until the key is set."
             )
+        else:
+            logger.info("IEEESearcher initialised with API key.")
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "paper-search-mcp/0.1.3 (https://github.com/Dragonatorul/paper-search-mcp; mailto:paper-search@example.org)",
