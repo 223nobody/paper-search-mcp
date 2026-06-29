@@ -203,6 +203,52 @@ from .widgets.response import widget_tool_result
 mcp = FastMCP("paper_search_server")
 logger = logging.getLogger(__name__)
 
+# ── Persistent rotating file log for post-crash diagnostics ─────────────
+# Writes to {cache_dir}/server.log with 1 MB max size and 3 backups.
+# Controlled by PAPER_SEARCH_MCP_LOG_LEVEL (default INFO).
+import logging.handlers
+
+
+def _setup_persistent_logging() -> None:
+    """Attach a RotatingFileHandler to the paper_search_mcp root logger."""
+    try:
+        from .cache import cache_root  # noqa: PLC0415
+        from .config import get_env as _log_env  # noqa: PLC0415
+
+        log_level_str = _log_env("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+        log_level = getattr(logging, log_level_str, logging.INFO)
+
+        log_dir = cache_root()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "server.log"
+
+        handler = logging.handlers.RotatingFileHandler(
+            str(log_path),
+            maxBytes=1_000_000,  # 1 MB
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setLevel(log_level)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+        )
+
+        root_logger = logging.getLogger("paper_search_mcp")
+        root_logger.addHandler(handler)
+        root_logger.setLevel(min(root_logger.level, log_level))
+        logger.addHandler(handler)
+        logger.setLevel(min(logger.level, log_level))
+
+    except Exception:
+        # Logging setup failures must never prevent server startup.
+        pass
+
+
+_setup_persistent_logging()
+
 # ---------------------------------------------------------------------------
 # Idle timeout: exit the process after 3 minutes of inactivity so that
 # orphaned stdio processes do not accumulate indefinitely.
@@ -269,6 +315,46 @@ _LOCAL_SELECTION_SERVER: Optional[ThreadingHTTPServer] = None
 _LOCAL_SELECTION_THREAD: Optional[threading.Thread] = None
 _LOCAL_SELECTION_BASE_URL = ""
 _LOCAL_SELECTION_PAGES: Dict[str, Dict[str, Any]] = {}
+_LOCAL_SELECTION_PAGE_MAX_AGE_SECONDS = 600  # 10-minute hard limit for browser pages
+
+
+def _cleanup_expired_pages() -> None:
+    """Background daemon: periodically remove expired/old local selection pages."""
+    while _LOCAL_SELECTION_SERVER is not None:
+        time.sleep(60)
+        now = datetime.now(timezone.utc)
+        expired_ids: List[str] = []
+        with _LOCAL_SELECTION_LOCK:
+            for page_id, page in list(_LOCAL_SELECTION_PAGES.items()):
+                # Already marked expired
+                if page.get("selection_expired"):
+                    expired_ids.append(page_id)
+                    continue
+                # Check explicit expires_at
+                expires_at = str(page.get("selection_expires_at") or "")
+                if expires_at:
+                    try:
+                        if now >= datetime.fromisoformat(expires_at):
+                            expired_ids.append(page_id)
+                            continue
+                    except ValueError:
+                        pass
+                # Hard age limit
+                created_at = str(page.get("created_at") or "")
+                if created_at:
+                    try:
+                        age = (now - datetime.fromisoformat(created_at)).total_seconds()
+                        if age > _LOCAL_SELECTION_PAGE_MAX_AGE_SECONDS:
+                            expired_ids.append(page_id)
+                    except ValueError:
+                        pass
+            for page_id in expired_ids:
+                del _LOCAL_SELECTION_PAGES[page_id]
+        if expired_ids:
+            logger.info(
+                "Cleaned %d expired local selection page(s)",
+                len(expired_ids),
+            )
 
 
 def _large_batch_selection_policy_name(value: str) -> str:
@@ -530,6 +616,14 @@ def _ensure_local_selection_server() -> None:
         )
         _LOCAL_SELECTION_THREAD.start()
 
+        # Background cleanup of expired browser selection pages
+        _cleanup_thread = threading.Thread(
+            target=_cleanup_expired_pages,
+            name="paper-search-page-ttl",
+            daemon=True,
+        )
+        _cleanup_thread.start()
+
 
 def _create_local_selection_page(
     *,
@@ -549,6 +643,7 @@ def _create_local_selection_page(
     semantics = _selection_semantics_name(selection_semantics)
     timeout_seconds = _download_selection_timeout_seconds(len(papers))
     _LOCAL_SELECTION_PAGES[page_id] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "selection_token": selection_token,
         "confirmation_token": confirmation_token,
         "papers": papers,
@@ -5263,42 +5358,6 @@ if acm_searcher is not None:
         return result
 
 
-# ---------------------------------------------------------------------------
-# Background scansci-pdf subprocess warmup (runs once at server startup)
-# ---------------------------------------------------------------------------
-
-def _warmup_scansci_pdf() -> None:
-    """Pre-warm the scansci-pdf MCP subprocess in a background thread.
-
-    The first ``_get_scansci_client()`` call takes 2-5 s because it starts
-    a ``python -m scansci_pdf.main run`` subprocess and waits for all
-    imports to complete.  Running this at startup moves that delay out of
-    the user's first publisher-download request.
-    """
-    import asyncio as _asyncio
-
-    async def _warm() -> None:
-        try:
-            from .tools.publisher import _get_scansci_client
-            logger.info("Pre-warming scansci-pdf subprocess …")
-            client = await _get_scansci_client()
-            if client is not None:
-                logger.info("scansci-pdf subprocess pre-warmed successfully.")
-            else:
-                logger.debug(
-                    "scansci-pdf warmup skipped (package not installed)."
-                )
-        except Exception as exc:
-            logger.debug("scansci-pdf warmup failed (non-blocking): %s", exc)
-
-    try:
-        _asyncio.run(_warm())
-    except Exception:
-        # Warmup failures are non-fatal — the first publisher-download
-        # request will create the client on demand as before.
-        pass
-
-
 def _startup_diagnostics() -> None:
     """Log a one-line summary of configuration state on server start.
 
@@ -5316,11 +5375,37 @@ def _startup_diagnostics() -> None:
     ieee_key = bool((_diag_env("IEEE_API_KEY", "") or "").strip())
     acm_key = bool((_diag_env("ACM_API_KEY", "") or "").strip())
     publisher_extra = False
+    publisher_components_ok = 0
+    publisher_components_bad = 0
     try:
         import scansci_pdf  # noqa: F401
         publisher_extra = True
+        # Quick optional-component check (non-blocking, cached).
+        try:
+            from .tools.publisher import _detect_publisher_components
+            _pub_comps = _detect_publisher_components()
+            publisher_components_ok = sum(
+                1 for v in _pub_comps.values() if v.get("available")
+            )
+            publisher_components_bad = sum(
+                1 for v in _pub_comps.values() if not v.get("available")
+            )
+        except Exception:
+            pass
     except ImportError:
         pass
+
+    if publisher_extra:
+        if publisher_components_bad == 0:
+            pub_status = "installed (all components ready)"
+        else:
+            pub_status = (
+                f"installed ({publisher_components_ok} ok, "
+                f"{publisher_components_bad} missing — "
+                f"run install_publisher_support)"
+            )
+    else:
+        pub_status = "NOT INSTALLED (call install_publisher_support first)"
 
     lines = [
         "=" * 60,
@@ -5330,7 +5415,7 @@ def _startup_diagnostics() -> None:
         f"  mineru key: {'configured' if mineru_key else 'NOT SET (pypdf-only fallback)'}",
         f"  semantic scholar key: {'configured' if semsch_key else 'not set (rate-limited)'}",
         f"  ieee key: {'configured' if ieee_key else 'not set'}  |  acm key: {'configured' if acm_key else 'not set'}",
-        f"  publisher (scansci-pdf): {'installed' if publisher_extra else 'NOT INSTALLED (uv sync --extra publisher)'}",
+        f"  publisher (scansci-pdf): {pub_status}",
         "=" * 60,
     ]
     for line in lines:
@@ -5343,25 +5428,46 @@ def main():
     _monitor = threading.Thread(target=_idle_timeout_monitor, daemon=True, name="idle-timeout")
     _monitor.start()
 
-    # Pre-warm scansci-pdf subprocess in the background so the first
-    # publisher-download call does not pay the 2-5 s startup penalty.
-    _warmup = threading.Thread(
-        target=_warmup_scansci_pdf,
-        daemon=True,
-        name="scansci-warmup",
-    )
-    _warmup.start()
-
-    # Wrap mcp.call_tool so every tool invocation refreshes the idle clock.
+    # Wrap mcp.call_tool so every tool invocation refreshes the idle clock
+    # and logs call count + latency for crash diagnostics.
     _original_call_tool = mcp.call_tool
+    _CALL_COUNTER = 0
 
     async def _tracked_call_tool(name: str, arguments: dict) -> Any:
+        global _CALL_COUNTER
+        _CALL_COUNTER += 1
         _update_activity()
-        return await _original_call_tool(name, arguments)
+        t0 = time.perf_counter()
+        try:
+            result = await _original_call_tool(name, arguments)
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "tool_call #%d %s ok (%.2fs) threads=%d",
+                _CALL_COUNTER, name, elapsed, threading.active_count(),
+            )
+            return result
+        except Exception:
+            elapsed = time.perf_counter() - t0
+            logger.warning(
+                "tool_call #%d %s FAILED (%.2fs) threads=%d",
+                _CALL_COUNTER, name, elapsed, threading.active_count(),
+            )
+            raise
 
     mcp.call_tool = _tracked_call_tool  # type: ignore[method-assign]
 
     _startup_diagnostics()
+
+    # Reset the idle clock so the timeout only begins counting after
+    # all initialisation (env loading, imports, diagnostics) finishes.
+    _update_activity()
+
+    # ── Startup housekeeping: clean up orphaned temp files and expired sessions ──
+    from .engine.download import cleanup_orphaned_temp_files
+    cleanup_orphaned_temp_files()
+
+    from .cache import cleanup_expired_sessions
+    cleanup_expired_sessions()
 
     transport = get_env("TRANSPORT", "stdio").strip().lower() or "stdio"
     if transport in {"http", "streamable_http", "streamable-http"}:

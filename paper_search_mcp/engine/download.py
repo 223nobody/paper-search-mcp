@@ -181,6 +181,56 @@ def _pdf_result_metadata(path: str) -> Dict[str, Any]:
     return meta
 
 
+def cleanup_orphaned_temp_files(save_path: Optional[str] = None) -> Dict[str, Any]:
+    """Remove orphaned .tmp files left behind by failed/interrupted downloads.
+
+    Scans *save_path* (default ~/Desktop/papers) for any ``*.tmp`` files.
+    These are always safe to delete because a live download atomically
+    renames its temp file to the final name on success.
+    """
+    resolved = resolve_save_path(save_path or "")
+    root = Path(resolved).expanduser()
+    cleaned: List[str] = []
+    bytes_freed = 0
+
+    if not root.exists() or not root.is_dir():
+        return {
+            "save_path": str(root),
+            "cleaned": 0,
+            "bytes_freed": 0,
+            "errors": 0,
+        }
+
+    for candidate in root.iterdir():
+        if not candidate.is_file():
+            continue
+        # Match both "file.pdf.tmp" and ".file.pdf.a1b2c3.tmp"
+        if not candidate.name.endswith(".tmp"):
+            continue
+        try:
+            size = candidate.stat().st_size
+            candidate.unlink()
+            cleaned.append(str(candidate))
+            bytes_freed += size
+        except OSError:
+            pass
+
+    if cleaned:
+        logging.getLogger(__name__).info(
+            "Cleaned %d orphaned .tmp file(s) from %s (%d bytes freed)",
+            len(cleaned),
+            str(root),
+            bytes_freed,
+        )
+
+    return {
+        "save_path": str(root),
+        "cleaned": len(cleaned),
+        "bytes_freed": bytes_freed,
+        "errors": 0,
+    }
+
+
 def _candidate_download_id(candidate: Dict[str, Any]) -> str:
     return (
         str(candidate.get("paper_id") or "").strip()
@@ -225,9 +275,39 @@ def _find_existing_pdf(
     candidate: Dict[str, Any], *, index: int, save_path: str
 ) -> tuple[str, str]:
     for method, path in _existing_pdf_candidates(candidate, index=index, save_path=save_path):
-        if _is_valid_pdf_file(str(path)):
+        path_str = str(path)
+        if path_str.endswith(".tmp"):
+            continue
+        if _is_valid_pdf_file(path_str):
             return str(path.expanduser().resolve()), method
     return "", ""
+
+
+def _find_partial_tmp(output_path: Path) -> Optional[Path]:
+    """Return an existing .tmp partial-download file matching *output_path*, or None.
+
+    Temp files are named ``.<output_name>.<random-hex>.tmp``.
+    Only the newest matching file is returned.
+    """
+    parent = output_path.parent
+    prefix = f".{output_path.name}."
+    best: Optional[Path] = None
+    best_mtime = 0.0
+    try:
+        for candidate in parent.iterdir():
+            if not candidate.is_file():
+                continue
+            if candidate.name.startswith(prefix) and candidate.name.endswith(".tmp"):
+                try:
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if best is None or mtime > best_mtime:
+                    best = candidate
+                    best_mtime = mtime
+    except OSError:
+        pass
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -245,53 +325,95 @@ async def _download_from_url(
     save_path = resolve_save_path(save_path)
     os.makedirs(save_path, exist_ok=True)
     output_path = Path(save_path) / _pdf_filename_from_hint(filename_hint)
-    temp_path = output_path.with_name(f".{output_path.name}.{secrets.token_hex(6)}.tmp")
     max_retries = _env_int(DOWNLOAD_MAX_RETRIES_ENV, 3, minimum=0)
     retry_backoff = _env_float(DOWNLOAD_RETRY_BACKOFF_ENV, 1.0, minimum=0.1)
 
+    # ── Resume support: look for an existing partial .tmp file ──────────
+    resume_pos = 0
+    temp_path = output_path.with_name(
+        f".{output_path.name}.{secrets.token_hex(6)}.tmp"
+    )
+    existing_tmp = _find_partial_tmp(output_path)
+    if existing_tmp is not None:
+        try:
+            existing_size = existing_tmp.stat().st_size
+        except OSError:
+            existing_size = 0
+        if existing_size > 0:
+            resume_pos = existing_size
+            temp_path = existing_tmp  # reuse the partial file
+            logger.info(
+                "Resuming partial download %s from byte %d",
+                existing_tmp.name, resume_pos,
+            )
+
     async def _stream(client_ctx):
-        async with client_ctx.stream("GET", pdf_url) as resp:
-            if resp.status_code >= 500 or resp.status_code in (429, 408):
-                raise httpx.HTTPStatusError(f"Server error {resp.status_code}", request=resp.request, response=resp)
-            if resp.status_code >= 400:
-                return None
-            ct = (resp.headers.get("content-type") or "").lower()
-            first = b""
-            total = 0
-            with temp_path.open("wb") as f:
-                async for chunk in resp.aiter_bytes(1024 * 256):
-                    if not chunk:
-                        continue
-                    if not first:
-                        first = chunk[:4096]
-                    total += len(chunk)
-                    f.write(chunk)
+        nonlocal resume_pos, temp_path
+        headers = {}
+        if resume_pos > 0:
+            headers["Range"] = f"bytes={resume_pos}-"
+        async with client_ctx.stream("GET", pdf_url, headers=headers) as resp:
+            if resume_pos > 0 and resp.status_code not in (206, 200):
+                # Server does not support Range — restart from scratch
+                temp_path.unlink(missing_ok=True)
+                resume_pos = 0
+                temp_path = output_path.with_name(
+                    f".{output_path.name}.{secrets.token_hex(6)}.tmp"
+                )
+                async with client_ctx.stream("GET", pdf_url) as resp2:
+                    resp = resp2
+                    return await _stream_inner(resp, 0, temp_path)
+            return await _stream_inner(resp, resume_pos, temp_path)
+
+    async def _stream_inner(resp, start_pos: int, tpath: Path):
+        if resp.status_code >= 500 or resp.status_code in (429, 408):
+            raise httpx.HTTPStatusError(
+                f"Server error {resp.status_code}",
+                request=resp.request, response=resp,
+            )
+        if resp.status_code >= 400 and resp.status_code != 206:
+            return None
+        ct = (resp.headers.get("content-type") or "").lower()
+        first = b""
+        total = start_pos
+        mode = "ab" if start_pos > 0 else "wb"
+        with tpath.open(mode) as f:
+            async for chunk in resp.aiter_bytes(1024 * 256):
+                if not chunk:
+                    continue
+                if not first:
+                    first = chunk[:4096]
+                total += len(chunk)
+                f.write(chunk)
         if total <= 0:
-            temp_path.unlink(missing_ok=True)
+            tpath.unlink(missing_ok=True)
             return None
         if not ("pdf" in ct or first.startswith(b"%PDF") or pdf_url.lower().endswith(".pdf")):
-            temp_path.unlink(missing_ok=True)
+            tpath.unlink(missing_ok=True)
             return None
-        temp_path.replace(output_path)
+        tpath.replace(output_path)
         return str(output_path)
 
     for attempt in range(max_retries + 1):
         try:
             if client:
                 return await _stream(client)
-            async with httpx.AsyncClient(follow_redirects=True, timeout=_env_float(DOWNLOAD_TIMEOUT_ENV, 30.0, minimum=1.0)) as c:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=_env_float(DOWNLOAD_TIMEOUT_ENV, 30.0, minimum=1.0),
+            ) as c:
                 return await _stream(c)
         except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             sc = e.response.status_code if isinstance(e, httpx.HTTPStatusError) and e.response else None
             if sc in {429, 502, 503, 504} or sc is None:
                 if attempt < max_retries:
                     await asyncio.sleep(retry_backoff * (2 ** attempt))
-                    temp_path.unlink(missing_ok=True)
+                    # Keep temp_path for Range resume on retry
                     continue
             temp_path.unlink(missing_ok=True)
             return None
         except asyncio.CancelledError:
-            temp_path.unlink(missing_ok=True)
+            # Keep temp_path for resume on next invocation
             raise
         except Exception as e:
             temp_path.unlink(missing_ok=True)

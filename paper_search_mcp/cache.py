@@ -1062,6 +1062,84 @@ def delete_search_session(selection_token: str, cache_dir: Optional[str] = None)
     return True
 
 
+def cleanup_expired_sessions(
+    cache_dir: Optional[str] = None,
+    *,
+    ttl_hours: Optional[float] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Delete search sessions older than *ttl_hours* (default 24 h).
+
+    Reads ``PAPER_SEARCH_MCP_SESSION_TTL_HOURS`` from the environment.
+    Set to ``0`` or a negative value to disable automatic cleanup.
+
+    Returns a dict with ``deleted_count`` and ``status``.
+    """
+    if ttl_hours is None:
+        raw = get_env("SESSION_TTL_HOURS", "24").strip()
+        try:
+            ttl_hours = float(raw) if raw else 24.0
+        except ValueError:
+            ttl_hours = 24.0
+
+    if ttl_hours <= 0:
+        return {
+            "status": "disabled",
+            "ttl_hours": ttl_hours,
+            "message": (
+                "Session TTL cleanup is disabled "
+                "(PAPER_SEARCH_MCP_SESSION_TTL_HOURS <= 0)."
+            ),
+        }
+
+    from datetime import timedelta
+
+    root = sessions_root(cache_dir)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+    deleted_count = 0
+    preserved_count = 0
+
+    for path in sorted(root.glob("*.json")):
+        session = read_json(path, {}) or {}
+        if not isinstance(session, dict):
+            continue
+
+        created_at_str = str(session.get("created_at", ""))
+        try:
+            created_at = datetime.fromisoformat(created_at_str)
+        except (ValueError, TypeError):
+            # Fall back to file modification time
+            try:
+                created_at = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                )
+            except OSError:
+                preserved_count += 1
+                continue
+
+        if created_at < cutoff:
+            if not dry_run:
+                path.unlink(missing_ok=True)
+            deleted_count += 1
+        else:
+            preserved_count += 1
+
+    if deleted_count:
+        logging.getLogger(__name__).info(
+            "Session TTL cleanup: %d session(s) older than %.1f h %s.",
+            deleted_count,
+            ttl_hours,
+            "(dry run)" if dry_run else "deleted",
+        )
+
+    return {
+        "status": "dry_run" if dry_run else "ok",
+        "ttl_hours": ttl_hours,
+        "deleted_count": deleted_count,
+        "preserved_count": preserved_count,
+    }
+
+
 # ── Download state persistence (checkpoint/resume) ──────────────────────
 
 def _session_download_state_path(selection_token: str, cache_dir: Optional[str] = None) -> Path:

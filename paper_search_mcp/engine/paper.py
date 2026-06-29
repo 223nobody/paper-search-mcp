@@ -689,8 +689,38 @@ def _strip_arxiv_version(arxiv_id: str) -> str:
     return _re.sub(r"v\d+$", "", arxiv_id.strip().lower())
 
 
+# Pattern for the canonical arXiv DOI prefix (DataCite: 10.48550/arXiv.{id})
+_SYNTHETIC_ARXIV_DOI_RE = re.compile(
+    r"10\.48550/arxiv\.(\d{4}\.\d{4,5})", re.IGNORECASE
+)
+
+
+def _is_synthetic_arxiv_doi(doi: Any) -> bool:
+    """Check whether *doi* is a synthesized arXiv DOI (10.48550/arXiv.{id}).
+
+    arXiv and Semantic Scholar synthesize this DOI when the paper has no
+    real registered DOI.  The synthetic DOI is useful for cross-source
+    dedup within the arXiv ecosystem, but it is not a publisher-registered
+    DOI — papers matched only on this DOI should still be eligible for
+    title-similarity merging in Pass 2.
+    """
+    return bool(_SYNTHETIC_ARXIV_DOI_RE.match(_paper_value(doi).strip()))
+
+
+def _extract_arxiv_id_from_synthetic_doi(doi: Any) -> str:
+    """Extract the arXiv ID from a synthesized arXiv DOI, or ''."""
+    m = _SYNTHETIC_ARXIV_DOI_RE.match(_paper_value(doi).strip())
+    return m.group(1) if m else ""
+
+
 def _paper_unique_key(paper: Dict[str, Any]) -> str:
-    """Produce a dedup key prioritising DOI > arXiv ID > title+authors > paper_id."""
+    """Produce a dedup key prioritising DOI > arXiv ID > title+authors > paper_id.
+
+    For the multi-key variant (used inside ``_dedupe_papers``) see
+    ``_paper_unique_keys``, which also emits secondary keys so that
+    papers with a synthetic arXiv DOI can still be reached by the
+    arXiv-ID tier.
+    """
     # ── Tier 1: DOI ──────────────────────────────────────────────
     doi = _normalize_lookup_text(paper.get("doi"))
     if doi:
@@ -710,6 +740,53 @@ def _paper_unique_key(paper: Dict[str, Any]) -> str:
     # ── Tier 4: paper_id (source-specific, last resort) ──────────
     paper_id = _normalize_lookup_text(paper.get("paper_id"))
     return f"id:{paper_id}"
+
+
+def _paper_unique_keys(paper: Dict[str, Any]) -> List[str]:
+    """Produce dedup keys with secondary keys for synthetic arXiv DOIs.
+
+    When the primary key is a synthetic arXiv DOI (``10.48550/arXiv.{id}``),
+    also emit ``arxiv:{id}`` as a secondary key.  This lets the paper match
+    another source that extracted the arXiv ID from its URL/paper_id but
+    does not have the synthetic DOI (e.g. CrossRef, OpenAlex, PubMed).
+
+    Returns a list of keys ordered by priority — the first key is always
+    the canonical primary key, and subsequent keys are secondary aliases.
+    """
+    keys: List[str] = []
+
+    # ── Tier 1: DOI ──────────────────────────────────────────────
+    doi_raw = _paper_value(paper.get("doi")).strip()
+    doi_normalized = _normalize_lookup_text(paper.get("doi"))
+    if doi_normalized:
+        keys.append(f"doi:{doi_normalized}")
+        # When the DOI is a synthetic arXiv DOI, also register
+        # under the arXiv-ID tier so other sources that do NOT
+        # have the synthetic DOI but that DO expose the arXiv ID
+        # can still match it in Pass 1.
+        if _is_synthetic_arxiv_doi(doi_raw):
+            arxiv_from_doi = _extract_arxiv_id_from_synthetic_doi(doi_raw)
+            if arxiv_from_doi:
+                keys.append(f"arxiv:{_strip_arxiv_version(arxiv_from_doi)}")
+        return keys
+
+    # ── Tier 2: arXiv ID (cross-source golden key for arXiv papers)
+    arxiv_id = _paper_arxiv_id(paper)
+    if arxiv_id:
+        keys.append(f"arxiv:{_strip_arxiv_version(arxiv_id)}")
+        return keys
+
+    # ── Tier 3: Title + Authors ──────────────────────────────────
+    title = _normalize_lookup_text(paper.get("title"))
+    authors = _normalize_lookup_text(paper.get("authors"))
+    if title:
+        keys.append(f"title:{title}|authors:{authors}")
+        return keys
+
+    # ── Tier 4: paper_id (source-specific, last resort) ──────────
+    paper_id = _normalize_lookup_text(paper.get("paper_id"))
+    keys.append(f"id:{paper_id}")
+    return keys
 
 
 def _paper_year_number(paper: Dict[str, Any]) -> int:
@@ -859,7 +936,7 @@ def _canonical_pdf_stem(
     """Resolve the best stable filename stem for a paper's artefacts."""
     arxiv_id = _extract_arxiv_id(paper_id, doi, pdf_url, url)
     if arxiv_id:
-        return arxiv_id
+        return _strip_arxiv_version(arxiv_id)
 
     normalized_doi = (doi or "").strip()
     if normalized_doi:
@@ -1982,6 +2059,32 @@ _DIVERSITY_MAX_PER_VENUE = int(_scoring_weight("DIVERSITY_MAX_PER_VENUE", 0))
 _DIVERSITY_SCORE_PENALTY = _scoring_weight("DIVERSITY_PENALTY", 1.5)
 
 
+def _inject_arxiv_ids(papers: List[Dict[str, Any]]) -> None:
+    """Pre-compute and inject arXiv IDs into every paper's ``extra`` field.
+
+    Many academic platforms (CrossRef, OpenAlex, PubMed, DBLP, …) do not
+    explicitly propagate arXiv IDs even when the paper was originally
+    uploaded to arXiv.  This function runs ``_paper_arxiv_id`` on every
+    paper *before* Pass 1 dedup and writes the result into
+    ``extra["arxiv_id"]`` when found, so the arXiv-ID tier of
+    ``_paper_unique_key`` / ``_paper_unique_keys`` is reachable for all
+    sources, not just arXiv and Semantic Scholar.
+
+    Mutates *papers* in-place.
+    """
+    for paper in papers:
+        if not isinstance(paper, dict):
+            continue
+        arxiv_id = _paper_arxiv_id(paper)
+        if not arxiv_id:
+            continue
+        extra = paper.get("extra")
+        if isinstance(extra, dict):
+            extra.setdefault("arxiv_id", arxiv_id)
+        else:
+            paper["extra"] = {"arxiv_id": arxiv_id}
+
+
 def _dedupe_papers(
     papers: List[Dict[str, Any]], query: str = ""
 ) -> List[Dict[str, Any]]:
@@ -1990,19 +2093,46 @@ def _dedupe_papers(
     Two-pass strategy:
     1. **Key-based merge** — DOI > arXiv ID > title+authors > paper_id.
        Catches explicit identifiers and exact title/author matches.
+       Uses multi-key lookup so that papers whose primary key is a
+       synthetic arXiv DOI (``10.48550/arXiv.{id}``) also register
+       under the ``arxiv:{id}`` secondary key, allowing cross-source
+       matching with platforms that expose the arXiv ID but not the
+       synthetic DOI.
     2. **Title-similarity merge** — Jaccard similarity on title tokens ≥ 0.85.
        Catches the same paper from different sources when identifiers are
        missing and author formatting differs (e.g. "J. Smith" vs "John Smith").
        Papers must also share a publication year when both have one.
     """
-    # ── Pass 1: key-based merge ──────────────────────────────────────
+    # ── Pre-pass: inject arXiv IDs for all sources ──────────────────
+    _inject_arxiv_ids(papers)
+
+    # ── Pass 1: key-based merge (multi-key) ─────────────────────────
     by_key: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     for paper in papers:
         if not isinstance(paper, dict):
             continue
-        key = _paper_unique_key(paper)
-        if key not in by_key:
+        keys = _paper_unique_keys(paper)
+        # Check whether *any* of the paper's keys already exist
+        matched_key: Optional[str] = None
+        for key in keys:
+            if key in by_key:
+                matched_key = key
+                break
+
+        if matched_key is not None:
+            # Merge into the existing record.  The base record may
+            # have been registered under multiple keys (e.g. both
+            # ``doi:10.48550/arXiv.{id}`` and ``arxiv:{id}``), so
+            # we must update ALL keys that reference the old record
+            # object, not just the ones belonging to the incoming
+            # paper.
+            old_record = by_key[matched_key]
+            merged = _merge_paper_record(old_record, paper)
+            for k in list(by_key.keys()):
+                if by_key[k] is old_record:
+                    by_key[k] = merged
+        else:
             merged = dict(paper)
             source = _paper_value(merged.get("source")).strip()
             merged["sources"] = [source] if source else []
@@ -2015,10 +2145,9 @@ def _dedupe_papers(
                     "url": _paper_value(merged.get("url")).strip(),
                 }
             ]
-            by_key[key] = merged
-            order.append(key)
-        else:
-            by_key[key] = _merge_paper_record(by_key[key], paper)
+            for key in keys:
+                by_key[key] = merged
+            order.append(keys[0])
 
     deduped = [by_key[key] for key in order]
 
@@ -2153,7 +2282,9 @@ def _title_similarity_dedup_pass(
     Only merges when:
     - Jaccard title-token similarity ≥ threshold (default 0.85)
     - Publication years match when both papers have a year
-    - Neither paper already has a DOI-based key (DOI = authoritative match)
+    - Neither paper has a *real registered* DOI (a synthetic arXiv DOI
+      like ``10.48550/arXiv.{id}`` does **not** block the check — it is a
+      convenience placeholder, not a publisher-registered identifier).
 
     The paper that appears first in the list absorbs matching later papers.
     """
@@ -2164,15 +2295,25 @@ def _title_similarity_dedup_pass(
         anchor = remaining.pop(0)
         anchor_title = _normalize_lookup_text(anchor.get("title"))
         anchor_year = _paper_year_number(anchor)
-        # Skip title-similarity for DOI-anchored papers — DOI matching
-        # in pass 1 is authoritative and these don't need fuzzy merge.
-        anchor_has_doi = bool(_paper_value(anchor.get("doi")).strip())
+        # Only block title-similarity when the anchor has a *real* DOI
+        # (not a synthetic arXiv DOI placeholder).
+        anchor_doi_raw = _paper_value(anchor.get("doi")).strip()
+        anchor_has_real_doi = bool(anchor_doi_raw) and not _is_synthetic_arxiv_doi(
+            anchor_doi_raw
+        )
 
         merged_indices: List[int] = []
         for idx, candidate in enumerate(remaining):
-            if anchor_has_doi and _paper_value(candidate.get("doi")).strip():
-                # Both have DOIs but keys didn't match — they are genuinely
-                # different papers.  Skip title-similarity to avoid false merges.
+            candidate_doi_raw = _paper_value(candidate.get("doi")).strip()
+            candidate_has_real_doi = (
+                bool(candidate_doi_raw)
+                and not _is_synthetic_arxiv_doi(candidate_doi_raw)
+            )
+
+            if anchor_has_real_doi and candidate_has_real_doi:
+                # Both have real (publisher-registered) DOIs but Pass 1
+                # keys didn't match — they are genuinely different papers.
+                # Skip title-similarity to avoid false merges.
                 continue
 
             candidate_title = _normalize_lookup_text(candidate.get("title"))
@@ -2218,9 +2359,9 @@ def _paper_parse_candidate(
     arxiv_id = _extract_arxiv_id(paper_id, doi, pdf_url, url)
     if arxiv_id:
         source = "arxiv"
-        paper_id = arxiv_id
+        paper_id = _strip_arxiv_version(arxiv_id)
         if not pdf_url or "arxiv.org/abs/" in pdf_url.lower():
-            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+            pdf_url = f"https://arxiv.org/pdf/{paper_id}"
 
     download_ready, reason, download_confidence = _download_route_for_candidate(
         source=source,

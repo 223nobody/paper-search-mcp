@@ -76,19 +76,23 @@ def _search_cache_key(
     max_results_per_source: int,
     sources: str,
     year: Optional[str],
+    requested_count: int = 0,
 ) -> str:
-    """Produce a deterministic cache key for a search request."""
+    """Produce a deterministic cache key for a search request.
+
+    *requested_count* is included when > 0 so that progressive retry
+    rounds with different oversampling targets produce distinct keys.
+    """
     resolved_sources = ",".join(_parse_sources(sources))
-    return json.dumps(
-        {
-            "query": query,
-            "max_results_per_source": max_results_per_source,
-            "sources": resolved_sources,
-            "year": year or "",
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
+    obj: Dict[str, Any] = {
+        "query": query,
+        "max_results_per_source": max_results_per_source,
+        "sources": resolved_sources,
+        "year": year or "",
+    }
+    if requested_count > 0:
+        obj["requested_count"] = requested_count
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False)
 
 
 def _cached_search_result(cache_key: str) -> Optional[Dict[str, Any]]:

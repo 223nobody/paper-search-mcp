@@ -234,6 +234,52 @@ def _find_playwright_chromium_dirs() -> List[str]:
     return found
 
 
+async def _install_playwright_chromium_async(timeout: int = 300) -> bool:
+    """Async, non-blocking install of the Playwright Chromium browser (~182 MB).
+
+    Uses ``asyncio.create_subprocess_exec`` so the MCP event loop stays
+    alive during the download — prevents ``-32000 Connection closed``
+    timeouts that occur with the synchronous ``subprocess.run`` approach.
+    """
+    logger.info(
+        "  [async] playwright install chromium (timeout=%ds) …", timeout
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+        if proc.returncode == 0:
+            logger.info("  ✓ Playwright Chromium installed.")
+            return True
+        stderr_text = (stderr or b"").decode("utf-8", errors="replace")
+        logger.warning(
+            "  ✗ playwright install chromium failed (rc=%d): %s",
+            proc.returncode, stderr_text[-300:],
+        )
+        return False
+    except asyncio.TimeoutError:
+        logger.warning(
+            "  ✗ playwright install chromium timed out after %ds.",
+            timeout,
+        )
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False
+    except Exception as exc:
+        logger.warning(
+            "  ✗ playwright install chromium error: %s", exc
+        )
+        return False
+
+
 def _detect_publisher_components() -> Dict[str, Dict[str, Any]]:
     """Detect which publisher-download components are available.
 
@@ -290,6 +336,12 @@ def _run_pip_install(package_spec: str, timeout: int = 300) -> bool:
     """Install a package, falling back to ``uv pip`` when the venv lacks pip.
 
     Returns ``True`` if a subprocess succeeded, ``False`` otherwise.
+
+    .. note::
+        This is the legacy synchronous version kept for backwards
+        compatibility (e.g. called from non-async contexts).  New code
+        should prefer :func:`_run_pip_install_async` to avoid blocking
+        the asyncio event loop.
     """
     # Attempt 1: standard pip
     try:
@@ -339,6 +391,62 @@ def _run_pip_install(package_spec: str, timeout: int = 300) -> bool:
         return False
 
 
+async def _run_pip_install_async(
+    package_spec: str, timeout: int = 300
+) -> bool:
+    """Async version of :func:`_run_pip_install` that does **not** block the
+    asyncio event loop.
+
+    Uses ``asyncio.create_subprocess_exec`` so the MCP server stays
+    responsive during long-running pip installs (avoids the
+    ``-32000 Connection closed`` timeout).
+    """
+    async def _install_one(cmd: List[str], label: str) -> bool:
+        logger.info("  [async] %s: %s", label, " ".join(cmd))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            if proc.returncode == 0:
+                return True
+            stderr_text = (stderr or b"").decode("utf-8", errors="replace")
+            logger.warning(
+                "  [async] %s failed (rc=%d): %s",
+                label, proc.returncode, stderr_text[-300:],
+            )
+            return False
+        except asyncio.TimeoutError:
+            logger.warning(
+                "  [async] %s timed out after %ds.", label, timeout
+            )
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return False
+        except Exception as exc:
+            logger.warning("  [async] %s error: %s", label, exc)
+            return False
+
+    # Attempt 1: standard pip
+    if await _install_one(
+        [sys.executable, "-m", "pip", "install", package_spec],
+        f"pip install {package_spec}",
+    ):
+        return True
+
+    # Attempt 2: uv pip install (fallback when venv lacks pip)
+    return await _install_one(
+        ["uv", "pip", "install", package_spec],
+        f"uv pip install {package_spec} (fallback)",
+    )
+
+
 def _install_missing_components(
     missing: List[str],
     install_timeout: int = 120,
@@ -346,6 +454,10 @@ def _install_missing_components(
     """Attempt to pip-install a list of missing Python packages.
 
     Returns a dict mapping each package name → whether it is now importable.
+
+    .. note::
+        Legacy synchronous version.  New code should prefer
+        :func:`_install_missing_components_async`.
     """
     results: Dict[str, bool] = {}
     for mod_name in missing:
@@ -361,6 +473,42 @@ def _install_missing_components(
             except ImportError:
                 results[mod_name] = False
                 logger.warning("  ✗ %s installed but still not importable.", mod_name)
+        else:
+            results[mod_name] = False
+
+    # Refresh cached status
+    _detect_publisher_components()
+    return results
+
+
+async def _install_missing_components_async(
+    missing: List[str],
+    install_timeout: int = 120,
+) -> Dict[str, bool]:
+    """Async version of :func:`_install_missing_components`.
+
+    Uses non-blocking ``asyncio.create_subprocess_exec`` under the hood
+    so the MCP event loop stays alive during installation.
+    """
+    results: Dict[str, bool] = {}
+    for mod_name in missing:
+        pip_target = _PUBLISHER_COMPONENT_PIP_TARGETS.get(mod_name, mod_name)
+        logger.info(
+            "  [async] Attempting to install %s (pip: %s) …",
+            mod_name, pip_target,
+        )
+        if await _run_pip_install_async(pip_target, timeout=install_timeout):
+            # Verify the module is now importable
+            import importlib as _importlib
+            try:
+                _importlib.import_module(mod_name)
+                results[mod_name] = True
+                logger.info("  ✓ %s installed and importable.", mod_name)
+            except ImportError:
+                results[mod_name] = False
+                logger.warning(
+                    "  ✗ %s installed but still not importable.", mod_name
+                )
         else:
             results[mod_name] = False
 
@@ -480,6 +628,132 @@ def _auto_install_scansci_pdf() -> bool:
     return True
 
 
+async def _auto_install_scansci_pdf_async() -> bool:
+    """Async version of :func:`_auto_install_scansci_pdf`.
+
+    Uses non-blocking ``asyncio.create_subprocess_exec`` throughout so
+    the MCP event loop stays responsive.  This prevents the ``-32000
+    Connection closed`` timeout that can occur when the synchronous
+    version blocks for 60–300 s during pip install.
+
+    Phases:
+    1. Install scansci-pdf base (async, non-blocking).
+    2. Detect which optional components are still missing.
+    3. Async-install each missing component.
+    4. Report final status.
+
+    Returns ``True`` if scansci-pdf itself is importable afterwards.
+    """
+    global _scansci_install_attempted, _scansci_importable, _component_status
+
+    # Fast path: already importable (cached)
+    if _scansci_importable is True:
+        return True
+
+    # Fast path: check if importable now
+    try:
+        import scansci_pdf  # noqa: F401
+        _scansci_importable = True
+        _detect_publisher_components()
+        return True
+    except ImportError:
+        pass
+
+    if _scansci_install_attempted:
+        try:
+            import scansci_pdf  # noqa: F401, PLC0415
+            _scansci_importable = True
+            _detect_publisher_components()
+            return True
+        except ImportError:
+            _scansci_importable = False
+            return False
+    _scansci_install_attempted = True
+
+    # ══════════════════════════════════════════════════════════════════
+    # Phase 1: Async-install scansci-pdf base
+    # ══════════════════════════════════════════════════════════════════
+    logger.info(
+        "scansci-pdf not found — attempting async auto-install …"
+    )
+    install_ok = False
+    for attempt, install_target in enumerate([
+        "scansci-pdf[cloakbrowser]",
+        "scansci-pdf",
+    ]):
+        logger.info(
+            "  [async] install %s (attempt %d) …",
+            install_target, attempt + 1,
+        )
+        if await _run_pip_install_async(install_target, timeout=300):
+            install_ok = True
+            break
+        else:
+            logger.warning(
+                "  [async] %s install failed, trying fallback.",
+                install_target,
+            )
+
+    if not install_ok:
+        logger.warning(
+            "scansci-pdf async auto-install failed completely."
+        )
+        _scansci_importable = False
+        return False
+
+    # Verify scansci-pdf is now importable
+    try:
+        import scansci_pdf  # noqa: F401, PLC0415
+        _scansci_importable = True
+        logger.info("scansci-pdf base package installed ✓")
+    except ImportError:
+        logger.warning(
+            "scansci-pdf installed but still not importable"
+        )
+        _scansci_importable = False
+        return False
+
+    # ══════════════════════════════════════════════════════════════════
+    # Phase 2: Detect and async-install missing optional components
+    # ══════════════════════════════════════════════════════════════════
+    components = _detect_publisher_components()
+    missing = [
+        name for name, info in components.items()
+        if not info.get("available")
+    ]
+
+    if missing:
+        logger.info(
+            "Missing publisher-access components: %s "
+            "— attempting async auto-install …",
+            ", ".join(missing),
+        )
+        install_results = await _install_missing_components_async(missing)
+
+        still_missing = [k for k, v in install_results.items() if not v]
+        if still_missing:
+            logger.warning(
+                "Could not async auto-install: %s. "
+                "Publisher downloads will use OA-only sources. "
+                "Install manually: pip install %s",
+                ", ".join(still_missing),
+                " ".join(
+                    _PUBLISHER_COMPONENT_PIP_TARGETS.get(m, m)
+                    for m in still_missing
+                ),
+            )
+        else:
+            logger.info(
+                "All publisher-access components installed ✓"
+            )
+    else:
+        logger.info(
+            "All publisher-access components already available ✓"
+        )
+
+    return True
+
+
 def _publisher_components_summary() -> str:
     """Return a one-line summary of publisher-component availability."""
     components = _detect_publisher_components()
@@ -517,8 +791,8 @@ async def _get_scansci_client() -> Optional[Any]:
         except ImportError:
             _scansci_importable = False
 
-    # ── Ensure scansci-pdf is installed ─────────────────────────
-    if not _scansci_importable and not _auto_install_scansci_pdf():
+    # ── Ensure scansci-pdf is installed (async, non-blocking) ─────
+    if not _scansci_importable and not await _auto_install_scansci_pdf_async():
         _scansci_error = (
             "scansci-pdf could not be installed. "
             "Install manually: pip install scansci-pdf[cloakbrowser]  "
@@ -2366,6 +2640,63 @@ def register_publisher_tools(mcp):  # noqa: C901
     _sys.modules[__name__].download_one_publisher_version = _download_one_publisher_version
 
     # ══════════════════════════════════════════════════════════════════
+    # Fast-fail helper: prevents long blocking auto-installs inside
+    # MCP tool calls that would trigger the -32000 connection timeout.
+    # ══════════════════════════════════════════════════════════════════
+
+    def _ensure_publisher_available() -> Optional[Dict[str, Any]]:
+        """Return ``None`` if scansci-pdf is ready, else a fast-fail error dict.
+
+        Always tries a lightweight ``import scansci_pdf`` when the cached
+        ``_scansci_importable`` flag is not already ``True``.  This keeps the
+        fast-fail accurate even when the user installs scansci-pdf manually
+        between two calls (the import is a ``sys.modules`` lookup once the
+        package has been installed, so it is negligibly cheap).
+        """
+        global _scansci_importable, _scansci_install_attempted
+
+        # Already known-good — proceed
+        if _scansci_importable is True:
+            return None
+
+        # Re-check: maybe it was installed manually since last check
+        try:
+            import scansci_pdf  # noqa: F401, PLC0415
+            _scansci_importable = True
+            return None
+        except ImportError:
+            _scansci_importable = False
+
+        # Not importable — return a clear action-required error
+        if not _scansci_install_attempted:
+            return {
+                "status": "not_installed",
+                "message": (
+                    "scansci-pdf is not installed. "
+                    "Run install_publisher_support first to install "
+                    "all required publisher-access components, then "
+                    "retry this download."
+                ),
+                "action_required": (
+                    "uv sync --extra publisher  &&  playwright install chromium"
+                ),
+                "next_step": "Call install_publisher_support or run the command above manually.",
+            }
+        else:
+            # Previously attempted — still broken
+            return {
+                "status": "not_installed",
+                "message": (
+                    "scansci-pdf could not be auto-installed. "
+                    "Install manually: uv sync --extra publisher  &&  "
+                    "playwright install chromium"
+                ),
+                "action_required": (
+                    "uv sync --extra publisher  &&  playwright install chromium"
+                ),
+            }
+
+    # ══════════════════════════════════════════════════════════════════
     # Tool: download_publisher_version  (single paper)
     # ══════════════════════════════════════════════════════════════════
 
@@ -2378,18 +2709,18 @@ def register_publisher_tools(mcp):  # noqa: C901
     ) -> Dict[str, Any]:
         """Download the publisher final version of a cached arXiv paper.
 
-        Connects to the external **scansci-pdf** MCP server (auto-installed
-        on first use) to locate and download the publisher's version of
-        record.  scansci-pdf races 13+ download sources — including
-        anti-detection browser engine (CloakBrowser), Tor proxy, Sci-Hub,
-        LibGen, Unpaywall, OpenAlex, and publisher-direct routes — to
-        maximise the chance of retrieving the final published PDF.
+        Connects to the external **scansci-pdf** MCP server to locate
+        and download the publisher's version of record.  scansci-pdf
+        races 13+ download sources — including anti-detection browser
+        engine (CloakBrowser), Tor proxy, Sci-Hub, LibGen, Unpaywall,
+        OpenAlex, and publisher-direct routes — to maximise the chance
+        of retrieving the final published PDF.
 
         **Prerequisites**
 
-        * Internet access (scansci-pdf is auto-installed via pip on first
-          call if not already present).
-        * The paper must already be parsed in the paper-search-mcp cache
+        * scansci-pdf must be installed (call ``install_publisher_support``
+          first if you get a ``"not_installed"`` response).
+        * The paper must already be cached in paper-search-mcp
           (use ``list_parsed_papers`` to see what is available).
         * The paper must have an arXiv ID or a publisher DOI.
 
@@ -2403,10 +2734,16 @@ def register_publisher_tools(mcp):  # noqa: C901
 
         Returns:
             A dict with ``status`` (one of ``"ok"``, ``"not_found"``,
-            ``"not_applicable"``, ``"unavailable"``, ``"download_failed"``,
-            ``"timeout"``, ``"invalid_pdf"``, ``"error"``) and, on success,
-            ``publisher_pdf``, ``download_source``, ``pdf_sha256``, etc.
+            ``"not_applicable"``, ``"not_installed"``, ``"unavailable"``,
+            ``"download_failed"``, ``"timeout"``, ``"invalid_pdf"``,
+            ``"error"``) and, on success, ``publisher_pdf``,
+            ``download_source``, ``pdf_sha256``, etc.
         """
+        # ── Fast-fail: scansci-pdf not installed ──────────────────
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
         return await _download_one_publisher_version(
             paper_key, save_path, timeout, force_reparse
         )
@@ -2440,6 +2777,11 @@ def register_publisher_tools(mcp):  # noqa: C901
             A dict with ``total``, ``ok``, ``failed`` counts and a
             ``results`` list of per-paper status dicts.
         """
+        # ── Fast-fail: scansci-pdf not installed ──────────────────
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
         # Resolve paper_keys
         raw = [k.strip() for k in (paper_keys or "").split(",") if k.strip()]
         if not raw:
@@ -2717,10 +3059,10 @@ def register_publisher_tools(mcp):  # noqa: C901
         except ImportError:
             report["scansci_pdf_installed"] = False
             report["message"] = (
-                "scansci-pdf is not installed. It will be auto-installed "
-                "on first use of download_publisher_version. "
-                "To pre-install: uv sync --extra publisher  "
-                "or: uv pip install scansci-pdf[cloakbrowser]"
+                "scansci-pdf is not installed. "
+                "Call install_publisher_support to install it "
+                "(async, non-blocking), or run manually: "
+                "uv sync --extra publisher  &&  playwright install chromium"
             )
             return report
 
@@ -2814,3 +3156,189 @@ def register_publisher_tools(mcp):  # noqa: C901
             logger.debug("Sci-Hub diagnostic skipped", exc_info=True)
 
         return report
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tool: install_publisher_support  (explicit async install)
+    # ══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    async def install_publisher_support(
+        install_playwright_browser: bool = True,
+    ) -> Dict[str, Any]:
+        """Install (or verify) the scansci-pdf publisher-download toolchain.
+
+        Uses **async, non-blocking** subprocess calls so the MCP connection
+        stays alive during installation — no ``-32000 Connection closed``
+        timeouts.
+
+        Call this tool once before the first use of
+        ``download_publisher_version`` or ``batch_download_publisher_versions``.
+        It is safe to call multiple times — subsequent calls detect existing
+        installations and return quickly.
+
+        Args:
+            install_playwright_browser: If ``True`` (default), also install
+                the Playwright Chromium browser (~182 MB) needed by
+                CloakBrowser.  Set to ``False`` to skip this step.
+
+        Returns:
+            A dict with ``status``, per-component install results, and
+            a summary of what is now available.
+        """
+        global _scansci_install_attempted, _scansci_importable
+        from datetime import datetime as _install_start_dt
+
+        start_time = _install_start_dt.utcnow()
+        steps: List[Dict[str, Any]] = []
+
+        # ── Step 0: Quick check — already fully installed? ──────────
+        if _scansci_importable is True:
+            components = _detect_publisher_components()
+            missing = [
+                k for k, v in components.items()
+                if not v.get("available")
+            ]
+            # Also check Playwright if cloakbrowser is present
+            pw_missing = False
+            if (
+                components.get("cloakbrowser", {}).get("available")
+                and install_playwright_browser
+            ):
+                pw = _check_playwright_browser()
+                pw_missing = not pw.get("chromium_browser")
+            if not missing and not pw_missing:
+                return {
+                    "status": "already_installed",
+                    "message": (
+                        "scansci-pdf and all publisher-access components "
+                        "are already installed and ready."
+                    ),
+                    "components": {
+                        k: v.get("available") for k, v in components.items()
+                    },
+                    "steps": [],
+                }
+
+        # ── Step 1: Install/verify scansci-pdf base ────────────────
+        steps.append({
+            "phase": "scansci_pdf_base",
+            "status": "started",
+            "message": "Installing scansci-pdf[cloakbrowser] (async, non-blocking) …",
+        })
+        logger.info("install_publisher_support: starting async scansci-pdf install …")
+        base_ok = await _auto_install_scansci_pdf_async()
+        steps[-1]["status"] = "ok" if base_ok else "failed"
+        steps[-1]["result"] = base_ok
+
+        if not base_ok:
+            return {
+                "status": "install_failed",
+                "message": (
+                    "scansci-pdf base package could not be installed. "
+                    "Check your network connection and try again, or "
+                    "install manually: uv sync --extra publisher"
+                ),
+                "steps": steps,
+                "elapsed_seconds": (
+                    _install_start_dt.utcnow() - start_time
+                ).total_seconds(),
+            }
+
+        # ── Step 2: Install missing optional components ────────────
+        components = _detect_publisher_components()
+        missing = [
+            k for k, v in components.items()
+            if not v.get("available")
+        ]
+        if missing:
+            steps.append({
+                "phase": "optional_components",
+                "status": "started",
+                "missing": missing,
+                "message": f"Installing {len(missing)} missing component(s): {', '.join(missing)} …",
+            })
+            logger.info(
+                "install_publisher_support: installing %d missing component(s): %s",
+                len(missing), ", ".join(missing),
+            )
+            install_results = await _install_missing_components_async(missing)
+            steps[-1]["status"] = "ok"
+            steps[-1]["results"] = install_results
+            still_missing = [k for k, v in install_results.items() if not v]
+            if still_missing:
+                steps[-1]["still_missing"] = still_missing
+                steps[-1]["hint"] = (
+                    "pip install "
+                    + " ".join(
+                        _PUBLISHER_COMPONENT_PIP_TARGETS.get(m, m)
+                        for m in still_missing
+                    )
+                )
+        else:
+            steps.append({
+                "phase": "optional_components",
+                "status": "skipped",
+                "message": "All optional components already installed.",
+            })
+
+        # ── Step 3: Playwright Chromium browser ────────────────────
+        if install_playwright_browser:
+            pw_status = _check_playwright_browser()
+            if not pw_status.get("chromium_browser"):
+                steps.append({
+                    "phase": "playwright_chromium",
+                    "status": "started",
+                    "message": (
+                        "Installing Playwright Chromium browser "
+                        "(~182 MB, async, non-blocking) …"
+                    ),
+                })
+                logger.info(
+                    "install_publisher_support: installing Playwright Chromium …"
+                )
+                pw_ok = await _install_playwright_chromium_async()
+                steps[-1]["status"] = "ok" if pw_ok else "failed"
+                steps[-1]["result"] = pw_ok
+                if pw_ok:
+                    logger.info("Playwright Chromium installed ✓")
+                else:
+                    logger.warning(
+                        "Playwright Chromium install failed. "
+                        "CloakBrowser will not work. "
+                        "Install manually: playwright install chromium"
+                    )
+                    steps[-1]["hint"] = (
+                        "playwright install chromium"
+                    )
+            else:
+                steps.append({
+                    "phase": "playwright_chromium",
+                    "status": "skipped",
+                    "message": "Playwright Chromium already installed.",
+                })
+
+        # ── Build final report ─────────────────────────────────────
+        elapsed = (_install_start_dt.utcnow() - start_time).total_seconds()
+        components = _detect_publisher_components()
+        all_ok = all(v.get("available") for v in components.values())
+
+        pw_final = _check_playwright_browser()
+        chromium_ok = bool(pw_final.get("chromium_browser"))
+
+        return {
+            "status": "ok",
+            "message": (
+                "Publisher support installed successfully."
+                if all_ok
+                else "Publisher support partially installed — "
+                       "some components are still missing."
+            ),
+            "scansci_pdf_importable": _scansci_importable,
+            "components": {
+                k: v.get("available") for k, v in components.items()
+            },
+            "playwright_chromium": chromium_ok,
+            "steps": steps,
+            "elapsed_seconds": elapsed,
+            "ready_for_download": all_ok and chromium_ok,
+        }

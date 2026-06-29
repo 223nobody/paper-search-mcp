@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import sys as _sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1760,7 +1761,7 @@ async def _run_download_selected_papers(
     download_concurrency = (
         concurrency
         if concurrency and concurrency > 0
-        else _env_int(DOWNLOAD_CONCURRENCY_ENV, 8, minimum=1)
+        else _env_int(DOWNLOAD_CONCURRENCY_ENV, 4 if _sys.platform == "win32" else 8, minimum=1)
     )
     semaphore = asyncio.Semaphore(download_concurrency)
     download_timeout = _env_float(DOWNLOAD_TIMEOUT_ENV, 30.0, minimum=1.0)
@@ -2185,114 +2186,128 @@ def register_orchestration_tools(mcp, searchers):
         progressively broader source profiles and higher oversampling until the
         target is met or all configured rounds are exhausted.
         """
-        effective_sources = sources
-        is_agent_skill = (
-            _ranking_profile_name(ranking_profile) == AGENT_SKILL_RANKING_PROFILE
-        )
-        if not (effective_sources or "").strip() and is_agent_skill:
-            effective_sources = "agent-skill-fast"
+        try:
+            effective_sources = sources
+            is_agent_skill = (
+                _ranking_profile_name(ranking_profile) == AGENT_SKILL_RANKING_PROFILE
+            )
+            if not (effective_sources or "").strip() and is_agent_skill:
+                effective_sources = "agent-skill-fast"
 
-        # ── Progressive retry rounds ─────────────────────────────────
-        # Each round specifies (source_profile, oversample_multiplier).
-        # When requested_count > 0 and the first round under-yields,
-        # progressively broader profiles are tried until the target is
-        # met or all rounds are exhausted.  This was previously gated to
-        # agent-skill only but now applies to all profiles.
-        RETRY_ROUNDS: List[tuple] = [
-            (effective_sources, 2.5),
-        ]
-        if requested_count > 0:
-            if is_agent_skill:
-                RETRY_ROUNDS.extend([
-                    ("agent-skill-broad", 5.0),
-                    ("agent-skill-broad", 3.0),
-                ])
-            else:
-                # Generic progressive broadening: fast → fast (higher oversample)
-                # We intentionally avoid "deep" here because it includes
-                # low-reliability sources (google_scholar, citeseerx, ssrn,
-                # base) that are prone to anti-bot blocking and timeouts.
-                # The second round uses "fast" with higher oversampling
-                # instead of broadening to unreliable sources.
-                RETRY_ROUNDS.extend([
-                    ("fast", 5.0),
-                ])
+            # ── Progressive retry rounds ─────────────────────────────────
+            # Each round specifies (source_profile, oversample_multiplier).
+            # When requested_count > 0 and the first round under-yields,
+            # progressively broader profiles are tried until the target is
+            # met or all rounds are exhausted.  This was previously gated to
+            # agent-skill only but now applies to all profiles.
+            RETRY_ROUNDS: List[tuple] = [
+                (effective_sources, 2.5),
+            ]
+            if requested_count > 0:
+                if is_agent_skill:
+                    RETRY_ROUNDS.extend([
+                        ("agent-skill-broad", 5.0),
+                        ("agent-skill-broad", 3.0),
+                    ])
+                else:
+                    # Generic progressive broadening: fast → fast (higher oversample)
+                    # We intentionally avoid "deep" here because it includes
+                    # low-reliability sources (google_scholar, citeseerx, ssrn,
+                    # base) that are prone to anti-bot blocking and timeouts.
+                    # The second round uses "fast" with higher oversampling
+                    # instead of broadening to unreliable sources.
+                    RETRY_ROUNDS.extend([
+                        ("fast", 5.0),
+                    ])
 
-        all_ranked_papers: List[Dict[str, Any]] = []
-        seen_keys: set = set()
-        combined_search_result: Optional[Dict[str, Any]] = None
-        target = max(requested_count, 1) if requested_count > 0 else 0
+            all_ranked_papers: List[Dict[str, Any]] = []
+            seen_keys: set = set()
+            combined_search_result: Optional[Dict[str, Any]] = None
+            target = max(requested_count, 1) if requested_count > 0 else 0
 
-        for round_idx, (round_sources, multiplier) in enumerate(RETRY_ROUNDS):
-            # ── Check if we already have enough downloadable papers ──
-            if round_idx > 0 and target > 0:
-                ready = _count_download_ready_papers(all_ranked_papers)
-                logger.info(
-                    "crawl_papers_for_selection round %d: %d download-ready, need %d",
-                    round_idx + 1, ready, target,
+            for round_idx, (round_sources, multiplier) in enumerate(RETRY_ROUNDS):
+                # ── Check if we already have enough downloadable papers ──
+                if round_idx > 0 and target > 0:
+                    ready = _count_download_ready_papers(all_ranked_papers)
+                    logger.info(
+                        "crawl_papers_for_selection round %d: %d download-ready, need %d",
+                        round_idx + 1, ready, target,
+                    )
+                    if ready >= target:
+                        break
+
+                # ── Oversample ──────────────────────────────────────────
+                num_sources = max(len(_parse_sources(round_sources)), 1)
+                if requested_count > 0:
+                    oversampled = math.ceil(requested_count * multiplier / num_sources)
+                    effective_max = max(max_results_per_source, oversampled)
+                else:
+                    effective_max = max_results_per_source
+
+                # ── Search (different sources param ensures cache miss) ──
+                search_result = await search_papers(
+                    query=query,
+                    max_results_per_source=effective_max,
+                    sources=round_sources,
+                    year=year,
                 )
-                if ready >= target:
+
+                # ── Dedup and accumulate ────────────────────────────────
+                round_papers = search_result.get("papers", [])
+                if not isinstance(round_papers, list):
+                    round_papers = []
+                new_papers: List[Dict[str, Any]] = []
+                for paper in round_papers:
+                    key = _paper_unique_key(paper)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        new_papers.append(paper)
+                all_ranked_papers.extend(new_papers)
+
+                # ── Merge result metadata ───────────────────────────────
+                if combined_search_result is None:
+                    combined_search_result = search_result
+                else:
+                    combined_search_result = _merge_search_results(
+                        combined_search_result, search_result
+                    )
+
+                # ── Stop early if no new papers found ───────────────────
+                if not new_papers:
+                    logger.info(
+                        "crawl_papers_for_selection round %d: no new papers, stopping",
+                        round_idx + 1,
+                    )
                     break
 
-            # ── Oversample ──────────────────────────────────────────
-            num_sources = max(len(_parse_sources(round_sources)), 1)
-            if requested_count > 0:
-                oversampled = math.ceil(requested_count * multiplier / num_sources)
-                effective_max = max(max_results_per_source, oversampled)
-            else:
-                effective_max = max_results_per_source
-
-            # ── Search (different sources param ensures cache miss) ──
-            search_result = await search_papers(
-                query=query,
-                max_results_per_source=effective_max,
-                sources=round_sources,
-                year=year,
-            )
-
-            # ── Dedup and accumulate ────────────────────────────────
-            round_papers = search_result.get("papers", [])
-            if not isinstance(round_papers, list):
-                round_papers = []
-            new_papers: List[Dict[str, Any]] = []
-            for paper in round_papers:
-                key = _paper_unique_key(paper)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    new_papers.append(paper)
-            all_ranked_papers.extend(new_papers)
-
-            # ── Merge result metadata ───────────────────────────────
-            if combined_search_result is None:
-                combined_search_result = search_result
-            else:
-                combined_search_result = _merge_search_results(
-                    combined_search_result, search_result
+            return _to_widget_tool_result(
+                await _create_paper_selection_result(
+                    query=query,
+                    max_results_per_source=max_results_per_source,
+                    sources=effective_sources,
+                    year=year,
+                    search_result=combined_search_result,
+                    interaction="crawl_papers_for_selection",
+                    ranking_profile=ranking_profile,
+                    action_tool="download_selected_papers",
+                    action_verb="download",
+                    selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                    requested_count=requested_count,
                 )
-
-            # ── Stop early if no new papers found ───────────────────
-            if not new_papers:
-                logger.info(
-                    "crawl_papers_for_selection round %d: no new papers, stopping",
-                    round_idx + 1,
-                )
-                break
-
-        return _to_widget_tool_result(
-            await _create_paper_selection_result(
-                query=query,
-                max_results_per_source=max_results_per_source,
-                sources=effective_sources,
-                year=year,
-                search_result=combined_search_result,
-                interaction="crawl_papers_for_selection",
-                ranking_profile=ranking_profile,
-                action_tool="download_selected_papers",
-                action_verb="download",
-                selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
-                requested_count=requested_count,
             )
-        )
+        except Exception as _exc:
+            import traceback as _tb
+            _logger = logging.getLogger(__name__)
+            _logger.error(
+                "Unhandled exception in crawl_papers_for_selection: %s",
+                _exc, exc_info=True,
+            )
+            return {
+                "status": "error",
+                "message": f"Internal error in crawl_papers_for_selection: {_exc}",
+                "error_type": type(_exc).__name__,
+                "query": query,
+            }
 
     # =======================================================================
     #  search_papers_with_elicitation
@@ -2575,171 +2590,300 @@ def register_orchestration_tools(mcp, searchers):
         local browser URL or MCP App widget prompt.  Programmatic bypass is
         not available through this public entry point.
         """
-        invalid_save_path = _invalid_mcp_save_path(
-            save_path,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-        )
-        if invalid_save_path:
-            return invalid_save_path
-
-        save_path = resolve_save_path(save_path)
-        save_path_meta = _mcp_save_path_metadata(
-            save_path,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-        )
-        session = await asyncio.to_thread(_cache_get_search_session, selection_token)
-        if not session:
-            return {
-                "status": "not_found",
-                "selection_token": selection_token,
-                "message": "Search session not found. Run crawl_papers_for_selection again.",
-            }
-
-        papers = session.get("papers", [])
-        if not isinstance(papers, list):
-            papers = []
-
-        if not _selected_indices_was_explicit(selected_indices):
-            candidates = [
-                _paper_parse_candidate(paper, index + 1)
-                for index, paper in enumerate(papers)
-            ]
-            surface = _selection_surface_policy(force_open=True)
-            prompt = {
-                "status": "selection_required",
-                "selection_token": selection_token,
-                "query": session.get("query", ""),
-                "sources": session.get("sources", ""),
-                **save_path_meta,
-                "papers": candidates,
-                "total": len(papers),
-                "downloaded": 0,
-                "skipped_existing": 0,
-                "skipped": 0,
-                "failed": 0,
-                "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
-                "recommended_selected_indices": "",
-                "selection_semantics": SELECTION_SEMANTICS_DOWNLOAD_ONLY,
-                "detected_host": surface.get("detected_host", "unknown"),
-                "app_widget_supported": surface.get("app_widget_supported", False),
-                "selection_surface": surface,
-                "message": (
-                    "No papers were selected. Render the paper selector and wait "
-                    "for a user-selected checkbox submission before downloading."
-                ),
-            }
-            prompt["app"] = _paper_selection_app_prompt(
-                selection_token=selection_token,
-                papers=candidates,
-                save_path=save_path,
-                use_scihub=use_scihub,
-                mode=mode,
-                backend=backend,
-                force=force,
-                custom_save_path_confirmed=custom_save_path_confirmed,
-                selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
-                parse_execution="none",
-            )
-            return _to_widget_tool_result(_promote_paper_selection_app(prompt))
-
         try:
-            indices = _parse_selected_indices(selected_indices, len(papers))
-        except ValueError as exc:
-            return {
-                "status": "invalid_selection",
-                "selection_token": selection_token,
-                "message": str(exc),
-                "total": len(papers),
-            }
-
-        # ── Resume / checkpoint: skip already-downloaded papers ──────────
-        original_indices = list(indices)
-        if resume:
-            download_state = await asyncio.to_thread(
-                _cache_read_session_download_state, selection_token
-            )
-            if isinstance(download_state, dict) and isinstance(
-                download_state.get("results"), dict
-            ):
-                completed = {
-                    int(k)
-                    for k, v in download_state["results"].items()
-                    if isinstance(v, dict)
-                    and v.get("status") in {"downloaded", "skipped_existing"}
-                }
-                indices = [i for i in indices if i not in completed]
-                if not indices:
-                    return {
-                        "status": "already_completed",
-                        "selection_token": selection_token,
-                        "message": "All selected papers have already been downloaded.",
-                        "total": len(original_indices),
-                        "downloaded": len(completed),
-                        "skipped_existing": 0,
-                        "skipped": 0,
-                        "failed": 0,
-                        "results": list(download_state.get("results", {}).values()),
-                    }
-
-        # Initialize download state for checkpoint
-        download_state = {
-            "status": "in_progress",
-            "results": {},
-            "created_at": utc_now(),
-            "download_strategy": download_strategy or "env_default",
-            "use_libgen": use_libgen,
-            "libgen_base_url": libgen_base_url,
-        }
-        await asyncio.to_thread(
-            _cache_write_session_download_state, selection_token, download_state
-        )
-
-        parse_execution_name = _workflow_parse_execution_name(parse_execution)
-        if _large_batch_confirmation_mismatch(session, indices):
-            return {
-                "status": "selection_mismatch",
-                "selection_token": selection_token,
-                "message": "Selected indices do not match the user-confirmed checkbox selection.",
-                "confirmed_selected_indices": _confirmed_large_batch_indices(session),
-                "requested_selected_indices": _format_selected_indices(indices),
-                "downloaded": 0,
-                "failed": 0,
-            }
-        _explicit = (
-            _selected_indices_was_explicit(selected_indices)
-            and str(selected_indices).strip().lower() not in {"all", "*"}
-        )
-        if _should_require_large_batch_selection(
-            len(indices),
-            large_batch_selection=large_batch_selection,
-            bypass_large_batch_selection=False,
-            session=session,
-            public_call=True,
-            explicit_user_selection=_explicit,
-        ):
-            selection_semantics = (
-                SELECTION_SEMANTICS_DOWNLOAD_ONLY
-                if parse_execution_name == "none"
-                else SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE
-            )
-            prompt = await _pre_download_selection_prompt(
-                selection_token=selection_token,
-                session=session,
-                indices=indices,
-                save_path=save_path,
-                use_scihub=use_scihub,
-                mode=mode,
-                backend=backend,
-                force=force,
-                parse_execution=parse_execution,
+            invalid_save_path = _invalid_mcp_save_path(
+                save_path,
                 custom_save_path_confirmed=custom_save_path_confirmed,
-                selection_semantics=selection_semantics,
             )
-            surface = _selection_surface_policy(force_open=True)
-            response = {
-                "status": "selection_required",
-                "selection_token": prompt.get("selection_token", ""),
-                "download_selection_token": selection_token,
+            if invalid_save_path:
+                return invalid_save_path
+
+            save_path = resolve_save_path(save_path)
+            save_path_meta = _mcp_save_path_metadata(
+                save_path,
+                custom_save_path_confirmed=custom_save_path_confirmed,
+            )
+            session = await asyncio.to_thread(_cache_get_search_session, selection_token)
+            if not session:
+                return {
+                    "status": "not_found",
+                    "selection_token": selection_token,
+                    "message": "Search session not found. Run crawl_papers_for_selection again.",
+                }
+
+            papers = session.get("papers", [])
+            if not isinstance(papers, list):
+                papers = []
+
+            if not _selected_indices_was_explicit(selected_indices):
+                candidates = [
+                    _paper_parse_candidate(paper, index + 1)
+                    for index, paper in enumerate(papers)
+                ]
+                surface = _selection_surface_policy(force_open=True)
+                prompt = {
+                    "status": "selection_required",
+                    "selection_token": selection_token,
+                    "query": session.get("query", ""),
+                    "sources": session.get("sources", ""),
+                    **save_path_meta,
+                    "papers": candidates,
+                    "total": len(papers),
+                    "downloaded": 0,
+                    "skipped_existing": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
+                    "recommended_selected_indices": "",
+                    "selection_semantics": SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                    "detected_host": surface.get("detected_host", "unknown"),
+                    "app_widget_supported": surface.get("app_widget_supported", False),
+                    "selection_surface": surface,
+                    "message": (
+                        "No papers were selected. Render the paper selector and wait "
+                        "for a user-selected checkbox submission before downloading."
+                    ),
+                }
+                prompt["app"] = _paper_selection_app_prompt(
+                    selection_token=selection_token,
+                    papers=candidates,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    mode=mode,
+                    backend=backend,
+                    force=force,
+                    custom_save_path_confirmed=custom_save_path_confirmed,
+                    selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
+                    parse_execution="none",
+                )
+                return _to_widget_tool_result(_promote_paper_selection_app(prompt))
+
+            try:
+                indices = _parse_selected_indices(selected_indices, len(papers))
+            except ValueError as exc:
+                return {
+                    "status": "invalid_selection",
+                    "selection_token": selection_token,
+                    "message": str(exc),
+                    "total": len(papers),
+                }
+
+            # ── Resume / checkpoint: skip already-downloaded papers ──────────
+            original_indices = list(indices)
+            if resume:
+                download_state = await asyncio.to_thread(
+                    _cache_read_session_download_state, selection_token
+                )
+                if isinstance(download_state, dict) and isinstance(
+                    download_state.get("results"), dict
+                ):
+                    completed = {
+                        int(k)
+                        for k, v in download_state["results"].items()
+                        if isinstance(v, dict)
+                        and v.get("status") in {"downloaded", "skipped_existing"}
+                    }
+                    indices = [i for i in indices if i not in completed]
+                    if not indices:
+                        return {
+                            "status": "already_completed",
+                            "selection_token": selection_token,
+                            "message": "All selected papers have already been downloaded.",
+                            "total": len(original_indices),
+                            "downloaded": len(completed),
+                            "skipped_existing": 0,
+                            "skipped": 0,
+                            "failed": 0,
+                            "results": list(download_state.get("results", {}).values()),
+                        }
+
+            # Initialize download state for checkpoint
+            download_state = {
+                "status": "in_progress",
+                "results": {},
+                "created_at": utc_now(),
+                "download_strategy": download_strategy or "env_default",
+                "use_libgen": use_libgen,
+                "libgen_base_url": libgen_base_url,
+            }
+            await asyncio.to_thread(
+                _cache_write_session_download_state, selection_token, download_state
+            )
+
+            parse_execution_name = _workflow_parse_execution_name(parse_execution)
+            if _large_batch_confirmation_mismatch(session, indices):
+                return {
+                    "status": "selection_mismatch",
+                    "selection_token": selection_token,
+                    "message": "Selected indices do not match the user-confirmed checkbox selection.",
+                    "confirmed_selected_indices": _confirmed_large_batch_indices(session),
+                    "requested_selected_indices": _format_selected_indices(indices),
+                    "downloaded": 0,
+                    "failed": 0,
+                }
+            _explicit = (
+                _selected_indices_was_explicit(selected_indices)
+                and str(selected_indices).strip().lower() not in {"all", "*"}
+            )
+            if _should_require_large_batch_selection(
+                len(indices),
+                large_batch_selection=large_batch_selection,
+                bypass_large_batch_selection=False,
+                session=session,
+                public_call=True,
+                explicit_user_selection=_explicit,
+            ):
+                selection_semantics = (
+                    SELECTION_SEMANTICS_DOWNLOAD_ONLY
+                    if parse_execution_name == "none"
+                    else SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE
+                )
+                prompt = await _pre_download_selection_prompt(
+                    selection_token=selection_token,
+                    session=session,
+                    indices=indices,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    mode=mode,
+                    backend=backend,
+                    force=force,
+                    parse_execution=parse_execution,
+                    custom_save_path_confirmed=custom_save_path_confirmed,
+                    selection_semantics=selection_semantics,
+                )
+                surface = _selection_surface_policy(force_open=True)
+                response = {
+                    "status": "selection_required",
+                    "selection_token": prompt.get("selection_token", ""),
+                    "download_selection_token": selection_token,
+                    "query": session.get("query", ""),
+                    "sources": session.get("sources", ""),
+                    "selected_indices": indices,
+                    **save_path_meta,
+                    "use_scihub": use_scihub,
+                    "download_strategy": download_strategy or "env_default",
+                    "use_libgen": use_libgen,
+                    "parse_execution": parse_execution_name,
+                    "mode": mode or "auto",
+                    "backend": backend or "",
+                    "force": force,
+                    "total": len(indices),
+                    "downloaded": 0,
+                    "skipped_existing": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "parse_prompt": _strip_widget_meta(prompt),
+                    "selection_semantics": selection_semantics,
+                    "large_batch_selection": _large_batch_selection_policy_name(
+                        large_batch_selection
+                    ),
+                    "message": prompt.get("message", ""),
+                    "detected_host": surface.get("detected_host", "unknown"),
+                    "app_widget_supported": surface.get("app_widget_supported", False),
+                    "selection_surface": surface,
+                }
+                if isinstance(prompt.get("app"), dict):
+                    response["app"] = prompt["app"]
+                if isinstance(prompt.get("local_browser"), dict):
+                    response["local_browser"] = prompt["local_browser"]
+                return _to_widget_tool_result(
+                    _promote_paper_selection_app(
+                    _prefer_local_selection_surface(response)
+                )
+                )
+
+            download_concurrency = (
+                concurrency
+                if concurrency and concurrency > 0
+                else _env_int(DOWNLOAD_CONCURRENCY_ENV, 4 if _sys.platform == "win32" else 8, minimum=1)
+            )
+            semaphore = asyncio.Semaphore(download_concurrency)
+            download_timeout = _env_float(DOWNLOAD_TIMEOUT_ENV, 30.0, minimum=1.0)
+
+            async def _limited(
+                index: int, shared_client: httpx.AsyncClient
+            ) -> Dict[str, Any]:
+                async with semaphore:
+                    paper = papers[index - 1]
+                    if not isinstance(paper, dict):
+                        return {
+                            "index": index,
+                            "status": "skipped",
+                            "message": "Stored search result is not a paper dictionary.",
+                        }
+                    return await _download_selected_session_paper_wrapper(
+                        paper=paper,
+                        index=index,
+                        save_path=save_path,
+                        use_scihub=use_scihub,
+                        client=shared_client,
+                        download_strategy=download_strategy,
+                        use_libgen=use_libgen,
+                        libgen_base_url=libgen_base_url,
+                        _searchers=searchers,
+                    )
+
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=download_timeout
+            ) as shared_client:
+                results = await asyncio.gather(
+                    *[_limited(index, shared_client) for index in indices]
+                )
+
+            # Persist download state for checkpoint/resume
+            for result in results:
+                idx = result.get("index")
+                if idx is not None:
+                    download_state["results"][str(idx)] = {
+                        "index": idx,
+                        "status": result.get("status"),
+                        "title": result.get("candidate", {}).get("title", ""),
+                        "pdf_path": result.get("pdf_path", ""),
+                        "download_method": result.get("download_method", ""),
+                    }
+            download_state["status"] = "completed"
+            await asyncio.to_thread(
+                _cache_write_session_download_state, selection_token, download_state
+            )
+
+            downloaded = sum(
+                1 for result in results if result.get("status") == "downloaded"
+            )
+            skipped_existing = sum(
+                1 for result in results if result.get("status") == "skipped_existing"
+            )
+            skipped = sum(
+                1 for result in results if result.get("status") == "skipped"
+            )
+            failed = len(results) - downloaded - skipped_existing - skipped
+            status = (
+                "ok"
+                if failed == 0
+                else "partial"
+                if downloaded or skipped_existing
+                else "failed"
+            )
+            successful_pdf_count = downloaded + skipped_existing
+            parse_prompt: Dict[str, Any] = {}
+            if successful_pdf_count > 0:
+                parse_prompt = await _parse_prompt_for_download_results(
+                    selection_token=selection_token,
+                    session=session,
+                    results=results,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    mode=mode,
+                    backend=backend,
+                    force=force,
+                    parse_execution=parse_execution,
+                    ctx=ctx,
+                    custom_save_path_confirmed=custom_save_path_confirmed,
+                )
+
+            manifest_path = _download_manifest_path(save_path, selection_token)
+            manifest = {
+                "status": status,
+                "selection_token": selection_token,
                 "query": session.get("query", ""),
                 "sources": session.get("sources", ""),
                 "selected_indices": indices,
@@ -2747,162 +2891,47 @@ def register_orchestration_tools(mcp, searchers):
                 "use_scihub": use_scihub,
                 "download_strategy": download_strategy or "env_default",
                 "use_libgen": use_libgen,
+                "libgen_base_url": libgen_base_url,
+                "download_concurrency": download_concurrency,
                 "parse_execution": parse_execution_name,
                 "mode": mode or "auto",
                 "backend": backend or "",
                 "force": force,
-                "total": len(indices),
-                "downloaded": 0,
-                "skipped_existing": 0,
-                "skipped": 0,
-                "failed": 0,
-                "parse_prompt": _strip_widget_meta(prompt),
-                "selection_semantics": selection_semantics,
-                "large_batch_selection": _large_batch_selection_policy_name(
-                    large_batch_selection
-                ),
-                "message": prompt.get("message", ""),
-                "detected_host": surface.get("detected_host", "unknown"),
-                "app_widget_supported": surface.get("app_widget_supported", False),
-                "selection_surface": surface,
+                "created_at": utc_now(),
+                "results": results,
+                "total": len(results),
+                "downloaded": downloaded,
+                "skipped_existing": skipped_existing,
+                "successful_pdf_count": successful_pdf_count,
+                "skipped": skipped,
+                "failed": failed,
+                "parse_prompt": parse_prompt,
             }
-            if isinstance(prompt.get("app"), dict):
-                response["app"] = prompt["app"]
-            if isinstance(prompt.get("local_browser"), dict):
-                response["local_browser"] = prompt["local_browser"]
+            await asyncio.to_thread(write_json, manifest_path, manifest)
+
+            response = {**manifest, "manifest_path": manifest_path}
+            if isinstance(parse_prompt, dict) and isinstance(
+                parse_prompt.get("app"), dict
+            ):
+                response["app"] = parse_prompt["app"]
             return _to_widget_tool_result(
-                _promote_paper_selection_app(
-                _prefer_local_selection_surface(response)
+                _promote_paper_selection_app(response)
+                if _should_promote_paper_selection_app(parse_prompt)
+                else response
             )
+        except Exception as _exc:
+            import traceback as _tb
+            _logger = logging.getLogger(__name__)
+            _logger.error(
+                "Unhandled exception in download_selected_papers: %s",
+                _exc, exc_info=True,
             )
-
-        download_concurrency = (
-            concurrency
-            if concurrency and concurrency > 0
-            else _env_int(DOWNLOAD_CONCURRENCY_ENV, 8, minimum=1)
-        )
-        semaphore = asyncio.Semaphore(download_concurrency)
-        download_timeout = _env_float(DOWNLOAD_TIMEOUT_ENV, 30.0, minimum=1.0)
-
-        async def _limited(
-            index: int, shared_client: httpx.AsyncClient
-        ) -> Dict[str, Any]:
-            async with semaphore:
-                paper = papers[index - 1]
-                if not isinstance(paper, dict):
-                    return {
-                        "index": index,
-                        "status": "skipped",
-                        "message": "Stored search result is not a paper dictionary.",
-                    }
-                return await _download_selected_session_paper_wrapper(
-                    paper=paper,
-                    index=index,
-                    save_path=save_path,
-                    use_scihub=use_scihub,
-                    client=shared_client,
-                    download_strategy=download_strategy,
-                    use_libgen=use_libgen,
-                    libgen_base_url=libgen_base_url,
-                    _searchers=searchers,
-                )
-
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=download_timeout
-        ) as shared_client:
-            results = await asyncio.gather(
-                *[_limited(index, shared_client) for index in indices]
-            )
-
-        # Persist download state for checkpoint/resume
-        for result in results:
-            idx = result.get("index")
-            if idx is not None:
-                download_state["results"][str(idx)] = {
-                    "index": idx,
-                    "status": result.get("status"),
-                    "title": result.get("candidate", {}).get("title", ""),
-                    "pdf_path": result.get("pdf_path", ""),
-                    "download_method": result.get("download_method", ""),
-                }
-        download_state["status"] = "completed"
-        await asyncio.to_thread(
-            _cache_write_session_download_state, selection_token, download_state
-        )
-
-        downloaded = sum(
-            1 for result in results if result.get("status") == "downloaded"
-        )
-        skipped_existing = sum(
-            1 for result in results if result.get("status") == "skipped_existing"
-        )
-        skipped = sum(
-            1 for result in results if result.get("status") == "skipped"
-        )
-        failed = len(results) - downloaded - skipped_existing - skipped
-        status = (
-            "ok"
-            if failed == 0
-            else "partial"
-            if downloaded or skipped_existing
-            else "failed"
-        )
-        successful_pdf_count = downloaded + skipped_existing
-        parse_prompt: Dict[str, Any] = {}
-        if successful_pdf_count > 0:
-            parse_prompt = await _parse_prompt_for_download_results(
-                selection_token=selection_token,
-                session=session,
-                results=results,
-                save_path=save_path,
-                use_scihub=use_scihub,
-                mode=mode,
-                backend=backend,
-                force=force,
-                parse_execution=parse_execution,
-                ctx=ctx,
-                custom_save_path_confirmed=custom_save_path_confirmed,
-            )
-
-        manifest_path = _download_manifest_path(save_path, selection_token)
-        manifest = {
-            "status": status,
-            "selection_token": selection_token,
-            "query": session.get("query", ""),
-            "sources": session.get("sources", ""),
-            "selected_indices": indices,
-            **save_path_meta,
-            "use_scihub": use_scihub,
-            "download_strategy": download_strategy or "env_default",
-            "use_libgen": use_libgen,
-            "libgen_base_url": libgen_base_url,
-            "download_concurrency": download_concurrency,
-            "parse_execution": parse_execution_name,
-            "mode": mode or "auto",
-            "backend": backend or "",
-            "force": force,
-            "created_at": utc_now(),
-            "results": results,
-            "total": len(results),
-            "downloaded": downloaded,
-            "skipped_existing": skipped_existing,
-            "successful_pdf_count": successful_pdf_count,
-            "skipped": skipped,
-            "failed": failed,
-            "parse_prompt": parse_prompt,
-        }
-        await asyncio.to_thread(write_json, manifest_path, manifest)
-
-        response = {**manifest, "manifest_path": manifest_path}
-        if isinstance(parse_prompt, dict) and isinstance(
-            parse_prompt.get("app"), dict
-        ):
-            response["app"] = parse_prompt["app"]
-        return _to_widget_tool_result(
-            _promote_paper_selection_app(response)
-            if _should_promote_paper_selection_app(parse_prompt)
-            else response
-        )
+            return {
+                "status": "error",
+                "message": f"Internal error in download_selected_papers: {_exc}",
+                "error_type": type(_exc).__name__,
+                "selection_token": selection_token,
+            }
 
     # =======================================================================
     #  resume_download
@@ -3141,6 +3170,7 @@ def register_orchestration_tools(mcp, searchers):
         custom_save_path_confirmed: bool = False,
         large_batch_selection: str = "auto",
         bypass_large_batch_selection: bool = False,
+        resume_token: str = "",
         ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
         """Preferred MCP-first natural-language workflow for paper research.
@@ -3154,201 +3184,323 @@ def register_orchestration_tools(mcp, searchers):
         When more than 10 papers are requested, a real checkbox UI confirmation
         is required.  Programmatic bypass is not available through this public entry point.
         """
-        intent_name = _workflow_intent_name(intent)
-        selection_mode_name = _workflow_intent_name(selection_mode)
-        parse_execution_name = _workflow_parse_execution_name(parse_execution)
-
-        # ── Auto-detect ranking profile from query text ────────────────
-        #     When no explicit ranking_profile is given, classify the query
-        #     against all registered profiles.  The top match (if confidence
-        #     ≥ 2.0) is auto-selected.  Falls back to agent-skill detection
-        #     for backward compatibility when the classifier is uncertain.
-        if not ranking_profile:
-            intents = _classify_query_intent(query, top_k=1)
-            if intents and intents[0][1] >= 2.0:
-                ranking_profile = intents[0][0]
-            else:
-                # Legacy fallback: check agent-skill vocabulary
-                query_doc = {"title": query, "abstract": ""}
-                if _agent_skill_profile_score(query_doc) >= 0.5:
-                    ranking_profile = AGENT_SKILL_RANKING_PROFILE
-
-        search_only_intents = {
-            "search",
-            "search_only",
-            "find",
-            "find_only",
-            "discover",
-            "selection",
-            "select",
-        }
-        manual_selection = selection_mode_name in {
-            "manual",
-            "choose",
-            "selection",
-            "select",
-        }
-        should_download = (
-            intent_name not in search_only_intents and not manual_selection
-        )
-        parse_disabled_intents = {
-            "download_only",
-            "search_download_only",
-            "no_parse",
-            "without_parse",
-            "skip_parse",
-            "download_no_parse",
-        }
-        should_apply_parse_policy = (
-            should_download
-            and parse_execution_name != "none"
-            and intent_name not in parse_disabled_intents
-            and _intent_explicitly_requests_parse(intent_name)
-        )
-
-        selection = await crawl_papers_for_selection(
-            query=query,
-            max_results_per_source=max_results_per_source,
-            sources=sources,
-            year=year,
-            ranking_profile=ranking_profile,
-            requested_count=count,
-        )
-        # ── Unwrap FastMCP ToolResult from crawl_papers_for_selection ──────
-        # When called internally, crawl_papers_for_selection returns a
-        # ToolResult.  Unwrap to a plain dict so downstream code can read
-        # .get("papers"), .get("selection_token"), etc.
-        selection, _selection_widget_meta = _unwrap_tool_result(selection)
-        papers = selection.get("papers", []) if isinstance(selection, dict) else []
-        if not isinstance(papers, list) or not papers:
-            return {
-                "status": "no_results",
-                "workflow": {
-                    "tool": "paper_research_workflow",
-                    "mcp_first": True,
-                    "intent": intent_name,
-                    "selection_mode": selection_mode_name,
-                },
-                "query": query,
-                "selection": selection,
-                "message": "No papers were found for the query.",
-            }
-
-        if not should_download:
-            response = {
-                "status": "selection_ready",
-                "workflow": {
-                    "tool": "paper_research_workflow",
-                    "mcp_first": True,
-                    "intent": intent_name,
-                    "selection_mode": selection_mode_name,
-                    "next_tool": PAPER_SELECTION_WIDGET_TOOL,
-                },
-                "query": query,
-                "selection": selection,
-                "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
-                "recommended_selected_indices": "",
-                "message": (
-                    "Paper candidates are ready. Present the checkbox UI "
-                    "or numbered list to the user so they can choose which "
-                    "papers to download. Do NOT call download_selected_papers "
-                    "directly — the user must select papers first."
-                ),
-            }
-            if isinstance(selection, dict) and isinstance(
-                selection.get("app"), dict
-            ):
-                response["app"] = selection["app"]
-            # ── Fallback: restore _meta from the crawl_papers_for_selection
-            #     ToolResult when the unwrapped app dict did not carry one.
-            if (
-                _selection_widget_meta
-                and isinstance(response.get("app"), dict)
-                and not isinstance(response["app"].get("_meta"), dict)
-            ):
-                response["app"]["_meta"] = _selection_widget_meta
-            return _to_widget_tool_result(_promote_paper_selection_app(response))
-
-        indices = _workflow_selection_indices(
-            selected_indices,
-            selection_mode,
-            count,
-            len(papers),
-            papers=papers,
-        )
-        if not indices:
-            return {
-                "status": "invalid_selection",
-                "workflow": {
-                    "tool": "paper_research_workflow",
-                    "mcp_first": True,
-                    "intent": intent_name,
-                    "selection_mode": selection_mode_name,
-                },
-                "query": query,
-                "selection": selection,
-                "message": "No selected papers were available to download.",
-            }
-
         try:
-            parsed_workflow_indices = _parse_selected_indices(
-                indices, len(papers)
-            )
-        except ValueError as exc:
-            return {
-                "status": "invalid_selection",
-                "workflow": {
-                    "tool": "paper_research_workflow",
-                    "mcp_first": True,
-                    "intent": intent_name,
-                    "selection_mode": selection_mode_name,
-                },
-                "query": query,
-                "selection": selection,
-                "message": str(exc),
-            }
+            intent_name = _workflow_intent_name(intent)
+            selection_mode_name = _workflow_intent_name(selection_mode)
+            parse_execution_name = _workflow_parse_execution_name(parse_execution)
 
-        if _should_require_large_batch_selection(
-            len(parsed_workflow_indices),
-            large_batch_selection=large_batch_selection,
-            bypass_large_batch_selection=False,
-            public_call=True,
-        ) or count > AUTO_PARSE_SAVED_PDF_LIMIT:
-            selection_semantics = (
-                SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE
-                if should_apply_parse_policy
-                else SELECTION_SEMANTICS_DOWNLOAD_ONLY
+            # ── Auto-detect ranking profile from query text ────────────────
+            #     When no explicit ranking_profile is given, classify the query
+            #     against all registered profiles.  The top match (if confidence
+            #     ≥ 2.0) is auto-selected.  Falls back to agent-skill detection
+            #     for backward compatibility when the classifier is uncertain.
+            if not ranking_profile:
+                intents = _classify_query_intent(query, top_k=1)
+                if intents and intents[0][1] >= 2.0:
+                    ranking_profile = intents[0][0]
+                else:
+                    # Legacy fallback: check agent-skill vocabulary
+                    query_doc = {"title": query, "abstract": ""}
+                    if _agent_skill_profile_score(query_doc) >= 0.5:
+                        ranking_profile = AGENT_SKILL_RANKING_PROFILE
+
+            search_only_intents = {
+                "search",
+                "search_only",
+                "find",
+                "find_only",
+                "discover",
+                "selection",
+                "select",
+            }
+            manual_selection = selection_mode_name in {
+                "manual",
+                "choose",
+                "selection",
+                "select",
+            }
+            should_download = (
+                intent_name not in search_only_intents and not manual_selection
             )
-            # 若 crawl_papers_for_selection 已创建本地浏览器页面，跳过重复创建
-            _skip_ui = bool(
-                isinstance(selection, dict)
-                and isinstance(selection.get("local_browser"), dict)
-                and selection["local_browser"].get("url")
+            parse_disabled_intents = {
+                "download_only",
+                "search_download_only",
+                "no_parse",
+                "without_parse",
+                "skip_parse",
+                "download_no_parse",
+            }
+            should_apply_parse_policy = (
+                should_download
+                and parse_execution_name != "none"
+                and intent_name not in parse_disabled_intents
+                and _intent_explicitly_requests_parse(intent_name)
             )
-            prompt = await _pre_download_selection_prompt(
-                selection_token=selection["selection_token"],
-                session={
+
+            # ── Resume from a previous session token when provided ────────────
+            _resume_token = (resume_token or "").strip()
+            if _resume_token:
+                _cached = await asyncio.to_thread(
+                    _cache_get_search_session, _resume_token
+                )
+                if _cached and isinstance(_cached.get("papers"), list) and _cached["papers"]:
+                    logger.info(
+                        "paper_research_workflow: resumed from token %s (%d papers)",
+                        _resume_token, len(_cached["papers"]),
+                    )
+                    selection = {
+                        "status": "ok",
+                        "selection_token": _resume_token,
+                        "papers": _cached["papers"],
+                        "sources_requested": _cached.get("sources", ""),
+                        "source_results": _cached.get("metadata", {}).get("source_results", {}),
+                        "errors": {},
+                        "ranking_profile": _cached.get("metadata", {}).get("ranking_profile", ""),
+                        "requested_count": len(_cached["papers"]),
+                        "selection_semantics": "download_selected_only",
+                    }
+                    _selection_widget_meta = None
+                else:
+                    return {
+                        "status": "invalid_resume_token",
+                        "workflow": {
+                            "tool": "paper_research_workflow",
+                            "mcp_first": True,
+                            "intent": intent_name,
+                            "selected_indices": "",
+                            "parse_execution": parse_execution_name,
+                        },
+                        "query": query,
+                        "resume_token": _resume_token,
+                        "message": (
+                            f"Session {_resume_token} not found or has no papers. "
+                            "Omit resume_token to start a fresh search."
+                        ),
+                    }
+            else:
+                selection = await crawl_papers_for_selection(
+                    query=query,
+                    max_results_per_source=max_results_per_source,
+                    sources=sources,
+                    year=year,
+                    ranking_profile=ranking_profile,
+                    requested_count=count,
+                )
+            # ── Unwrap FastMCP ToolResult from crawl_papers_for_selection ──────
+            # When called internally, crawl_papers_for_selection returns a
+            # ToolResult.  Unwrap to a plain dict so downstream code can read
+            # .get("papers"), .get("selection_token"), etc.
+            selection, _selection_widget_meta = _unwrap_tool_result(selection)
+            papers = selection.get("papers", []) if isinstance(selection, dict) else []
+            if not isinstance(papers, list) or not papers:
+                return {
+                    "status": "no_results",
+                    "workflow": {
+                        "tool": "paper_research_workflow",
+                        "mcp_first": True,
+                        "intent": intent_name,
+                        "selection_mode": selection_mode_name,
+                    },
                     "query": query,
-                    "sources": (
-                        selection.get("sources_requested", sources)
-                        if isinstance(selection, dict)
-                        else sources
+                    "selection": selection,
+                    "message": "No papers were found for the query.",
+                }
+
+            if not should_download:
+                response = {
+                    "status": "selection_ready",
+                    "workflow": {
+                        "tool": "paper_research_workflow",
+                        "mcp_first": True,
+                        "intent": intent_name,
+                        "selection_mode": selection_mode_name,
+                        "next_tool": PAPER_SELECTION_WIDGET_TOOL,
+                    },
+                    "query": query,
+                    "selection": selection,
+                    "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
+                    "recommended_selected_indices": "",
+                    "message": (
+                        "Paper candidates are ready. Present the checkbox UI "
+                        "or numbered list to the user so they can choose which "
+                        "papers to download. Do NOT call download_selected_papers "
+                        "directly — the user must select papers first."
                     ),
-                    "papers": papers,
-                },
-                indices=parsed_workflow_indices,
+                }
+                if isinstance(selection, dict) and isinstance(
+                    selection.get("app"), dict
+                ):
+                    response["app"] = selection["app"]
+                # ── Fallback: restore _meta from the crawl_papers_for_selection
+                #     ToolResult when the unwrapped app dict did not carry one.
+                if (
+                    _selection_widget_meta
+                    and isinstance(response.get("app"), dict)
+                    and not isinstance(response["app"].get("_meta"), dict)
+                ):
+                    response["app"]["_meta"] = _selection_widget_meta
+                return _to_widget_tool_result(_promote_paper_selection_app(response))
+
+            indices = _workflow_selection_indices(
+                selected_indices,
+                selection_mode,
+                count,
+                len(papers),
+                papers=papers,
+            )
+            if not indices:
+                return {
+                    "status": "invalid_selection",
+                    "workflow": {
+                        "tool": "paper_research_workflow",
+                        "mcp_first": True,
+                        "intent": intent_name,
+                        "selection_mode": selection_mode_name,
+                    },
+                    "query": query,
+                    "selection": selection,
+                    "message": "No selected papers were available to download.",
+                }
+
+            try:
+                parsed_workflow_indices = _parse_selected_indices(
+                    indices, len(papers)
+                )
+            except ValueError as exc:
+                return {
+                    "status": "invalid_selection",
+                    "workflow": {
+                        "tool": "paper_research_workflow",
+                        "mcp_first": True,
+                        "intent": intent_name,
+                        "selection_mode": selection_mode_name,
+                    },
+                    "query": query,
+                    "selection": selection,
+                    "message": str(exc),
+                }
+
+            if _should_require_large_batch_selection(
+                len(parsed_workflow_indices),
+                large_batch_selection=large_batch_selection,
+                bypass_large_batch_selection=False,
+                public_call=True,
+            ) or count > AUTO_PARSE_SAVED_PDF_LIMIT:
+                selection_semantics = (
+                    SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE
+                    if should_apply_parse_policy
+                    else SELECTION_SEMANTICS_DOWNLOAD_ONLY
+                )
+                # 若 crawl_papers_for_selection 已创建本地浏览器页面，跳过重复创建
+                _skip_ui = bool(
+                    isinstance(selection, dict)
+                    and isinstance(selection.get("local_browser"), dict)
+                    and selection["local_browser"].get("url")
+                )
+                prompt = await _pre_download_selection_prompt(
+                    selection_token=selection["selection_token"],
+                    session={
+                        "query": query,
+                        "sources": (
+                            selection.get("sources_requested", sources)
+                            if isinstance(selection, dict)
+                            else sources
+                        ),
+                        "papers": papers,
+                    },
+                    indices=parsed_workflow_indices,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    mode=parse_mode,
+                    backend=backend,
+                    force=force,
+                    parse_execution=(parse_execution if should_apply_parse_policy else "none"),
+                    custom_save_path_confirmed=custom_save_path_confirmed,
+                    selection_semantics=selection_semantics,
+                    skip_local_ui=_skip_ui,
+                )
+                response: Dict[str, Any] = {
+                    "status": "selection_required",
+                    "workflow": {
+                        "tool": "paper_research_workflow",
+                        "mcp_first": True,
+                        "intent": intent_name,
+                        "selection_mode": selection_mode_name,
+                        "selected_indices": indices,
+                        "parse_execution": (
+                            parse_execution_name if should_apply_parse_policy else "none"
+                        ),
+                        "next_tool": PAPER_SELECTION_WIDGET_TOOL,
+                    },
+                    "query": query,
+                    "count_requested": count,
+                    "selected_indices": indices,
+                    **_mcp_save_path_metadata(
+                        save_path,
+                        custom_save_path_confirmed=custom_save_path_confirmed,
+                    ),
+                    "download_selection_token": selection.get("selection_token", ""),
+                    "display_total": len(prompt.get("papers", [])) if isinstance(prompt, dict) else 0,
+                    "full_total": len(papers),
+                    "parse_execution": (
+                        parse_execution_name if should_apply_parse_policy else "none"
+                    ),
+                    "selection_semantics": selection_semantics,
+                    "large_batch_selection": _large_batch_selection_policy_name(
+                        large_batch_selection
+                    ),
+                    "message": prompt.get("message", ""),
+                }
+                if isinstance(prompt.get("app"), dict):
+                    response["app"] = prompt["app"]
+                if isinstance(prompt.get("local_browser"), dict):
+                    response["local_browser"] = prompt["local_browser"]
+                # 复用 crawl_papers_for_selection 已创建的本地浏览器页面
+                existing_lb = (
+                    selection.get("local_browser")
+                    if isinstance(selection, dict)
+                    else None
+                )
+                if isinstance(existing_lb, dict) and existing_lb.get("url"):
+                    response["local_browser"] = existing_lb
+                    response["local_browser_url"] = existing_lb.get("url")
+                return _to_widget_tool_result(
+                    _promote_paper_selection_app(
+                        _prefer_local_selection_surface(response)
+                    )
+                )
+
+            download = await download_selected_papers(
+                selection_token=selection["selection_token"],
+                selected_indices=indices,
                 save_path=save_path,
                 use_scihub=use_scihub,
+                concurrency=download_concurrency,
+                parse_execution=(
+                    "prompt" if count > AUTO_PARSE_SAVED_PDF_LIMIT
+                    else (parse_execution if should_apply_parse_policy else "none")
+                ),
                 mode=parse_mode,
                 backend=backend,
                 force=force,
-                parse_execution=(parse_execution if should_apply_parse_policy else "none"),
                 custom_save_path_confirmed=custom_save_path_confirmed,
-                selection_semantics=selection_semantics,
-                skip_local_ui=_skip_ui,
+                large_batch_selection=large_batch_selection,
+                bypass_large_batch_selection=False,
+                ctx=ctx,
             )
-            response: Dict[str, Any] = {
-                "status": "selection_required",
+            # ── Unwrap FastMCP ToolResult from download_selected_papers ──────────
+            # download_selected_papers may return a ToolResult when its own
+            # large-batch gate triggers (pre-download checkbox selection).
+            download, _download_widget_meta = _unwrap_tool_result(download)
+            if not isinstance(download, dict):
+                download = {}
+
+            response = {
+                "status": (
+                    download.get("status", "unknown")
+                    if isinstance(download, dict)
+                    else "unknown"
+                ),
                 "workflow": {
                     "tool": "paper_research_workflow",
                     "mcp_first": True,
@@ -3358,169 +3510,109 @@ def register_orchestration_tools(mcp, searchers):
                     "parse_execution": (
                         parse_execution_name if should_apply_parse_policy else "none"
                     ),
-                    "next_tool": PAPER_SELECTION_WIDGET_TOOL,
                 },
                 "query": query,
                 "count_requested": count,
                 "selected_indices": indices,
                 **_mcp_save_path_metadata(
-                    save_path,
-                    custom_save_path_confirmed=custom_save_path_confirmed,
+                    save_path, custom_save_path_confirmed=custom_save_path_confirmed
                 ),
-                "download_selection_token": selection.get("selection_token", ""),
-                "display_total": len(prompt.get("papers", [])) if isinstance(prompt, dict) else 0,
-                "full_total": len(papers),
-                "parse_execution": (
-                    parse_execution_name if should_apply_parse_policy else "none"
+                "selection": selection,
+                "download": download,
+                "parse_prompt": (
+                    download.get("parse_prompt")
+                    if isinstance(download, dict)
+                    else None
                 ),
-                "selection_semantics": selection_semantics,
-                "large_batch_selection": _large_batch_selection_policy_name(
-                    large_batch_selection
-                ),
-                "message": prompt.get("message", ""),
             }
-            if isinstance(prompt.get("app"), dict):
-                response["app"] = prompt["app"]
-            if isinstance(prompt.get("local_browser"), dict):
-                response["local_browser"] = prompt["local_browser"]
-            # 复用 crawl_papers_for_selection 已创建的本地浏览器页面
-            existing_lb = (
-                selection.get("local_browser")
-                if isinstance(selection, dict)
-                else None
-            )
-            if isinstance(existing_lb, dict) and existing_lb.get("url"):
-                response["local_browser"] = existing_lb
-                response["local_browser_url"] = existing_lb.get("url")
-            return _to_widget_tool_result(
-                _promote_paper_selection_app(
-                    _prefer_local_selection_surface(response)
+            if isinstance(download, dict) and isinstance(download.get("app"), dict):
+                response["app"] = download["app"]
+                if _should_promote_paper_selection_app(download):
+                    _promote_paper_selection_app(response)
+
+            parse_prompt = response.get("parse_prompt")
+            if not should_apply_parse_policy or parse_execution_name == "none":
+                response["workflow"]["next_tool"] = ""
+                return _to_widget_tool_result(response)
+
+            if isinstance(parse_prompt, dict) and isinstance(
+                parse_prompt.get("parse_job"), dict
+            ):
+                response["parse_job"] = parse_prompt["parse_job"]
+                response["status"] = parse_prompt["parse_job"].get(
+                    "status", response["status"]
                 )
+                response["workflow"]["next_tool"] = "get_parse_job_status"
+                return response
+
+            if (
+                isinstance(parse_prompt, dict)
+                and parse_prompt.get("interaction") == "auto_parse_saved_pdfs"
+            ):
+                response["parse"] = parse_prompt
+                response["status"] = parse_prompt.get("status", response["status"])
+                response["workflow"]["next_tool"] = "get_parsed_paper"
+                return response
+
+            if (
+                isinstance(parse_prompt, dict)
+                and parse_prompt.get("recommended_tool") == PAPER_SELECTION_WIDGET_TOOL
+            ):
+                response["workflow"]["next_tool"] = PAPER_SELECTION_WIDGET_TOOL
+                response["parse_decision_required"] = True
+                response["requires_user_parse_decision"] = True
+                return response
+
+            if not isinstance(parse_prompt, dict) or not parse_prompt.get(
+                "selection_token"
+            ):
+                response["status"] = "partial"
+                response["message"] = (
+                    "Download finished, but no parse-ready PDFs were found."
+                )
+                return response
+
+            parse_ready_total = int(parse_prompt.get("parse_ready_total") or 0)
+            if parse_ready_total <= 0:
+                response["status"] = "partial"
+                response["message"] = (
+                    "Download finished, but no parse-ready PDFs were found."
+                )
+                return response
+
+            parse_selection_token = str(parse_prompt["selection_token"])
+            parse_indices = str(
+                parse_prompt.get("recommended_selected_indices") or "all"
             )
 
-        download = await download_selected_papers(
-            selection_token=selection["selection_token"],
-            selected_indices=indices,
-            save_path=save_path,
-            use_scihub=use_scihub,
-            concurrency=download_concurrency,
-            parse_execution=(
-                "prompt" if count > AUTO_PARSE_SAVED_PDF_LIMIT
-                else (parse_execution if should_apply_parse_policy else "none")
-            ),
-            mode=parse_mode,
-            backend=backend,
-            force=force,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-            large_batch_selection=large_batch_selection,
-            bypass_large_batch_selection=False,
-            ctx=ctx,
-        )
-        # ── Unwrap FastMCP ToolResult from download_selected_papers ──────────
-        # download_selected_papers may return a ToolResult when its own
-        # large-batch gate triggers (pre-download checkbox selection).
-        download, _download_widget_meta = _unwrap_tool_result(download)
-        if not isinstance(download, dict):
-            download = {}
-
-        response = {
-            "status": (
-                download.get("status", "unknown")
-                if isinstance(download, dict)
-                else "unknown"
-            ),
-            "workflow": {
-                "tool": "paper_research_workflow",
-                "mcp_first": True,
-                "intent": intent_name,
-                "selection_mode": selection_mode_name,
-                "selected_indices": indices,
-                "parse_execution": (
-                    parse_execution_name if should_apply_parse_policy else "none"
-                ),
-            },
-            "query": query,
-            "count_requested": count,
-            "selected_indices": indices,
-            **_mcp_save_path_metadata(
-                save_path, custom_save_path_confirmed=custom_save_path_confirmed
-            ),
-            "selection": selection,
-            "download": download,
-            "parse_prompt": (
-                download.get("parse_prompt")
-                if isinstance(download, dict)
-                else None
-            ),
-        }
-        if isinstance(download, dict) and isinstance(download.get("app"), dict):
-            response["app"] = download["app"]
-            if _should_promote_paper_selection_app(download):
-                _promote_paper_selection_app(response)
-
-        parse_prompt = response.get("parse_prompt")
-        if not should_apply_parse_policy or parse_execution_name == "none":
-            response["workflow"]["next_tool"] = ""
-            return _to_widget_tool_result(response)
-
-        if isinstance(parse_prompt, dict) and isinstance(
-            parse_prompt.get("parse_job"), dict
-        ):
-            response["parse_job"] = parse_prompt["parse_job"]
-            response["status"] = parse_prompt["parse_job"].get(
-                "status", response["status"]
+            # Lazy-import cross-tool calls from .core
+            from .core import (  # noqa: PLC0415
+                _run_parse_selected_papers as parse_selected_papers,
+                _run_submit_parse_job as submit_parse_job,
             )
-            response["workflow"]["next_tool"] = "get_parse_job_status"
-            return response
 
-        if (
-            isinstance(parse_prompt, dict)
-            and parse_prompt.get("interaction") == "auto_parse_saved_pdfs"
-        ):
-            response["parse"] = parse_prompt
-            response["status"] = parse_prompt.get("status", response["status"])
-            response["workflow"]["next_tool"] = "get_parsed_paper"
-            return response
+            if parse_execution_name == "sync":
+                parse_result = await parse_selected_papers(
+                    selection_token=parse_selection_token,
+                    selected_indices=parse_indices,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    mode=parse_mode,
+                    backend=backend,
+                    force=force,
+                    custom_save_path_confirmed=custom_save_path_confirmed,
+                )
+                response["parse"] = parse_result
+                response["status"] = (
+                    parse_result.get("status", response["status"])
+                    if isinstance(parse_result, dict)
+                    else response["status"]
+                )
+                response["workflow"]["next_tool"] = "get_parsed_paper"
+                return response
 
-        if (
-            isinstance(parse_prompt, dict)
-            and parse_prompt.get("recommended_tool") == PAPER_SELECTION_WIDGET_TOOL
-        ):
-            response["workflow"]["next_tool"] = PAPER_SELECTION_WIDGET_TOOL
-            response["parse_decision_required"] = True
-            response["requires_user_parse_decision"] = True
-            return response
-
-        if not isinstance(parse_prompt, dict) or not parse_prompt.get(
-            "selection_token"
-        ):
-            response["status"] = "partial"
-            response["message"] = (
-                "Download finished, but no parse-ready PDFs were found."
-            )
-            return response
-
-        parse_ready_total = int(parse_prompt.get("parse_ready_total") or 0)
-        if parse_ready_total <= 0:
-            response["status"] = "partial"
-            response["message"] = (
-                "Download finished, but no parse-ready PDFs were found."
-            )
-            return response
-
-        parse_selection_token = str(parse_prompt["selection_token"])
-        parse_indices = str(
-            parse_prompt.get("recommended_selected_indices") or "all"
-        )
-
-        # Lazy-import cross-tool calls from .core
-        from .core import (  # noqa: PLC0415
-            _run_parse_selected_papers as parse_selected_papers,
-            _run_submit_parse_job as submit_parse_job,
-        )
-
-        if parse_execution_name == "sync":
-            parse_result = await parse_selected_papers(
+            parse_job = await submit_parse_job(
+                parse_fn=parse_selected_papers,
                 selection_token=parse_selection_token,
                 selected_indices=parse_indices,
                 save_path=save_path,
@@ -3530,34 +3622,27 @@ def register_orchestration_tools(mcp, searchers):
                 force=force,
                 custom_save_path_confirmed=custom_save_path_confirmed,
             )
-            response["parse"] = parse_result
+            response["parse_job"] = parse_job
             response["status"] = (
-                parse_result.get("status", response["status"])
-                if isinstance(parse_result, dict)
+                parse_job.get("status", response["status"])
+                if isinstance(parse_job, dict)
                 else response["status"]
             )
-            response["workflow"]["next_tool"] = "get_parsed_paper"
+            response["workflow"]["next_tool"] = "get_parse_job_status"
             return response
-
-        parse_job = await submit_parse_job(
-            parse_fn=parse_selected_papers,
-            selection_token=parse_selection_token,
-            selected_indices=parse_indices,
-            save_path=save_path,
-            use_scihub=use_scihub,
-            mode=parse_mode,
-            backend=backend,
-            force=force,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-        )
-        response["parse_job"] = parse_job
-        response["status"] = (
-            parse_job.get("status", response["status"])
-            if isinstance(parse_job, dict)
-            else response["status"]
-        )
-        response["workflow"]["next_tool"] = "get_parse_job_status"
-        return response
+        except Exception as _exc:
+            import traceback as _tb
+            _logger = logging.getLogger(__name__)
+            _logger.error(
+                "Unhandled exception in paper_research_workflow: %s",
+                _exc, exc_info=True,
+            )
+            return {
+                "status": "error",
+                "message": f"Internal error in paper_research_workflow: {_exc}",
+                "error_type": type(_exc).__name__,
+                "query": query,
+            }
 
     # ---- Export closures to module level for direct callers (CLI, tests) ----
     _set_module_functions(
