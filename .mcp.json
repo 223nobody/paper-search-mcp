@@ -12,7 +12,8 @@
       ],
       "env": {
         "PAPER_SEARCH_MCP_SEARCH_PROFILE": "pdf-cs",
-        "PAPER_SEARCH_MCP_MINERU_MODE": "auto"
+        "PAPER_SEARCH_MCP_MINERU_MODE": "auto",
+        "PAPER_SEARCH_MCP_MINERU_LANGUAGE": "en"
       }
     }
   }
