@@ -11,7 +11,9 @@ description: MCP-first academic paper workflow. Use when the user asks to find p
 interface. Every operation — search, download, parse, cache — should go through
 MCP tools. The MCP server:
 
-- Is already configured in `.claude/mcp.json` and auto-starts with Claude Code
+- Is already configured at **user scope (global)** in `~/.claude.json` and
+  auto-starts with Claude Code in any project; the repo also ships a copy in
+  `.claude/mcp.json` for out-of-the-box use
 - Exposes 50+ tools with full type safety and structured output
 - Manages selection sessions, background jobs, and checkbox widgets
 - Enforces safety policies (large-batch confirmation, fallback chains)
@@ -86,8 +88,9 @@ If the MCP client cannot render the widget, call:
 
 ## Source Selection Guide
 
-The server is configured with `PAPER_SEARCH_MCP_SEARCH_PROFILE=pdf-cs` in
-`.claude/mcp.json`. Available profiles and source sets:
+The server is configured with `PAPER_SEARCH_MCP_SEARCH_PROFILE=pdf-cs` (set in
+the global user-scope MCP config; the repo's `.claude/mcp.json` carries the same
+values). Available profiles and source sets:
 
 | Domain | Recommended Sources |
 |--------|-------------------|
@@ -180,21 +183,28 @@ PYTHONIOENCODING=utf-8 uv run paper-search cache list
 
 ## Environment
 
-Configuration is in `.claude/mcp.json`:
+The server is registered at **user scope (global)** in `~/.claude.json` and
+auto-starts in any project (verify with `claude mcp list`):
 ```json
 {
   "mcpServers": {
     "paper-search-mcp": {
+      "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "C:\\code\\paper-search-mcp", "-m", "paper_search_mcp.server"],
+      "args": ["run", "--frozen", "--directory", "C:\\code\\paper-search-mcp", "-m", "paper_search_mcp.server"],
       "env": {
         "PAPER_SEARCH_MCP_SEARCH_PROFILE": "pdf-cs",
-        "PAPER_SEARCH_MCP_MINERU_MODE": "auto"
+        "PAPER_SEARCH_MCP_MINERU_MODE": "auto",
+        "PAPER_SEARCH_MCP_MINERU_LANGUAGE": "en"
       }
     }
   }
 }
 ```
+
+The repo also ships the same server in `.claude/mcp.json`, so cloning the repo
+works out of the box on other machines. The user-scope config takes precedence
+in this project.
 
 Parser/cache overrides via `.env`:
 ```dotenv
