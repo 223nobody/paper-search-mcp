@@ -1,12 +1,5 @@
 <h1 align="center"> Paper Search MCP</h1>
 
-> **Current UI routing (2026-09)**: T1 MCP Apps rendering requires the wire
-> capability `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes`
-> to contain `text/html;profile=mcp-app`. dsh/ZCode names are diagnostic only;
-> clients without that capability receive the same checkbox page as a browser
-> URL. The MCP selection path does not open a GUI, use named-pipe IPC, or
-> return a numbered text fallback. `PAPER_SEARCH_MCP_SELECTION_UI_MODE=off`
-> returns `ui_disabled`.
 
 <p align="center">
   <b>🔬 A multi-source academic paper MCP server — search, download, and parse papers with AI agents</b>
@@ -138,7 +131,7 @@ Once the MCP is running, describe your needs in natural language. Example:
 - 🆓 **Free-First Design**: Open and public sources are prioritized before any optional commercial or restricted integrations.
 - 🔑 **Optional API-Key Enhancement**: Sources like Semantic Scholar can work better with a user-provided API key, but are not intended to force paid usage.
 - 📖 **Discovery + Retrieval Workflow**: Google Scholar and Crossref can be used for discovery and DOI backfilling, while open repositories and publisher links are used for lawful full-text resolution where available.
-- 📂 **OA-First Fallback Chain**: `download_with_fallback` now follows source-native download → OpenAIRE/CORE/Europe PMC/PMC discovery → Unpaywall DOI resolution → optional Sci-Hub. Sci-Hub fallback is opt-in.
+- 📂 **Fastest Download Chain (default)**: `download_with_fallback` races open-access sources (source-native, OpenAIRE/CORE/Europe PMC/PMC discovery, Unpaywall, publisher direct) **and grey sources (LibGen, Sci-Hub)** in parallel and returns the first valid PDF; if all fail it falls back to scansci-pdf (anti-detection browser + Tor + 13 sources). Switch via `PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY` (`fastest` / `race` / `oa_first` / `sequential`).
 - 🧪 **MinerU-First Parsing Pipeline**: Local PDFs can be parsed into `full.md`, `content_list.json`, `manifest.json`, and extracted assets beside the source PDF. With `PAPER_SEARCH_MCP_MINERU_API_KEY` configured, `extract`/`cloud_api` mode can submit multiple PDFs through one MinerU batch; `auto` still falls back through local API/CLI and `pypdf`.
 - ⚡ **Saved-PDF Parsing Prompts + Selection UI**: Download/read tools auto-submit a background MinerU job for saved-PDF sets of 10 or fewer. Batches over 10 PDFs surface the MCP Apps checkbox selector before download; after explicit selection, download-and-parse flows call `download_and_parse_selected_papers`.
 - 🔎 **Fast Parsed-Paper Search**: Parsed blocks are indexed into `.paper_search_cache/parsed_index.sqlite3` with SQLite FTS when available, while file-based search remains the fallback.
@@ -192,7 +185,7 @@ This matrix reflects **verified live-integration results** from functional and e
 | HAL                | ✅               | ✅ (record-dependent) | ✅ (record-dependent) | Open API; reliable                                                                                           |
 | SSRN               | ⚠️               | ⚠️ best-effort        | ⚠️ best-effort        | 403 bot-detection active; public PDF only                                                                    |
 | Unpaywall          | ✅ (DOI lookup)  | ❌                    | ❌                    | **Requires** `PAPER_SEARCH_MCP_UNPAYWALL_EMAIL`                                                              |
-| Sci-Hub (optional) | ⚠️ fallback-only | ✅                    | ❌                    | Optional; unstable mirrors; user responsibility                                                              |
+| Sci-Hub (grey)      | ⚠️ raced in fastest | ✅                    | ❌                    | In default fastest race; unstable mirrors; user responsibility                                                              |
 | **IEEE Xplore** 🔑 | 🚧 skeleton      | 🚧 skeleton           | 🚧 skeleton           | Requires `PAPER_SEARCH_MCP_IEEE_API_KEY` to activate                                                         |
 | **ACM DL** 🔑      | 🚧 skeleton      | 🚧 skeleton           | 🚧 skeleton           | Requires `PAPER_SEARCH_MCP_ACM_API_KEY` to activate                                                          |
 
@@ -303,7 +296,7 @@ Additional free-source connectors: 🟢 `zenodo` (search + PDF), 🟢 `hal` (sea
 
 ## ⚖️ Sci-Hub Notice
 
-Sci-Hub is available as an optional, opt-in connector — not the default full-text path. Availability is unstable, legal risks vary by jurisdiction, and users are responsible for enabling it. Open-access sources should always be tried first.
+LibGen and Sci-Hub are now part of the default `fastest` download race (alongside open-access sources), and scansci-pdf runs as a last-resort fallback. Grey sources carry legal risk that varies by jurisdiction — enabling them is the user's responsibility. To restrict downloads to open-access sources only, set `PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY=race` or `oa_first` and disable `PAPER_SEARCH_MCP_LIBGEN_ENABLED` / `PAPER_SEARCH_MCP_SCANSCI_FALLBACK`.
 
 ---
 
@@ -669,6 +662,12 @@ PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS=300
 PAPER_SEARCH_MCP_ARXIV_TIMEOUT_SECONDS=8
 PAPER_SEARCH_MCP_ARXIV_MAX_ATTEMPTS=2
 PAPER_SEARCH_MCP_DOWNLOAD_TIMEOUT_SECONDS=20
+PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY=fastest
+PAPER_SEARCH_MCP_DOWNLOAD_MAX_RETRIES=1
+PAPER_SEARCH_MCP_DOWNLOAD_RETRY_BACKOFF_SECONDS=0.3
+PAPER_SEARCH_MCP_LIBGEN_ENABLED=true
+PAPER_SEARCH_MCP_SCANSCI_FALLBACK=true
+PAPER_SEARCH_MCP_SCANSCI_FALLBACK_TIMEOUT_SECONDS=25
 PAPER_SEARCH_MCP_PARSE_CONCURRENCY=3
 PAPER_SEARCH_MCP_PARSE_PROMPT_TIMEOUT_SECONDS=180
 PAPER_SEARCH_MCP_PARSE_PROMPT_TIMEOUT_PER_PAPER_SECONDS=15

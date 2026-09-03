@@ -1,12 +1,5 @@
 <h1 align="center"> Paper Search MCP</h1>
 
-> **Current UI routing (2026-09)**: T1 MCP Apps rendering requires the wire
-> capability `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes`
-> to contain `text/html;profile=mcp-app`. dsh/ZCode names are diagnostic only;
-> clients without that capability receive the same checkbox page as a browser
-> URL. The MCP selection path does not open a GUI, use named-pipe IPC, or
-> return a numbered text fallback. `PAPER_SEARCH_MCP_SELECTION_UI_MODE=off`
-> returns `ui_disabled`.
 
 <p align="center"><b>🔬 一站式学术论文 MCP 服务 —— 检索、下载、解析，让 AI Agent 成为你的研究助手</b></p>
 
@@ -98,7 +91,7 @@ MCP 可用后，只需用自然语言描述需求即可，Agent 会自动调用�
 
 - 🔍 **多源论文检索**：支持 arXiv、PubMed、bioRxiv、medRxiv、Semantic Scholar、Crossref、OpenAlex、PMC、CORE、Europe PMC、dblp、OpenAIRE、CiteSeerX、DOAJ、BASE、Zenodo、HAL、SSRN、Unpaywall 等来源。
 - 📋 **统一结果格式**：不同来源返回的论文会被整理为统一字段，便于 Agent 后续选择、下载和解析。
-- 📖 **开放获取优先下载**：`download_with_fallback` 会优先使用来源原生下载、开放仓储、Unpaywall 等路径；Sci-Hub 保持可选且默认不启用。
+- 📥 **最快链下载（fastest 默认）**：`download_with_fallback` 默认并行 race 开放获取源（来源原生、开放仓储、Unpaywall、出版商直链）**和灰色源（LibGen、Sci-Hub）**，先成功先返回；全部失败后自动用 scansci-pdf（反检测浏览器 + Tor + 13 源）兜底。可用 `PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY` 切换 `fastest` / `race` / `oa_first` / `sequential`。
 - ⚡ **保存 PDF 后解析 / 大批量选择**：只要 MCP 工具路径中发生 PDF 保存行为，就会返回 `parse_prompt`；10 篇及以下默认自动提交 MinerU 后台解析任务，超过 10 篇先返回 checkbox/编号选择，用户确认后才下载并按需解析。
 - ✅ **Checkbox/多选 UI 与降级机制**：支持 MCP Elicitation 或 MCP Apps 的客户端可以显示多选/checkbox UI；不支持时返回 `selection_token` 和编号列表，再按语义调用 `download_and_parse_selected_papers`、`submit_parse_job` 或 `parse_selected_papers`。
 - 🧪 **MinerU 优先解析**：支持官方 extract API、本地 MinerU API、MinerU CLI，并保留 `pypdf` 作为兜底文本提取方式。
@@ -109,7 +102,7 @@ MCP 可用后，只需用自然语言描述需求即可，Agent 会自动调用�
 - 🕐 **后台解析任务**：长时间批量解析可用 `submit_parse_job` 提交，再用 `get_parse_job_status`、`list_parse_jobs`、`cancel_parse_job` 管理。
 - 🪶 **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session、下载健康统计和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
 - 🔌 **MCP 优先、CLI 兜底**：自然语言 Agent 场景优先通过 MCP 工具调用；命令行工具保留给手动验证、脚本和 MCP 不可用时的兜底。
-- 🏢 **出版商发行版下载（MCP Chaining）**：通过内置的 scansci-pdf MCP Chaining 集成，将已下载的 arXiv 论文自动升级为出版商最终发行版 PDF（Nature、Elsevier、Springer 等）。自动安装、零配置、按需使用，所有现有功能不受影响。要求 scansci-pdf >= 1.14.0。
+- 🏢 **出版商发行版下载（MCP Chaining）**：通过内置的 scansci-pdf MCP Chaining 集成，将已下载的 arXiv 论文自动升级为出版商最终发行版 PDF（Nature、Elsevier、Springer 等）。自动安装、零配置、按需使用，所有现有功能不受影响。要求 scansci-pdf >= 1.14.0。**scansci-pdf 同时已作为 `download_with_fallback` 兜底链的最后一步自动接入**（OA/灰色源都失败后自动尝试，限时）。
 - 🎓 **机构通道登录**：付费墙论文可通过 `publisher_login` 走 WebVPN（100+ 高校）、CARSI、EZProxy 等机构通道；`publisher_schools` 搜索/设置学校，`publisher_channel_status` 校验通道状态，`publisher_diagnostics` 一键诊断网络与数据源健康。
 
 ---
@@ -192,6 +185,15 @@ PAPER_SEARCH_MCP_SEARCH_TIMEOUT_SECONDS=18
 PAPER_SEARCH_MCP_SEARCH_SOURCE_TIMEOUT_SECONDS=12
 PAPER_SEARCH_MCP_SEARCH_CACHE_TTL_SECONDS=300
 PAPER_SEARCH_MCP_PARSE_CONCURRENCY=3
+
+# 下载策略（fastest 默认：并行 race OA + LibGen/Sci-Hub 灰色源，scansci-pdf 兜底）
+PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY=fastest
+PAPER_SEARCH_MCP_DOWNLOAD_TIMEOUT_SECONDS=20
+PAPER_SEARCH_MCP_DOWNLOAD_MAX_RETRIES=1
+PAPER_SEARCH_MCP_DOWNLOAD_RETRY_BACKOFF_SECONDS=0.3
+PAPER_SEARCH_MCP_LIBGEN_ENABLED=true
+PAPER_SEARCH_MCP_SCANSCI_FALLBACK=true
+PAPER_SEARCH_MCP_SCANSCI_FALLBACK_TIMEOUT_SECONDS=25
 
 PAPER_SEARCH_MCP_MINERU_MODE=auto
 PAPER_SEARCH_MCP_MINERU_API_KEY=
@@ -467,7 +469,7 @@ arxiv_1706.03762, arxiv_1810.04805
 - `render_mineru_api_key_setup_app`：渲染 MinerU API key 输入框。
 - `configure_mineru_api_key`：把 MinerU API key 写入 `.env`。
 - `list_search_sessions` / `get_search_session` / `delete_search_session`：管理编号选择 session。
-- `download_with_fallback`：按开放获取优先策略下载 PDF。
+- `download_with_fallback`：按 `fastest` 链下载 PDF（并行 race OA + LibGen/Sci-Hub 灰色源，scansci-pdf 兜底）。
 - `parse_downloaded_paper`：下载论文后直接进入 MinerU 解析流程。
 - `parse_pdf_with_mineru`：解析本地 PDF。
 - `mineru_health_check`：检查 MinerU extract/API/CLI/pypdf 可用性。
@@ -549,8 +551,8 @@ arxiv_1706.03762, arxiv_1810.04805
 
 ## 🛡️ 合规与安全提示
 
-- 项目默认采用开放获取优先策略，建议优先使用来源原生 PDF、开放仓储和 Unpaywall 等路径。
-- Sci-Hub 属于可选能力，不应作为默认下载路径；是否启用以及如何使用由用户自行承担责任。
+- 默认 `fastest` 下载策略会把灰色源（LibGen、Sci-Hub）纳入并行 race，并用 scansci-pdf 兜底。灰色源的使用存在法律风险（视司法辖区而定），是否启用及如何使用由用户自行承担责任。
+- 如需只走开放获取源：设置 `PAPER_SEARCH_MCP_DOWNLOAD_STRATEGY=race` 或 `oa_first`，并关闭 `PAPER_SEARCH_MCP_LIBGEN_ENABLED`、`PAPER_SEARCH_MCP_SCANSCI_FALLBACK`。
 - 不要把 `PAPER_SEARCH_MCP_MINERU_API_KEY`、Semantic Scholar key、CORE key 等真实凭据写入 README、提交记录或公开 issue。
 - `.env` 适合保存本地凭据，发布前应确认 `.gitignore` 已忽略该文件。
 
