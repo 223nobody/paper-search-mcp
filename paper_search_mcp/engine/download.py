@@ -69,6 +69,9 @@ DOWNLOAD_RETRY_BACKOFF_ENV = "DOWNLOAD_RETRY_BACKOFF_SECONDS"
 PAPER_FETCH_FALLBACK_ENV = "PAPER_FETCH_PDF_FALLBACK"
 LIBGEN_ENABLED_ENV = "LIBGEN_ENABLED"
 LIBGEN_BASE_URL_ENV = "LIBGEN_BASE_URL"
+SCANSCI_FALLBACK_ENV = "SCANSCI_FALLBACK"
+SCANSCI_FALLBACK_TIMEOUT_ENV = "SCANSCI_FALLBACK_TIMEOUT_SECONDS"
+ARXIV_METADATA_TIMEOUT_ENV = "ARXIV_METADATA_TIMEOUT_SECONDS"
 SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
 SAVED_PDF_BATCH_PROMPT_ENV = "SAVED_PDF_BATCH_PROMPT"
 SAVED_PDF_BATCH_WINDOW_ENV = "SAVED_PDF_BATCH_WINDOW_SECONDS"
@@ -92,12 +95,19 @@ def _explicit_save_path_required() -> bool:
 
 
 def _download_strategy(strategy: str = "") -> str:
-    """Return the normalized download strategy name."""
-    value = (strategy or get_env(DOWNLOAD_STRATEGY_ENV, "race")).strip().lower()
+    """Return the normalized download strategy name.
+
+    ``fastest`` (the default) races every source — open-access *and* grey
+    (LibGen, Sci-Hub) — in parallel and returns the first valid PDF, matching
+    scansci-pdf's source-racing behaviour. ``race`` races OA sources only,
+    ``oa_first`` stops after the OA race with no grey fallback, and
+    ``sequential`` tries methods one-by-one in ranked order.
+    """
+    value = (strategy or get_env(DOWNLOAD_STRATEGY_ENV, "fastest")).strip().lower()
     value = value.replace("-", "_")
-    if value in {"race", "oa_first", "sequential"}:
+    if value in {"fastest", "race", "oa_first", "sequential"}:
         return value
-    return "race"
+    return "fastest"
 
 
 def _libgen_enabled(use_libgen: Optional[bool] = None) -> bool:
@@ -325,8 +335,8 @@ async def _download_from_url(
     save_path = resolve_save_path(save_path)
     os.makedirs(save_path, exist_ok=True)
     output_path = Path(save_path) / _pdf_filename_from_hint(filename_hint)
-    max_retries = _env_int(DOWNLOAD_MAX_RETRIES_ENV, 3, minimum=0)
-    retry_backoff = _env_float(DOWNLOAD_RETRY_BACKOFF_ENV, 1.0, minimum=0.1)
+    max_retries = _env_int(DOWNLOAD_MAX_RETRIES_ENV, 2, minimum=0)
+    retry_backoff = _env_float(DOWNLOAD_RETRY_BACKOFF_ENV, 0.5, minimum=0.1)
 
     # ── Resume support: look for an existing partial .tmp file ──────────
     resume_pos = 0
@@ -623,6 +633,45 @@ async def _try_libgen_download(
     return {"method": "libgen", "path": None, "error": "LibGen did not return a valid PDF"}
 
 
+async def _try_scihub_download(
+    *, source_name: str, paper_id: str, doi: str, title: str, save_path: str,
+    scihub_base_url: str = "",
+) -> Dict[str, Any]:
+    ident = (doi or "").strip() or (title or "").strip() or (paper_id or "").strip()
+    if not ident:
+        return {"method": "scihub", "path": None, "error": "no DOI, title, or paper_id provided"}
+    try:
+        from ..academic_platforms.sci_hub import SciHubFetcher
+    except Exception as exc:
+        return {"method": "scihub", "path": None, "error": f"Sci-Hub fetcher import failed: {exc}"}
+
+    try:
+        fetcher = SciHubFetcher(
+            base_url=scihub_base_url or "https://sci-hub.se",
+            output_dir=save_path,
+        )
+        path = await asyncio.to_thread(fetcher.download_pdf, ident)
+    except Exception as exc:
+        return {"method": "scihub", "path": None, "error": str(exc)}
+    if path and os.path.exists(path) and _is_valid_pdf_file(path):
+        record_download(
+            pdf_path=path,
+            source=source_name,
+            paper_id=paper_id,
+            doi=doi,
+            title=title,
+            downloader="scihub",
+            legal_status="user_opt_in_scihub",
+        )
+        return {
+            "method": "scihub",
+            "path": path,
+            "downloader": "scihub",
+            "legal_status": "user_opt_in_scihub",
+        }
+    return {"method": "scihub", "path": None, "error": "Sci-Hub did not return a valid PDF"}
+
+
 def _paper_fetch_pdf_query(*, paper_id: str, doi: str, title: str) -> str:
     return (doi or "").strip() or (paper_id or "").strip() or (title or "").strip()
 
@@ -722,6 +771,7 @@ async def _attempt_download_method(
     unpaywall_resolver: Any = None,
     client: Optional[httpx.AsyncClient] = None,
     libgen_base_url: str = "",
+    scihub_base_url: str = "",
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     try:
@@ -764,6 +814,15 @@ async def _attempt_download_method(
                 save_path=save_path,
                 libgen_base_url=libgen_base_url,
             )
+        elif method == "scihub":
+            result = await _try_scihub_download(
+                source_name=source_name,
+                paper_id=paper_id,
+                doi=doi,
+                title=title,
+                save_path=save_path,
+                scihub_base_url=scihub_base_url,
+            )
         else:
             result = {"method": method, "path": None, "error": f"Unknown download method '{method}'"}
         ok = bool(result.get("path") and _is_valid_pdf_file(result.get("path")))
@@ -800,6 +859,7 @@ async def _race_download_methods(
     unpaywall_resolver: Any = None,
     client: Optional[httpx.AsyncClient] = None,
     libgen_base_url: str = "",
+    scihub_base_url: str = "",
 ) -> tuple[Optional[Dict[str, Any]], List[str]]:
     if not methods:
         return None, []
@@ -818,6 +878,7 @@ async def _race_download_methods(
                 unpaywall_resolver=unpaywall_resolver,
                 client=client,
                 libgen_base_url=libgen_base_url,
+                scihub_base_url=scihub_base_url,
             )
         ): method
         for method in methods
@@ -854,6 +915,7 @@ async def _sequential_download_methods(
     unpaywall_resolver: Any = None,
     client: Optional[httpx.AsyncClient] = None,
     libgen_base_url: str = "",
+    scihub_base_url: str = "",
 ) -> tuple[Optional[Dict[str, Any]], List[str]]:
     errors: List[str] = []
     for method in methods:
@@ -870,6 +932,7 @@ async def _sequential_download_methods(
                 unpaywall_resolver=unpaywall_resolver,
                 client=client,
                 libgen_base_url=libgen_base_url,
+                scihub_base_url=scihub_base_url,
             )
         except Exception as exc:
             errors.append(f"{method}: {exc}")
@@ -890,6 +953,7 @@ async def _race_oa_downloads(
     strategy: str = "",
     use_libgen: Optional[bool] = None,
     libgen_base_url: str = "",
+    scihub_base_url: str = "",
 ) -> tuple[Optional[Dict[str, Any]], List[str]]:
     resolved_strategy = _download_strategy(strategy)
     ranked_oa_methods = rank_download_methods(["primary", "repositories", "unpaywall"], source=source_name)
@@ -913,10 +977,15 @@ async def _race_oa_downloads(
             unpaywall_resolver=unpaywall_resolver,
             client=client,
             libgen_base_url=libgen_base_url,
+            scihub_base_url=scihub_base_url,
         )
 
     race_methods = list(ranked_oa_methods)
-    if resolved_strategy == "race" and libgen_allowed:
+    if resolved_strategy == "fastest":
+        # Race OA *and* grey sources in parallel; first valid PDF wins.
+        # Mirrors scansci-pdf's source-racing "fastest" behaviour.
+        race_methods.extend(["libgen", "scihub"])
+    elif resolved_strategy == "race" and libgen_allowed:
         race_methods.append("libgen")
 
     result, errors = await _race_download_methods(
@@ -931,6 +1000,7 @@ async def _race_oa_downloads(
         unpaywall_resolver=unpaywall_resolver,
         client=client,
         libgen_base_url=libgen_base_url,
+        scihub_base_url=scihub_base_url,
     )
     if result:
         return result, errors
@@ -942,6 +1012,82 @@ async def _race_oa_downloads(
 # ---------------------------------------------------------------------------
 # Full fallback download
 # ---------------------------------------------------------------------------
+
+async def _resolve_arxiv_id_from_metadata(
+    doi: str, title: str, searchers: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve a publisher DOI/title to an arXiv preprint ID via metadata sources.
+
+    The OA-fallback chain is routinely handed paywalled publisher DOIs (IEEE
+    CVPR/ICCV, AAAI, ACL, NeurIPS) that have no open-access location registered
+    in Unpaywall. Nearly all such papers have a freely-available arXiv preprint,
+    but nothing in the chain maps the publisher DOI back to that preprint. This
+    closes the gap by asking OpenAlex and Semantic Scholar — both of which expose
+    the arXiv identifier — and returns the arXiv ID so the downloader can route
+    through ``arxiv``.
+
+    Best-effort: any lookup failure returns "" and the chain proceeds unchanged.
+    """
+    if not searchers:
+        return ""
+
+    meta_timeout = _env_float(ARXIV_METADATA_TIMEOUT_ENV, 6.0, minimum=1.0)
+
+    async def _openalex_arxiv() -> str:
+        openalex = searchers.get("openalex")
+        if openalex is None or not hasattr(openalex, "get_arxiv_url_by_doi") or not doi:
+            return ""
+        try:
+            arxiv_url = await asyncio.to_thread(openalex.get_arxiv_url_by_doi, doi)
+            return _extract_arxiv_id(arxiv_url)
+        except Exception:
+            return ""
+
+    async def _semantic_arxiv() -> str:
+        semantic = searchers.get("semantic")
+        if semantic is None or not hasattr(semantic, "get_paper_details") or not doi:
+            return ""
+        try:
+            paper = await asyncio.to_thread(semantic.get_paper_details, f"DOI:{doi}")
+        except Exception:
+            return ""
+        extra = getattr(paper, "extra", None) or {}
+        return _extract_arxiv_id(extra.get("arxiv_id"), getattr(paper, "doi", ""))
+
+    # 1) Race OpenAlex + Semantic DOI lookups in parallel, bounded by a single
+    #    timeout so a paywalled DOI with no arXiv preprint can't stall the
+    #    download chain for three serial ~30s calls.
+    if doi:
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(_openalex_arxiv(), _semantic_arxiv()),
+                timeout=meta_timeout,
+            )
+        except (asyncio.TimeoutError, Exception):
+            results = ["", ""]
+        for arxiv_id in results or []:
+            if arxiv_id:
+                return arxiv_id
+
+    # 2) Last resort: title search (only when no DOI is available).
+    if title:
+        semantic = searchers.get("semantic")
+        if semantic is not None and hasattr(semantic, "search"):
+            try:
+                papers = await asyncio.wait_for(
+                    asyncio.to_thread(semantic.search, title, None, 3),
+                    timeout=meta_timeout,
+                )
+            except (asyncio.TimeoutError, Exception):
+                papers = None
+            for paper in papers or []:
+                extra = getattr(paper, "extra", None) or {}
+                arxiv_id = _extract_arxiv_id(extra.get("arxiv_id"), getattr(paper, "doi", ""))
+                if arxiv_id:
+                    return arxiv_id
+
+    return ""
+
 
 async def _download_with_fallback_path(
     source: str, paper_id: str, doi: str = "", title: str = "",
@@ -967,6 +1113,8 @@ async def _download_with_fallback_path(
     sn, pid, pdoi = _source_from_identifier(sn, paper_id, doi)
     paper_id, doi = pid, pdoi
     arxiv_id = _extract_arxiv_id(paper_id, doi, title)
+    if not arxiv_id:
+        arxiv_id = await _resolve_arxiv_id_from_metadata(doi, title, searchers)
     if arxiv_id:
         sn, paper_id = "arxiv", arxiv_id
     tried_methods: List[str] = []
@@ -975,6 +1123,7 @@ async def _download_with_fallback_path(
         searchers=searchers or {}, repository_searchers=repository_searchers,
         unpaywall_resolver=unpaywall_resolver, client=client,
         strategy=download_strategy, use_libgen=use_libgen, libgen_base_url=libgen_base_url,
+        scihub_base_url=scihub_base_url,
     )
     tried_methods.append("oa_race")
     if result and isinstance(result.get("path"), str):
@@ -1011,22 +1160,51 @@ async def _download_with_fallback_path(
             if libgen_result.get("error"):
                 errors.append(f"libgen: {libgen_result['error']}")
 
+    # ── scansci-pdf publisher download: last resort for paywalled DOIs ──
+    #    Heavyweight (browser/Tor + 13 racing sources), so it runs only after
+    #    the fast OA/grey race and paper_fetch have all failed, with a short
+    #    bounded timeout to avoid stalling the chain.
+    if doi and _env_flag_enabled(SCANSCI_FALLBACK_ENV, default="true"):
+        scansci_timeout = _env_int(SCANSCI_FALLBACK_TIMEOUT_ENV, 45, minimum=5)
+        tried_methods.append("scansci_pdf")
+        try:
+            from ..tools.publisher import _download_publisher_by_doi
+            pub = await asyncio.wait_for(
+                _download_publisher_by_doi(doi, save_path, scansci_timeout, title),
+                timeout=scansci_timeout + 30,
+            )
+        except asyncio.TimeoutError:
+            pub = {"status": "timeout", "message": "scansci-pdf fallback timed out"}
+        except Exception as exc:
+            pub = {"status": "error", "message": f"scansci-pdf unavailable: {exc}"}
+        if isinstance(pub, dict) and pub.get("status") == "ok":
+            pp = str(pub.get("publisher_pdf") or pub.get("pdf_path") or "").strip()
+            if pp and _is_valid_pdf_file(pp):
+                record_download(
+                    pdf_path=pp, source=sn, paper_id=paper_id, doi=doi, title=title,
+                    downloader="scansci_pdf", legal_status="publisher_version",
+                )
+                return {"status": "ok", "pdf_path": pp, "download_method": "scansci_pdf"}
+        if isinstance(pub, dict):
+            errors.append(f"scansci_pdf: {pub.get('message') or pub.get('status') or 'failed'}")
+
     # ── Build available-options guidance ─────────────────────────────
     available_options: List[Dict[str, Any]] = []
     if doi:
         available_options.append({
             "method": "publisher_download",
-            "description": "Try publisher version via scansci-pdf (may need setup)",
+            "description": "Manual publisher retry via scansci-pdf (longer timeout, bibtex/SI)",
             "tool": "download_publisher_version",
         })
-    if not use_scihub:
+    grey_already_raced = _download_strategy(download_strategy) == "fastest"
+    if not use_scihub and not grey_already_raced:
         available_options.append({
             "method": "scihub",
             "description": "Opt-in Sci-Hub fallback",
             "tool": "download_with_fallback",
             "param": "use_scihub=true",
         })
-    if not _libgen_enabled(use_libgen):
+    if not _libgen_enabled(use_libgen) and not grey_already_raced:
         available_options.append({
             "method": "libgen",
             "description": "Opt-in LibGen fallback",

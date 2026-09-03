@@ -42,6 +42,20 @@ _PARSE_ITEM_TERMINAL_STATUSES: set[str] = {
     "skipped",
     "download_failed",
     "error",
+    # Download-only terminal statuses (reused by download jobs on the same
+    # job infrastructure; never produced by the parse flow).
+    "downloaded",
+    "skipped_existing",
+}
+
+# Statuses that count as a *successful* terminal state for progress rendering.
+# For parse jobs this is {ok, cached}; for download jobs it is
+# {downloaded, skipped_existing}.
+_PARSE_ITEM_SUCCESS_STATUSES: set[str] = {
+    "ok",
+    "cached",
+    "downloaded",
+    "skipped_existing",
 }
 
 # SSE progress subscribers: job_id -> list of queues
@@ -75,7 +89,7 @@ def _parse_job_item_stage(status: str) -> str:
     """Map a parse-item status to a human-readable stage name for the UI."""
     normalized = (status or "").strip().lower()
     if normalized in _PARSE_ITEM_TERMINAL_STATUSES:
-        if normalized in {"ok", "cached"}:
+        if normalized in _PARSE_ITEM_SUCCESS_STATUSES:
             return "completed"
         if normalized in {"failed", "download_failed", "error"}:
             return "error"
@@ -104,6 +118,7 @@ def _parse_job_item_from_candidate(
     index: int,
     *,
     status: str = "queued",
+    message: str = "Waiting to start MinerU parsing.",
 ) -> Dict[str, Any]:
     """Build a parse-job item dict from a paper candidate."""
     return {
@@ -113,7 +128,7 @@ def _parse_job_item_from_candidate(
         "doi": str(candidate.get("doi") or ""),
         "source": str(candidate.get("source") or "unknown"),
         "status": status,
-        "message": "Waiting to start MinerU parsing.",
+        "message": message,
         "progress_percent": _parse_job_stage_progress(status),
     }
 
@@ -196,7 +211,10 @@ def _refresh_parse_job_progress(job: Dict[str, Any]) -> None:
         1 for item in items if isinstance(item, dict)
         and str(item.get("status") or "").strip().lower() in {"parsing", "batch_parsing"}
     )
-    phase_completed = parsed
+    phase_completed = sum(
+        1 for item in items if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() in _PARSE_ITEM_SUCCESS_STATUSES
+    )
     phase_error = failed
 
     progress = round(
@@ -234,7 +252,16 @@ def _progress_notify(job_id: str, snapshot: Dict[str, Any]) -> None:
         try:
             q.put_nowait(payload)
         except queue.Full:
-            pass  # drop for slow clients
+            # Coalesce to the latest snapshot: drop the oldest pending frame so
+            # the terminal state is never lost behind a full queue.
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
 
 
 def progress_subscribe(job_id: str) -> queue.Queue:

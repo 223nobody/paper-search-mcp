@@ -28,7 +28,9 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys as _sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -122,6 +124,19 @@ from ..engine.download import (
 )
 
 # ---------------------------------------------------------------------------
+# Engine jobs imports (shared job infrastructure reused for download jobs)
+# ---------------------------------------------------------------------------
+from ..engine.jobs import (
+    _PARSE_JOBS,
+    _PARSE_JOB_LOCK,
+    _parse_job_item_from_candidate,
+    _persist_parse_job,
+    _refresh_parse_job_progress,
+    _update_parse_job,
+    _update_parse_job_item,
+)
+
+# ---------------------------------------------------------------------------
 # Engine parse imports (selection / UI helpers)
 # ---------------------------------------------------------------------------
 from ..engine.parse import (
@@ -132,18 +147,18 @@ from ..engine.parse import (
     SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE,
     SELECTION_SEMANTICS_DOWNLOAD_ONLY,
     SELECTION_SEMANTICS_PARSE,
-    _build_paper_selection_schema,
     _parse_prompt_timeout_metadata,
     _terminal_parse_prompt_for_download,
     _write_pending_parse_prompt_state,
-    _elicitation_option_label,
     _paper_from_download_metadata,
     _paper_selection_app_prompt,
+    _build_paper_selection_schema,
     _codex_app_display_candidates,
     _codex_recommended_selected_indices,
+    _elicitation_option_label,
     _reindexed_display_candidates,
-    _parse_elicitation_selected_indices,
     _parse_selected_indices,
+    _parse_elicitation_selected_indices,
     _promote_paper_selection_app,
     _selection_surface_policy,
     _selection_semantics_name,
@@ -193,21 +208,6 @@ def _prefer_local_selection_surface(result: Dict[str, Any]) -> Dict[str, Any]:
             local = prompt["local_browser"]
             result["local_browser"] = local
     if not isinstance(local, dict) or local.get("status") != "ok":
-        return result
-
-    surface = local.get("selection_surface")
-    surface_name = surface.get("surface") if isinstance(surface, dict) else ""
-
-    if surface_name == "hybrid":
-        result.setdefault("interaction", "mcp_app")
-        result["local_browser_url"] = local.get("url", "")
-        result["page_id"] = local.get("page_id", "")
-        result["opened"] = bool(local.get("opened", False))
-        result.setdefault("recommended_tool", PAPER_SELECTION_WIDGET_TOOL)
-        result.setdefault("selection_token", local.get("selection_token", ""))
-        result["recommended_url"] = local.get("url", "")
-        if isinstance(surface, dict):
-            result["selection_surface"] = surface
         return result
 
     result["interaction"] = local.get("interaction", "local_browser_checkbox")
@@ -410,7 +410,7 @@ def _should_require_large_batch_selection(
     # ── Cross-batch gate: block when the ORIGINAL session requested_count
     #     was above the limit even if this single call only picks ≤ 10 papers.
     #     Skip this gate when the user has explicitly chosen which papers to
-    #     download (e.g. via numbered fallback indices "1,3,5").
+    #     download (e.g. via an explicit selection page submission).
     if not explicit_user_selection:
         if isinstance(session, dict):
             metadata = session.get("metadata")
@@ -577,6 +577,7 @@ async def _create_paper_selection_result(
     action_verb: str = "parse",
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     requested_count: int = 0,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Create a paper selection session from search results."""
     semantics = _selection_semantics_name(selection_semantics)
@@ -708,7 +709,6 @@ async def _create_paper_selection_result(
     parse_ready_total = sum(
         1 for candidate in candidates if candidate["parse_ready"]
     )
-    numbered_fallback = _numbered_paper_fallback(candidates)
     action_description = (
         f"call {action_tool}(selection_token=<token>, "
         "selected_indices='1,3,5') or selected_indices='all'."
@@ -725,7 +725,7 @@ async def _create_paper_selection_result(
     )
     requested_over_limit = requested_count > AUTO_PARSE_SAVED_PDF_LIMIT
 
-    surface = _selection_surface_policy(force_open=True)
+    surface = _selection_surface_policy(force_open=True, ctx=ctx)
     result: Dict[str, Any] = {
         "status": "selection_required" if requested_over_limit else "ok",
         "selection_token": session["selection_token"],
@@ -740,20 +740,20 @@ async def _create_paper_selection_result(
         "selection_semantics": semantics,
         "requested_count": requested_count,
         "instructions": (
-            f"Present the numbered papers to the user. To {action_verb} "
-            f"selected papers, {action_description}"
+            "Render the MCP App when the client advertises the "
+            "io.modelcontextprotocol/ui capability. Otherwise call "
+            "open_paper_selection_page with the selection_token, then "
+            f"{action_description}"
         ),
         "papers": candidates,
-        "numbered_fallback": numbered_fallback,
         "fallback": {
-            "interaction": "backend_session_numbered_selection",
+            "interaction": "browser_url_selection",
             "selection_token": session["selection_token"],
             "full_selection_token": full_session["selection_token"],
             "instructions": (
-                "If checkbox UI is unavailable, show numbered_fallback and "
-                f"pass the user's numbers to {action_tool}."
+                "Call open_paper_selection_page with the selection_token; "
+                f"then pass the selected indices to {action_tool}."
             ),
-            "papers": numbered_fallback,
         },
         "total": len(candidates),
         "display_total": len(candidates),
@@ -770,9 +770,15 @@ async def _create_paper_selection_result(
         "app_widget_supported": surface.get("app_widget_supported", False),
         "selection_surface": surface,
     }
+    if surface.get("surface") == "ui_disabled":
+        result["status"] = "ui_disabled"
+        result["error"] = "selection_ui_disabled"
+        result["recommended_tool"] = ""
+        result["message"] = (
+            "Paper selection UI is disabled by PAPER_SEARCH_MCP_SELECTION_UI_MODE."
+        )
     # ── TUI hint for CLI-only hosts ─────────────────────────
     from ..ui.tui import is_tui_available as _is_tui_available
-    from ..utils import host_is_claude_code as _host_is_claude_code
     if _is_tui_available():
         result["tui_available"] = True
         result["tui_instructions"] = (
@@ -780,8 +786,8 @@ async def _create_paper_selection_result(
             "Call select_papers_tui(selection_token, download_only=True|False) "
             "to let the user pick papers in the terminal."
         )
-        if _host_is_claude_code() and not surface.get("app_widget_supported"):
-            result["recommended_tool"] = "select_papers_tui"
+        # Keep the TUI as an explicit compatibility tool, but do not let
+        # host-name heuristics replace the capability-routed App/browser path.
     if requested_over_limit:
         result["parse_decision_required"] = True
         result["requires_user_parse_decision"] = True
@@ -798,7 +804,9 @@ async def _create_paper_selection_result(
         requested_count=requested_count,
         full_total=len(full_candidates),
     )
-    if requested_over_limit:
+    # T2 returns the same local page URL directly in the tool result.  The
+    # server never opens a GUI; clients decide whether and how to navigate.
+    if surface.get("surface") == "browser":
         await _attach_local_selection_ui(
             result,
             selection_token=session["selection_token"],
@@ -812,6 +820,7 @@ async def _create_paper_selection_result(
             force_open=True,
             selection_semantics=semantics,
             parse_execution=parse_execution,
+            ctx=ctx,
         )
     # _meta is set on the dict by _promote_paper_selection_app.
     # Callers that need a FastMCP ToolResult (MCP tool endpoints) must
@@ -939,33 +948,29 @@ async def _attach_local_selection_ui(
     force_open: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     parse_execution: str = "background",
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Open a local-hosted checkbox UI as a fallback for non-App hosts.
 
     Uses the local browser selection server from ``..ui.server``.
     """
-    from ..utils import open_url_in_host as _open_url_in_host
     from ..engine.parse import _selection_semantics_name as _ssn
     from ..engine.parse import _workflow_parse_execution_name as _wpen
     from ..ui.server import _create_local_selection_page
 
-    surface = _selection_surface_policy(force_open=force_open)
+    surface = _selection_surface_policy(force_open=force_open, ctx=ctx)
     prompt["selection_surface"] = surface
-    if surface.get("surface") == "numbered_fallback":
-        return prompt
-    if surface.get("surface") == "mcp_app_then_local":
-        prompt["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
-        prompt["status_tool"] = "get_paper_selection_surface_status"
-        prompt["fallback_after_seconds"] = int(
-            surface.get("fallback_after_seconds") or 0
+    if surface.get("surface") == "ui_disabled":
+        prompt["status"] = "ui_disabled"
+        prompt["error"] = "selection_ui_disabled"
+        prompt["message"] = (
+            "Paper selection UI is disabled by PAPER_SEARCH_MCP_SELECTION_UI_MODE."
         )
         return prompt
     # ── Hybrid mode: for tentative MCP Apps hosts (Claude Code Desktop/VSCode),
     #     create the local_browser fallback even though _meta is also set.
     if surface.get("surface") == "mcp_app":
-        from ..utils import host_mcp_apps_confirmed  # noqa: PLC0415
-        if host_mcp_apps_confirmed():
-            return prompt
+        return prompt
     # 已有本地浏览器页面，不重复创建
     if prompt.get("local_browser", {}).get("url"):
         return prompt
@@ -989,8 +994,8 @@ async def _attach_local_selection_ui(
             selection_semantics=selection_semantics,
             parse_execution=parse_execution,
         )
-        # ── Host-aware URL opening: VS Code stays in-editor ──
-        opened = await asyncio.to_thread(_open_url_in_host, page["url"])
+        # Return the URL to the host/user; the MCP server must not open a GUI.
+        opened = False
 
         prompt["local_browser"] = {
             "status": "ok",
@@ -1144,7 +1149,7 @@ async def _parse_prompt_for_download_results(
     )
     fallback: Dict[str, Any] = {
         "status": "ok" if selectable else "no_parse_ready_pdfs",
-        "interaction": "backend_session_numbered_selection",
+        "interaction": "browser_url_selection",
         "selection_token": parse_session["selection_token"],
         "download_selection_token": selection_token,
         **timeout_meta,
@@ -1240,28 +1245,27 @@ async def _parse_prompt_for_download_results(
 
     if parse_execution_name == "prompt":
         fallback["message"] = (
-            f"Saved {len(candidates)} PDFs. Select PDFs in the checkbox UI "
-            "or use numbered indices before MinerU parsing."
+            f"Saved {len(candidates)} PDFs. Select PDFs in the MCP App or "
+            "browser page before MinerU parsing."
         )
         fallback["parse_decision_required"] = True
         fallback["requires_user_parse_decision"] = True
         fallback["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
         fallback["recommended_selected_indices"] = ""
-        if len(candidates) > AUTO_PARSE_SAVED_PDF_LIMIT:
-            await _attach_local_selection_ui(
-                fallback,
-                selection_token=parse_session["selection_token"],
-                papers=candidates,
-                save_path=save_path,
-                use_scihub=use_scihub,
-                mode=mode,
-                backend=backend,
-                force=force,
-                custom_save_path_confirmed=custom_save_path_confirmed,
-                # force_open=True is gated by _selection_ui_should_open(),
-                # which suppresses the browser for MCP-widget-capable hosts.
-                force_open=True,
-            )
+        await _attach_local_selection_ui(
+            fallback,
+            selection_token=parse_session["selection_token"],
+            papers=candidates,
+            save_path=save_path,
+            use_scihub=use_scihub,
+            mode=mode,
+            backend=backend,
+            force=force,
+            custom_save_path_confirmed=custom_save_path_confirmed,
+            # The helper routes from the current MCP capability evidence.
+            force_open=True,
+            ctx=ctx,
+        )
         await asyncio.to_thread(_write_pending_parse_prompt_state, fallback)
         return _to_widget_tool_result(_promote_paper_selection_app(fallback))
 
@@ -1336,8 +1340,8 @@ async def _parse_prompt_for_download_results(
     if len(candidates) > AUTO_PARSE_SAVED_PDF_LIMIT:
         fallback["message"] = (
             f"Saved {len(candidates)} PDFs, which is above the auto-parse "
-            f"limit of {AUTO_PARSE_SAVED_PDF_LIMIT}. Use the checkbox UI "
-            "or numbered indices to choose PDFs for MinerU."
+            f"limit of {AUTO_PARSE_SAVED_PDF_LIMIT}. Use the MCP App or "
+            "browser selection page to choose PDFs for MinerU."
         )
         fallback["parse_decision_required"] = True
         fallback["requires_user_parse_decision"] = True
@@ -1351,125 +1355,17 @@ async def _parse_prompt_for_download_results(
             backend=backend,
             force=force,
             custom_save_path_confirmed=custom_save_path_confirmed,
-            # _selection_ui_should_open suppresses browser for widget-capable hosts
+            # The helper routes from the current MCP capability evidence.
             force_open=True,
+            ctx=ctx,
         )
 
-    if ctx is None:
-        prompted = {
-            **fallback,
-            "parse_decision_required": True,
-            "requires_user_parse_decision": True,
-            "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
-            "recommended_selected_indices": "",
-        }
-        await asyncio.to_thread(_write_pending_parse_prompt_state, prompted)
-        return _to_widget_tool_result(_promote_paper_selection_app(prompted))
-
-    options = [_elicitation_option_label(candidate) for candidate in selectable]
-    schema = _build_paper_selection_schema(options)
-    try:
-        elicitation = await ctx.elicit(
-            message="More than 10 PDFs were saved. Select PDFs for MinerU "
-            "PDF parsing.",
-            schema=schema,
-        )
-    except Exception as exc:
-        return {
-            **fallback,
-            "message": f"Elicitation request failed: {exc}",
-        }
-
-    if getattr(elicitation, "action", "") != "accept":
-        return {
-            **fallback,
-            "status": "elicitation_not_accepted",
-            "elicitation_action": getattr(elicitation, "action", ""),
-            "message": (
-                "User declined or cancelled parsing. "
-                "Use the checkbox UI or numbered indices if needed."
-            ),
-        }
-
-    selected_values = getattr(
-        getattr(elicitation, "data", None), "selected_papers", []
-    )
-    try:
-        selected_indices = _parse_elicitation_selected_indices(
-            selected_values, len(candidates)
-        )
-    except ValueError as exc:
-        return {
-            **fallback,
-            "status": "invalid_elicitation_selection",
-            "message": str(exc),
-        }
-
-    if not selected_indices:
-        return {
-            **fallback,
-            "status": "no_selection",
-            "message": (
-                "No PDFs were selected. Use the checkbox UI or numbered "
-                "indices if needed."
-            ),
-        }
-
-    selected_indices_arg = ",".join(str(index) for index in selected_indices)
-    if parse_execution_name == "sync":
-        parse_result = await _parse_selected_papers_fn(
-            selection_token=parse_session["selection_token"],
-            selected_indices=selected_indices_arg,
-            save_path=save_path,
-            use_scihub=use_scihub,
-            mode=mode,
-            backend=backend,
-            force=force,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-        )
-        return {
-            **parse_result,
-            "interaction": "elicitation",
-            "selection_token": parse_session["selection_token"],
-            "download_selection_token": selection_token,
-            "papers": candidates,
-            "selected_indices": selected_indices,
-            "recommended_tool": "get_parsed_paper",
-            "recommended_selected_indices": selected_indices_arg,
-            "parse_execution": parse_execution_name,
-        }
-
-    if _submit_parse_job_fn is None:
-        return {
-            **fallback,
-            "status": "error",
-            "message": "submit_parse_job is not available.",
-        }
-    parse_job = await _submit_parse_job_fn(
-        parse_fn=_parse_selected_papers_fn,
-        selection_token=parse_session["selection_token"],
-        selected_indices=selected_indices_arg,
-        save_path=save_path,
-        use_scihub=use_scihub,
-        mode=mode,
-        backend=backend,
-        force=force,
-        custom_save_path_confirmed=custom_save_path_confirmed,
-    )
-    return {
-        **fallback,
-        "status": (
-            parse_job.get("status", "submitted")
-            if isinstance(parse_job, dict)
-            else "submitted"
-        ),
-        "interaction": "elicitation",
-        "selected_indices": selected_indices,
-        "recommended_tool": "get_parse_job_status",
-        "recommended_selected_indices": selected_indices_arg,
-        "parse_job": parse_job,
-        "message": "Submitted a MinerU parse job for the selected PDFs.",
-    }
+    fallback["parse_decision_required"] = True
+    fallback["requires_user_parse_decision"] = True
+    fallback["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
+    fallback["recommended_selected_indices"] = ""
+    await asyncio.to_thread(_write_pending_parse_prompt_state, fallback)
+    return _to_widget_tool_result(_promote_paper_selection_app(fallback))
 
 
 # ===========================================================================
@@ -1490,6 +1386,7 @@ async def _pre_download_selection_prompt(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_DOWNLOAD_AND_PARSE,
     skip_local_ui: bool = False,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Pre-download selection prompt for large batches.
 
@@ -1664,10 +1561,11 @@ async def _pre_download_selection_prompt(
             backend=backend,
             force=force,
             custom_save_path_confirmed=custom_save_path_confirmed,
-            # _selection_ui_should_open suppresses browser for widget-capable hosts
+            # The helper routes from the current MCP capability evidence.
             force_open=True,
             selection_semantics=semantics,
             parse_execution=parse_execution,
+            ctx=ctx,
         )
     return _promote_paper_selection_app(_prefer_local_selection_surface(prompt))
 
@@ -1695,6 +1593,7 @@ async def _run_download_selected_papers(
     large_batch_selection: str = "never",
     bypass_large_batch_selection: bool = False,
     _caller: str = "unknown",
+    job_id: str = "",
 ) -> Dict[str, Any]:
     """Download papers from a saved selection session without parsing.
 
@@ -1702,6 +1601,10 @@ async def _run_download_selected_papers(
     (e.g. the local browser selection UI) as well as used internally by the
     MCP tool wrappers.  It does NOT trigger large-batch checks or parse
     policies — those are handled by the caller.
+
+    When *job_id* is set, per-paper progress is published to that job via the
+    shared job infrastructure (``_update_parse_job_item``) so the browser
+    SSE endpoint can render real-time per-paper download status.
 
     ``bypass_large_batch_selection`` is **only** honoured when ``_caller`` is
     a whitelisted internal path (local browser UI or confirmed-download handler).
@@ -1770,23 +1673,71 @@ async def _run_download_selected_papers(
         index: int, shared_client: httpx.AsyncClient
     ) -> Dict[str, Any]:
         async with semaphore:
+            if job_id:
+                _update_parse_job_item(
+                    job_id,
+                    index,
+                    status="downloading",
+                    message="Downloading PDF.",
+                    current=f"Downloading paper {index}.",
+                )
             paper = papers[index - 1]
             if not isinstance(paper, dict):
-                return {
+                result = {
                     "index": index,
                     "status": "skipped",
                     "message": "Stored search result is not a paper dictionary.",
                 }
-            return await _download_selected_session_paper_wrapper(
-                paper=paper,
-                index=index,
-                save_path=save_path,
-                use_scihub=use_scihub,
-                client=shared_client,
-                download_strategy=download_strategy,
-                use_libgen=use_libgen,
-                libgen_base_url=libgen_base_url,
-            )
+            else:
+                result = await _download_selected_session_paper_wrapper(
+                    paper=paper,
+                    index=index,
+                    save_path=save_path,
+                    use_scihub=use_scihub,
+                    client=shared_client,
+                    download_strategy=download_strategy,
+                    use_libgen=use_libgen,
+                    libgen_base_url=libgen_base_url,
+                )
+            if job_id:
+                status = str(result.get("status") or "download_failed")
+                if status == "downloaded":
+                    _update_parse_job_item(
+                        job_id,
+                        index,
+                        status="downloaded",
+                        message="PDF downloaded.",
+                        pdf_path=result.get("pdf_path", ""),
+                        download_method=result.get("download_method", ""),
+                        current=f"Downloaded paper {index}.",
+                    )
+                elif status == "skipped_existing":
+                    _update_parse_job_item(
+                        job_id,
+                        index,
+                        status="skipped_existing",
+                        message="PDF already exists.",
+                        pdf_path=result.get("pdf_path", ""),
+                        download_method=result.get("download_method", ""),
+                        current=f"Paper {index} already downloaded.",
+                    )
+                elif status == "skipped":
+                    _update_parse_job_item(
+                        job_id,
+                        index,
+                        status="skipped",
+                        message=str(result.get("message") or "Paper is not download-ready."),
+                        current=f"Skipped paper {index}.",
+                    )
+                else:
+                    _update_parse_job_item(
+                        job_id,
+                        index,
+                        status="download_failed",
+                        message=str(result.get("message") or "Download failed."),
+                        current=f"Failed to download paper {index}.",
+                    )
+            return result
 
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=download_timeout
@@ -1882,6 +1833,215 @@ async def _run_download_selected_papers(
         if _should_promote_paper_selection_app(parse_prompt)
         else response
     )
+
+
+# ===========================================================================
+# Download job runner (reuses the shared job infrastructure for real-time
+# per-paper progress over the browser SSE endpoint).
+# ===========================================================================
+
+def _run_download_job_thread(
+    *,
+    job_id: str,
+    selection_token: str,
+    selected_indices: str,
+    save_path: str,
+    use_scihub: bool,
+    parse_execution: str,
+    mode: str,
+    backend: str,
+    force: bool,
+    custom_save_path_confirmed: bool,
+) -> None:
+    """Run a background download job to completion, publishing per-item progress.
+
+    Wraps ``_run_download_selected_papers`` (which emits ``_update_parse_job_item``
+    frames for each paper) and finalises the job-level state machine.
+    """
+
+    async def _run() -> None:
+        _update_parse_job(
+            job_id,
+            status="running",
+            started_epoch=time.time(),
+            started_at=utc_now(),
+            current="Starting downloads.",
+            message="Downloads started.",
+        )
+        try:
+            result = await _run_download_selected_papers(
+                selection_token=selection_token,
+                selected_indices=selected_indices,
+                save_path=save_path,
+                use_scihub=use_scihub,
+                parse_execution=parse_execution,
+                mode=mode,
+                backend=backend,
+                force=force,
+                custom_save_path_confirmed=custom_save_path_confirmed,
+                large_batch_selection="never",
+                bypass_large_batch_selection=True,
+                _caller="local_browser_ui",
+                job_id=job_id,
+            )
+            result_status = (
+                str(result.get("status") if isinstance(result, dict) else "")
+                .strip()
+                .lower()
+            )
+            job_status = (
+                "error"
+                if result_status
+                in {"not_found", "invalid_selection", "no_selection", "invalid_request"}
+                else "completed"
+            )
+            _update_parse_job(
+                job_id,
+                status=job_status,
+                completed_epoch=time.time(),
+                completed_at=utc_now(),
+                result=result,
+                downloaded=result.get("downloaded", 0) if isinstance(result, dict) else 0,
+                skipped_existing=(
+                    result.get("skipped_existing", 0) if isinstance(result, dict) else 0
+                ),
+                failed=result.get("failed", 0) if isinstance(result, dict) else 0,
+                total=result.get("total", 0) if isinstance(result, dict) else 0,
+                progress_percent=100,
+                current=(
+                    "Downloads finished."
+                    if job_status == "completed"
+                    else "Downloads could not start."
+                ),
+                message=(
+                    str(result.get("message"))
+                    if isinstance(result, dict) and result.get("message")
+                    else ("Downloads finished." if job_status == "completed" else "Downloads failed.")
+                ),
+            )
+        except Exception as exc:
+            logger.exception("Download job %s failed", job_id)
+            _update_parse_job(
+                job_id,
+                status="error",
+                completed_epoch=time.time(),
+                completed_at=utc_now(),
+                message=str(exc),
+                current="Downloads failed.",
+            )
+
+    asyncio.run(_run())
+
+
+async def _submit_download_job(
+    *,
+    selection_token: str,
+    selected_indices: str = "",
+    save_path: str = DEFAULT_SAVE_PATH,
+    use_scihub: bool = False,
+    parse_execution: str = "none",
+    mode: str = "auto",
+    backend: str = "",
+    force: bool = False,
+    custom_save_path_confirmed: bool = False,
+) -> Dict[str, Any]:
+    """Create a background download job and return immediately.
+
+    The job reuses the same ``job_id`` / ``_PARSE_JOBS`` / SSE subscription
+    infrastructure as parse jobs, so the browser can render real-time
+    per-paper download status via ``/api/progress-stream/<job_id>``.
+    """
+    session = await asyncio.to_thread(_cache_get_search_session, selection_token)
+    if not session:
+        return {
+            "status": "not_found",
+            "selection_token": selection_token,
+            "message": "Search session not found. Run crawl_papers_for_selection again.",
+        }
+
+    papers = session.get("papers", [])
+    if not isinstance(papers, list):
+        papers = []
+    try:
+        indices = _parse_selected_indices(selected_indices, len(papers))
+    except ValueError as exc:
+        return {
+            "status": "invalid_selection",
+            "selection_token": selection_token,
+            "message": str(exc),
+            "total": len(papers),
+        }
+
+    items: List[Dict[str, Any]] = []
+    for index in indices:
+        paper = papers[index - 1] if 0 <= index - 1 < len(papers) else {}
+        candidate = _paper_parse_candidate(paper if isinstance(paper, dict) else {}, index)
+        items.append(
+            _parse_job_item_from_candidate(
+                candidate,
+                index,
+                status="queued",
+                message="Waiting to download.",
+            )
+        )
+
+    job_id = f"download_{int(time.time())}_{secrets.token_hex(6)}"
+    created_epoch = time.time()
+    created_at = utc_now()
+    worker = threading.Thread(
+        target=_run_download_job_thread,
+        kwargs={
+            "job_id": job_id,
+            "selection_token": selection_token,
+            "selected_indices": selected_indices,
+            "save_path": save_path,
+            "use_scihub": use_scihub,
+            "parse_execution": parse_execution,
+            "mode": mode,
+            "backend": backend,
+            "force": force,
+            "custom_save_path_confirmed": custom_save_path_confirmed,
+        },
+        name=f"paper-search-download-job-{job_id}",
+        daemon=True,
+    )
+    with _PARSE_JOB_LOCK:
+        _PARSE_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "submitted",
+            "selection_token": selection_token,
+            "selected_indices": selected_indices,
+            "save_path": save_path,
+            "use_scihub": use_scihub,
+            "parse_execution": parse_execution,
+            "mode": mode,
+            "backend": backend,
+            "force": force,
+            "custom_save_path_confirmed": bool(custom_save_path_confirmed),
+            "created_at": created_at,
+            "created_epoch": created_epoch,
+            "updated_at": created_at,
+            "updated_epoch": created_epoch,
+            "message": f"Queued {len(items)} paper(s) for download.",
+            "current": "Queued for download.",
+            "items": items,
+            "total": len(items),
+            "completed_items": 0,
+            "progress_percent": 0,
+            "task": None,
+            "thread": worker,
+        }
+        _refresh_parse_job_progress(_PARSE_JOBS[job_id])
+        _persist_parse_job(job_id, _PARSE_JOBS[job_id], active=True)
+    worker.start()
+    return {
+        "status": "submitted",
+        "job_id": job_id,
+        "message": f"Download started for {len(items)} paper(s).",
+        "total": len(items),
+        "items": items,
+        "progress_percent": 0,
+    }
 
 
 # ===========================================================================
@@ -2138,12 +2298,12 @@ def register_orchestration_tools(mcp, searchers):
         max_results_per_source: int = 5,
         sources: str = "",
         year: Optional[str] = None,
+        ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
-        """Search papers, persist a numbered selection session, and return parse candidates.
+        """Search papers and return a capability-routed selection session.
 
-        Use this when the MCP client cannot show elicitation/App checkbox UI. The
-        caller can present the returned numbered list, then call
-        parse_selected_papers with the selection_token and indices like "1,3,5".
+        Clients advertising ``io.modelcontextprotocol/ui`` receive the MCP App
+        metadata. Other clients receive a URL for ``open_paper_selection_page``.
         """
         search_result = await search_papers(
             query=query,
@@ -2158,9 +2318,10 @@ def register_orchestration_tools(mcp, searchers):
                 sources=sources,
                 year=year,
                 search_result=search_result,
-                interaction="backend_session_numbered_selection",
+                interaction="browser_url_selection",
                 action_tool="parse_selected_papers",
                 action_verb="parse",
+                ctx=ctx,
             )
         )
 
@@ -2175,11 +2336,13 @@ def register_orchestration_tools(mcp, searchers):
         year: Optional[str] = None,
         ranking_profile: str = "",
         requested_count: int = 0,
+        ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
-        """Search papers and persist a checkbox/numbered selection session without downloading or parsing.
+        """Search papers and persist a selection session without downloading or parsing.
 
         Use ranking_profile='agent-skill' for LLM-agent skill/library/retrieval/security topics.
-        The response always includes a selection_token, MCP App checkbox prompt, and numbered_fallback.
+        The response includes a selection_token and an MCP App or browser URL
+        surface selected from the initialize capability handshake.
 
         When *requested_count* is set and the first round of search does not
         return enough downloadable papers, the tool automatically retries with
@@ -2293,6 +2456,7 @@ def register_orchestration_tools(mcp, searchers):
                     action_verb="download",
                     selection_semantics=SELECTION_SEMANTICS_DOWNLOAD_ONLY,
                     requested_count=requested_count,
+                    ctx=ctx,
                 )
             )
         except Exception as _exc:
@@ -2325,137 +2489,38 @@ def register_orchestration_tools(mcp, searchers):
         force: bool = False,
         ctx: Optional[Context] = None,
     ) -> Dict[str, Any]:
-        """Search papers, ask the MCP client for a multi-select choice, then parse.
+        """Deprecated alias that returns the capability-routed selection UI.
 
-        MCP clients with elicitation support, such as VS Code Copilot Agent Mode,
-        can render the returned schema as a native multi-select control. Clients
-        without elicitation support receive the same backend session and numbered
-        paper list used by search_papers_for_parsing/parse_selected_papers.
+        Selection is intentionally handled by the MCP App or browser URL. The
+        legacy elicitation form is not sent because clients such as dsh/ZCode
+        do not advertise that interaction surface consistently.
         """
         session_result = await search_papers_for_parsing(
             query=query,
             max_results_per_source=max_results_per_source,
             sources=sources,
             year=year,
+            ctx=ctx,
         )
         # ── Unwrap ToolResult from search_papers_for_parsing ──────────────
         session_result, _ = _unwrap_tool_result(session_result)
         if not isinstance(session_result, dict):
             session_result = {}
-        candidates = session_result.get("papers", [])
-        if not isinstance(candidates, list):
-            candidates = []
-
-        selectable = [
-            candidate for candidate in candidates if candidate.get("parse_ready")
-        ]
-        if not selectable:
-            return {
-                **session_result,
-                "status": "no_parse_ready_papers",
-                "interaction": "backend_session_numbered_selection",
-                "message": (
-                    "No parse-ready papers were found. Use the returned session "
-                    "for inspection or search again."
-                ),
-            }
-
-        if ctx is None:
-            return {
-                **session_result,
-                "status": "elicitation_unavailable",
-                "interaction": "backend_session_numbered_selection",
-                "message": (
-                    "MCP context was not available, so no elicitation request "
-                    "could be sent."
-                ),
-            }
-
-        options = [_elicitation_option_label(candidate) for candidate in selectable]
-        schema = _build_paper_selection_schema(options)
-
-        try:
-            elicitation = await ctx.elicit(
-                message=(
-                    "Select papers for MinerU PDF parsing. "
-                    "If the client does not show a checkbox or multi-select UI, "
-                    "use the returned selection_token with numbered indices."
-                ),
-                schema=schema,
-            )
-        except Exception as exc:
-            return {
-                **session_result,
-                "status": "elicitation_unavailable",
-                "interaction": "backend_session_numbered_selection",
-                "message": f"Elicitation request failed: {exc}",
-            }
-
-        if getattr(elicitation, "action", "") != "accept":
-            return {
-                **session_result,
-                "status": "elicitation_not_accepted",
-                "interaction": "backend_session_numbered_selection",
-                "elicitation_action": getattr(elicitation, "action", ""),
-                "message": (
-                    "User declined or cancelled the selection. Use "
-                    "parse_selected_papers with numbered indices if needed."
-                ),
-            }
-
-        selected_values = getattr(
-            getattr(elicitation, "data", None), "selected_papers", []
+        surface_name = session_result.get("selection_surface", {}).get("surface")
+        if surface_name != "ui_disabled":
+            session_result["status"] = "selection_required"
+        session_result["interaction"] = (
+            "mcp_app"
+            if surface_name == "mcp_app"
+            else "ui_disabled"
+            if surface_name == "ui_disabled"
+            else "browser_url_selection"
         )
-        try:
-            selected_indices = _parse_elicitation_selected_indices(
-                selected_values, len(candidates)
-            )
-        except ValueError as exc:
-            return {
-                **session_result,
-                "status": "invalid_elicitation_selection",
-                "interaction": "backend_session_numbered_selection",
-                "message": str(exc),
-            }
-
-        if not selected_indices:
-            return {
-                **session_result,
-                "status": "no_selection",
-                "interaction": "backend_session_numbered_selection",
-                "message": (
-                    "No papers were selected. Use parse_selected_papers with "
-                    "numbered indices if needed."
-                ),
-            }
-
-        # Lazy-import parse_selected_papers from .core
-        from .core import _run_parse_selected_papers as parse_selected_papers  # noqa: PLC0415
-
-        parse_result = await parse_selected_papers(
-            selection_token=session_result["selection_token"],
-            selected_indices=",".join(str(index) for index in selected_indices),
-            save_path=save_path,
-            use_scihub=use_scihub,
-            mode=mode,
-            backend=backend,
-            force=force,
+        session_result["message"] = (
+            "Select papers in the rendered MCP App or open the returned URL, "
+            "then call parse_selected_papers with the selection_token."
         )
-        return {
-            **parse_result,
-            "interaction": "elicitation",
-            "selection_token": session_result["selection_token"],
-            "selected_indices": selected_indices,
-            "search": {
-                "query": query,
-                "sources_requested": sources,
-                "sources_used": session_result.get("sources_used", []),
-                "source_results": session_result.get("source_results", {}),
-                "errors": session_result.get("errors", {}),
-                "total": session_result.get("total", 0),
-                "parse_ready_total": session_result.get("parse_ready_total", 0),
-            },
-        }
+        return session_result
 
     # =======================================================================
     #  download_with_fallback
@@ -2482,6 +2547,35 @@ def register_orchestration_tools(mcp, searchers):
         )
         if invalid_save_path:
             return invalid_save_path
+
+        # ── Batch-download guard: repeated single-paper downloads must not
+        #    bypass the >N selection gate.  Once this directory already holds
+        #    more than AUTO_PARSE_SAVED_PDF_LIMIT recent PDFs, route the caller
+        #    to the checkbox selection flow instead of continuing to loop. ──
+        from ..engine.parse import (
+            _recent_saved_pdf_papers,
+            _saved_pdf_batch_window_seconds,
+        )
+        recent_count = len(
+            _recent_saved_pdf_papers(
+                save_path,
+                window_seconds=_saved_pdf_batch_window_seconds(),
+            )
+        )
+        if recent_count > AUTO_PARSE_SAVED_PDF_LIMIT:
+            return {
+                "status": "selection_required",
+                "message": (
+                    f"{recent_count} PDFs were saved recently in this directory. "
+                    f"Batch downloads above {AUTO_PARSE_SAVED_PDF_LIMIT} papers must go "
+                    "through the checkbox selection UI "
+                    "(crawl_papers_for_selection → download_selected_papers) "
+                    "rather than repeated single-paper downloads."
+                ),
+                "recent_saved_pdf_count": recent_count,
+                "auto_parse_limit": AUTO_PARSE_SAVED_PDF_LIMIT,
+                "recommended_tool": "crawl_papers_for_selection",
+            }
 
         routed_source, routed_paper_id, routed_doi = _source_from_identifier(
             source.strip().lower(),
@@ -2620,7 +2714,7 @@ def register_orchestration_tools(mcp, searchers):
                     _paper_parse_candidate(paper, index + 1)
                     for index, paper in enumerate(papers)
                 ]
-                surface = _selection_surface_policy(force_open=True)
+                surface = _selection_surface_policy(force_open=True, ctx=ctx)
                 prompt = {
                     "status": "selection_required",
                     "selection_token": selection_token,
@@ -2750,8 +2844,9 @@ def register_orchestration_tools(mcp, searchers):
                     parse_execution=parse_execution,
                     custom_save_path_confirmed=custom_save_path_confirmed,
                     selection_semantics=selection_semantics,
+                    ctx=ctx,
                 )
-                surface = _selection_surface_policy(force_open=True)
+                surface = _selection_surface_policy(force_open=True, ctx=ctx)
                 response = {
                     "status": "selection_required",
                     "selection_token": prompt.get("selection_token", ""),
@@ -3016,6 +3111,7 @@ def register_orchestration_tools(mcp, searchers):
             year=year,
             ranking_profile=ranking_profile,
             requested_count=limit,
+            ctx=ctx,
         )
         # ── Unwrap ToolResult from crawl_papers_for_selection ──────────────
         selection, _ = _unwrap_tool_result(selection)
@@ -3074,6 +3170,7 @@ def register_orchestration_tools(mcp, searchers):
                 parse_execution=selection_parse_execution,
                 custom_save_path_confirmed=custom_save_path_confirmed,
                 selection_semantics=selection_semantics,
+                ctx=ctx,
             )
             response = {
                 "status": "selection_required",
@@ -3285,6 +3382,7 @@ def register_orchestration_tools(mcp, searchers):
                     year=year,
                     ranking_profile=ranking_profile,
                     requested_count=count,
+                    ctx=ctx,
                 )
             # ── Unwrap FastMCP ToolResult from crawl_papers_for_selection ──────
             # When called internally, crawl_papers_for_selection returns a
@@ -3321,8 +3419,8 @@ def register_orchestration_tools(mcp, searchers):
                     "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
                     "recommended_selected_indices": "",
                     "message": (
-                        "Paper candidates are ready. Present the checkbox UI "
-                        "or numbered list to the user so they can choose which "
+                        "Paper candidates are ready. Render the MCP App or open "
+                        "the returned browser URL so the user can choose which "
                         "papers to download. Do NOT call download_selected_papers "
                         "directly — the user must select papers first."
                     ),
@@ -3418,6 +3516,7 @@ def register_orchestration_tools(mcp, searchers):
                     custom_save_path_confirmed=custom_save_path_confirmed,
                     selection_semantics=selection_semantics,
                     skip_local_ui=_skip_ui,
+                    ctx=ctx,
                 )
                 response: Dict[str, Any] = {
                     "status": "selection_required",

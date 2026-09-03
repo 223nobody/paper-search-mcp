@@ -1,5 +1,13 @@
 <h1 align="center"> Paper Search MCP</h1>
 
+> **Current UI routing (2026-09)**: T1 MCP Apps rendering requires the wire
+> capability `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes`
+> to contain `text/html;profile=mcp-app`. dsh/ZCode names are diagnostic only;
+> clients without that capability receive the same checkbox page as a browser
+> URL. The MCP selection path does not open a GUI, use named-pipe IPC, or
+> return a numbered text fallback. `PAPER_SEARCH_MCP_SELECTION_UI_MODE=off`
+> returns `ui_disabled`.
+
 <p align="center"><b>🔬 一站式学术论文 MCP 服务 —— 检索、下载、解析，让 AI Agent 成为你的研究助手</b></p>
 
 `paper-search-mcp` 是一个面向论文检索、PDF 下载和论文解析的 MCP Server，也提供 `paper-search` 命令行工具。当前版本在原始多源论文检索能力上，补齐了“检索/下载 PDF -> 解析提示或后台 MinerU 解析任务 -> PDF 同目录解析产物与轻量缓存”的完整链路。
@@ -26,9 +34,9 @@ git clone https://github.com/223nobody/paper-search-mcp.git ~/code/paper-search-
 ## 2. 检测平台并安装依赖
 - 检查是否安装了 uv（Python 包管理器），如未安装则先安装。
 - 进入项目目录，运行 `uv sync` 安装核心依赖。
-- 运行 `uv sync --extra publisher` 安装 scansci-pdf。
+- 运行 `uv sync --extra publisher` 安装 scansci-pdf（要求 >= 1.14.0）。
   如果 scansci-pdf 在首次使用时自动安装失败，可手动执行：
-  `uv pip install scansci-pdf[cloakbrowser]`
+  `uv pip install "scansci-pdf[cloakbrowser]>=1.14.0"`
   `playwright install chromium`
 
 ## 3. 配置 .env
@@ -101,7 +109,8 @@ MCP 可用后，只需用自然语言描述需求即可，Agent 会自动调用�
 - 🕐 **后台解析任务**：长时间批量解析可用 `submit_parse_job` 提交，再用 `get_parse_job_status`、`list_parse_jobs`、`cancel_parse_job` 管理。
 - 🪶 **轻量解析缓存**：`.paper_search_cache` 只保存 metadata、status、session、下载健康统计和轻量 manifest/index，不再复制原 PDF，也不再保存一份完整解析内容。
 - 🔌 **MCP 优先、CLI 兜底**：自然语言 Agent 场景优先通过 MCP 工具调用；命令行工具保留给手动验证、脚本和 MCP 不可用时的兜底。
-- 🏢 **出版商发行版下载（MCP Chaining）**：通过内置的 scansci-pdf MCP Chaining 集成，将已下载的 arXiv 论文自动升级为出版商最终发行版 PDF（Nature、Elsevier、Springer 等）。自动安装、零配置、按需使用，所有现有功能不受影响。
+- 🏢 **出版商发行版下载（MCP Chaining）**：通过内置的 scansci-pdf MCP Chaining 集成，将已下载的 arXiv 论文自动升级为出版商最终发行版 PDF（Nature、Elsevier、Springer 等）。自动安装、零配置、按需使用，所有现有功能不受影响。要求 scansci-pdf >= 1.14.0。
+- 🎓 **机构通道登录**：付费墙论文可通过 `publisher_login` 走 WebVPN（100+ 高校）、CARSI、EZProxy 等机构通道；`publisher_schools` 搜索/设置学校，`publisher_channel_status` 校验通道状态，`publisher_diagnostics` 一键诊断网络与数据源健康。
 
 ---
 
@@ -463,9 +472,14 @@ arxiv_1706.03762, arxiv_1810.04805
 - `parse_pdf_with_mineru`：解析本地 PDF。
 - `mineru_health_check`：检查 MinerU extract/API/CLI/pypdf 可用性。
 - `list_parsed_papers` / `get_parsed_paper` / `search_parsed_paper` / `get_paper_assets`：按 `paper_key` 读取和检索 PDF 同目录解析产物。
-- `download_publisher_version`：通过 scansci-pdf MCP Chaining 下载 arXiv 论文的出版商最终发行版 PDF（单篇）。
+- `download_publisher_version`：通过 scansci-pdf MCP Chaining 下载 arXiv 论文的出版商最终发行版 PDF（单篇，支持 `bibtex` / `download_si` / `force`）。
 - `batch_download_publisher_versions`：批量下载多篇 arXiv 论文的出版商发行版。
-- `check_publisher_setup`：检查 scansci-pdf 环境（安装状态、Tor、CloakBrowser、API Key 配置）。
+- `check_publisher_setup`：检查 scansci-pdf 环境（安装状态、版本、Tor、CloakBrowser、API Key 配置）。
+- `install_publisher_support`：异步安装 scansci-pdf >= 1.14.0 及可选组件。
+- `publisher_login`：机构通道登录（WebVPN / CARSI / EZProxy / 出版商 SSO），浏览器完成登录后会话自动复用。
+- `publisher_schools`：搜索 / 设置 WebVPN 高校（100+ 所）。
+- `publisher_channel_status`：检查机构通道会话状态（webvpn / carsi / ezproxy / browser）。
+- `publisher_diagnostics`：上游 health / network / sources / setup 诊断。
 
 ---
 
@@ -519,11 +533,13 @@ arxiv_1706.03762, arxiv_1810.04805
 
 将缓存的 arXiv 论文升级为出版商最终发行版（Nature、Elsevier、Springer 等正式排版版本）。通过内置 scansci-pdf MCP Chaining 自动调用反检测浏览器、Tor 代理和 13+ 下载源。
 
-**首次使用自动安装**，无需手动配置。`download_publisher_version` 内部自动启动 Tor、检查 CloakBrowser、探测可用源。如需更好的成功率，可配置免费 Elsevier API Key（1-2s 直下 ScienceDirect 论文）。
+**首次使用自动安装**（钉版 >= 1.14.0），无需手动配置。`download_publisher_version` 内部自动启动 Tor、检查 CloakBrowser、探测可用源。如需更好的成功率，可配置免费 Elsevier API Key（1-2s 直下 ScienceDirect 论文）。
 
-**推荐工具**：`download_publisher_version`（单篇）、`batch_download_publisher_versions`（批量）、`check_publisher_setup`（诊断）。
+**付费墙论文走机构通道**：`publisher_schools(action="search", query="学校名")` 搜索学校 → `publisher_schools(action="set", school="学校名")` 设置 → `publisher_login(kind="webvpn")` 浏览器登录（登录完成关闭浏览器窗口）→ `publisher_channel_status` 确认通道可用 → 重新下载。
 
-> 💡 **工作原理**：paper-search-mcp 通过 MCP Chaining 技术，在工具内部启动 scansci-pdf 子进程，提取论文的 DOI 或 arXiv ID 后调用 `scansci_pdf_smart_download`。scansci-pdf 并发尝试出版商直链、Elsevier API、Unpaywall、Sci-Hub 等 13+ 源，返回成功下载的 PDF。scansci-pdf 首次使用自动通过 pip 安装，Tor 自动下载配置，完全无感。
+**推荐工具**：`download_publisher_version`（单篇）、`batch_download_publisher_versions`（批量）、`check_publisher_setup`（诊断）、`publisher_login` / `publisher_schools` / `publisher_channel_status` / `publisher_diagnostics`（机构通道与诊断）。
+
+> 💡 **工作原理**：paper-search-mcp 通过 MCP Chaining 技术，在工具内部启动 scansci-pdf 子进程，提取论文的 DOI 或 arXiv ID 后调用 `scansci_pdf_download`。scansci-pdf 并发尝试出版商直链、Elsevier API、Unpaywall、Sci-Hub 等 13+ 源，返回成功下载的 PDF。失败时结果会透传上游 `agent_hint`，提示是否需要机构登录。scansci-pdf 首次使用自动通过 pip 安装（要求 >= 1.14.0），Tor 自动下载配置，完全无感。
 
 ### 🔬 排查解析质量
 

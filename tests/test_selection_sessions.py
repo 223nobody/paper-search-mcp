@@ -35,6 +35,17 @@ def _local_page_confirmation_token(html: str) -> str:
     return str(data.get("confirmation_token") or "")
 
 
+def _wait_for_terminal_job(job_id: str, cache_dir: str, timeout: float = 5.0) -> dict:
+    """Poll a background job's persisted record until it reaches a terminal state."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = cache.read_parse_job(job_id, cache_dir=cache_dir) or {}
+        if str(job.get("status") or "").lower() in {"completed", "error", "canceled"}:
+            return job
+        time.sleep(0.02)
+    return cache.read_parse_job(job_id, cache_dir=cache_dir) or {}
+
+
 class TestSelectionSessions(unittest.TestCase):
     def test_download_selected_papers_tool_declares_checkbox_output_template(self):
         tools = asyncio.run(server.mcp.list_tools())
@@ -3883,12 +3894,17 @@ class TestSelectionSessions(unittest.TestCase):
                     method="POST",
                 )
                 body = json.loads(urllib.request.urlopen(request, timeout=5).read().decode("utf-8"))
+                job = _wait_for_terminal_job(body["job_id"], tmp)
+                result = job.get("result", {})
                 loaded = cache.get_search_session(session["selection_token"], cache_dir=tmp)
 
-        self.assertEqual(body["status"], "ok")
-        self.assertEqual(body["selection_token"], session["selection_token"])
-        self.assertEqual(body["parse_prompt"]["recommended_tool"], "submit_parse_job")
-        self.assertEqual(body["parse_prompt"]["recommended_selected_indices"], "all")
+        self.assertEqual(body["status"], "submitted")
+        self.assertIn("job_id", body)
+        self.assertIn("confirmation_token", body)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["selection_token"], session["selection_token"])
+        self.assertEqual(result["parse_prompt"]["recommended_tool"], "submit_parse_job")
+        self.assertEqual(result["parse_prompt"]["recommended_selected_indices"], "all")
         download_mock.assert_awaited_once()
         self.assertEqual(download_mock.await_args.kwargs["large_batch_selection"], "never")
         self.assertTrue(download_mock.await_args.kwargs["bypass_large_batch_selection"])
@@ -4361,14 +4377,16 @@ class TestSelectionSessions(unittest.TestCase):
                 download_body = json.loads(
                     urllib.request.urlopen(download_request, timeout=5).read().decode("utf-8")
                 )
+                download_job = _wait_for_terminal_job(download_body["job_id"], tmp)
+                download_result = download_job.get("result", {})
                 parse_request = urllib.request.Request(
                     result["url"].replace(
                         "/paper-selection/", "/api/parse-downloaded-selection/"
                     ),
                     data=json.dumps(
                         {
-                            "parse_selection_token": download_body["parse_prompt"]["selection_token"],
-                            "selected_indices": download_body["parse_prompt"][
+                            "parse_selection_token": download_result["parse_prompt"]["selection_token"],
+                            "selected_indices": download_result["parse_prompt"][
                                 "default_parse_selected_indices"
                             ],
                             "confirmation_token": download_body["confirmation_token"],
@@ -4381,8 +4399,9 @@ class TestSelectionSessions(unittest.TestCase):
                     urllib.request.urlopen(parse_request, timeout=5).read().decode("utf-8")
                 )
 
-        self.assertEqual(download_body["status"], "ok")
+        self.assertEqual(download_body["status"], "submitted")
         self.assertIn("confirmation_token", download_body)
+        self.assertEqual(download_result["status"], "ok")
         self.assertEqual(parse_body["status"], "submitted")
         self.assertEqual(parse_body["job_id"], "same-page-parse-job")
         self.assertEqual(parse_body["selection_token"], "downloaded-parse-token")

@@ -193,7 +193,6 @@ PDF_CS_SOURCES = [
     "arxiv",
     "openalex",
     "crossref",
-    "dblp",
 ]
 
 AGENT_SKILL_FAST_SOURCES = [

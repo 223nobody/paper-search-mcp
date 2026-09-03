@@ -74,6 +74,8 @@ def detect_host() -> str:
       - ``"claude_code_desktop"``  : Claude Code Desktop (standalone GUI app)
       - ``"claude_code_cli"``      : Claude Code CLI (terminal)
       - ``"claude_desktop"``       : Claude Desktop (legacy standalone app)
+      - ``"dsh"``                  : DeepSeek Harness / dsh
+      - ``"zcode"``                : ZCode host
       - ``"vscode_generic"``       : Inside VS Code but not a known AI agent
       - ``"unknown"``              : Fallback
     """
@@ -106,6 +108,12 @@ def detect_host() -> str:
         "vscode": "vscode_generic",
         "vs_code": "vscode_generic",
         "vscode_generic": "vscode_generic",
+        "dsh": "dsh",
+        "deepseek": "dsh",
+        "deepseek_harness": "dsh",
+        "zcode": "zcode",
+        "zhipu_code": "zcode",
+        "codegeex": "zcode",
     }
     if explicit in explicit_aliases:
         return explicit_aliases[explicit]
@@ -139,6 +147,13 @@ def detect_host() -> str:
     if _looks_like_codex_vscode_process():
         return "codex_vscode"
 
+    # Harness-specific markers are lower-confidence diagnostics.  They are
+    # checked after explicit Claude/VS Code signals and never grant Apps UI.
+    if _looks_like_dsh():
+        return "dsh"
+    if _looks_like_zcode():
+        return "zcode"
+
     # ── Disk-based detection: Codex always writes its
     #     global config to ~/.codex/config.toml ─────────
     codex_config = Path.home() / ".codex" / "config.toml"
@@ -150,6 +165,31 @@ def detect_host() -> str:
         return "vscode_generic"
 
     return "unknown"
+
+
+def _looks_like_dsh() -> bool:
+    """Best-effort dsh signal used only for diagnostics and telemetry."""
+    for key in ("DSH_CLIENT", "DSH_VERSION", "DSH_SESSION", "DEEPSEEK_HARNESS"):
+        if _os.environ.get(key, "").strip():
+            return True
+    try:
+        return (Path.home() / ".dsh").is_dir()
+    except RuntimeError:
+        return False
+
+
+def _looks_like_zcode() -> bool:
+    """Best-effort ZCode signal used only for diagnostics and telemetry."""
+    integration = _os.environ.get("INTEGRATION_IDE", "").strip().lower()
+    if integration in {"zcode", "zhipu", "codegeex"}:
+        return True
+    for key in ("ZCODE_VERSION", "ZCODE_SESSION", "ZHIPU_CODE"):
+        if _os.environ.get(key, "").strip():
+            return True
+    try:
+        return (Path.home() / ".zcode").is_dir()
+    except RuntimeError:
+        return False
 
 
 def _looks_like_codex_vscode_process() -> bool:
@@ -172,17 +212,146 @@ def _looks_like_codex_vscode_process() -> bool:
     return False
 
 
+# ===========================================================================
+# MCP capability negotiation
+# ===========================================================================
+
+MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
+MCP_APPS_HTML_MIME = "text/html;profile=mcp-app"
+
+
+def _model_to_dict(value: Any) -> Dict[str, Any]:
+    """Convert an MCP/Pydantic model or mapping to a plain dict."""
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json", by_alias=True, exclude_none=True)
+        except TypeError:
+            dumped = model_dump()
+        return dict(dumped) if isinstance(dumped, dict) else {}
+    return {}
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    """Read a field from either an SDK model or a plain mapping."""
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def client_supports_mcp_apps(capabilities: Any) -> bool:
+    """Return True only for an explicit MCP Apps capability declaration.
+
+    Stable clients advertise the extension in ``capabilities.extensions``.
+    Older ext-apps clients used ``experimental`` while the capability was
+    still being standardized, so that location is accepted for compatibility.
+    Host names and environment variables are deliberately ignored here.
+    """
+    caps = _model_to_dict(capabilities)
+    for field in ("extensions", "experimental"):
+        extensions = caps.get(field)
+        if not isinstance(extensions, dict):
+            continue
+        extension = extensions.get(MCP_APPS_EXTENSION_ID)
+        if not isinstance(extension, dict):
+            continue
+        mime_types = extension.get("mimeTypes")
+        if mime_types is None:
+            mime_types = extension.get("mime_types")
+        if isinstance(mime_types, (list, tuple, set)) and MCP_APPS_HTML_MIME in mime_types:
+            return True
+    return False
+
+
+def client_supports_elicitation_url(capabilities: Any) -> bool:
+    """Return True when the wire-level ``elicitation.url`` field is present."""
+    caps = _model_to_dict(capabilities)
+    elicitation = caps.get("elicitation")
+    if not isinstance(elicitation, dict) or "url" not in elicitation:
+        return False
+    # The valid declaration is often ``{"url": {}}``; an empty mapping is
+    # still a capability and must not be tested with ``bool(value)``.
+    return isinstance(elicitation.get("url"), dict)
+
+
+def inspect_mcp_client(ctx: Any = None) -> Dict[str, Any]:
+    """Extract initialize/request metadata for routing and diagnostics.
+
+    FastMCP exposes the original initialize parameters as
+    ``ctx.session.client_params``.  Newer clients may repeat capabilities in
+    request ``_meta``; only the current request context is considered.  The
+    returned values are plain JSON-compatible dictionaries so this helper is
+    also usable in tests without importing a concrete SDK version.
+    """
+    result: Dict[str, Any] = {
+        "capabilities": {},
+        "source": "unavailable",
+        "protocol_version": "",
+        "client_info": {},
+    }
+    if ctx is None:
+        return result
+
+    try:
+        session = _field(ctx, "session")
+        params = _field(session, "client_params")
+        if params is not None:
+            capabilities = _model_to_dict(_field(params, "capabilities"))
+            result.update(
+                {
+                    "capabilities": capabilities,
+                    "source": "initialize",
+                    "protocol_version": str(
+                        _field(params, "protocolVersion", "")
+                        or _field(params, "protocol_version", "")
+                        or ""
+                    ),
+                    "client_info": _model_to_dict(
+                        _field(params, "clientInfo")
+                        or _field(params, "client_info")
+                    ),
+                }
+            )
+
+        # RequestParams.Meta permits extra fields.  Check both the Context
+        # metadata and the raw request params for SDK implementations that do
+        # not expose the alias uniformly.
+        meta_values = []
+        request_context = _field(ctx, "request_context")
+        if request_context is not None:
+            meta_values.append(_field(request_context, "meta"))
+            request = _field(request_context, "request")
+            request_params = _field(request, "params")
+            if request_params is not None:
+                meta_values.append(_field(request_params, "meta"))
+                meta_values.append(_field(request_params, "_meta"))
+        for raw_meta in meta_values:
+            meta = _model_to_dict(raw_meta)
+            for key in (
+                "io.modelcontextprotocol/clientCapabilities",
+                "io.modelcontextprotocol/client_capabilities",
+            ):
+                modern = meta.get(key)
+                if isinstance(modern, dict):
+                    result["capabilities"] = modern
+                    result["source"] = "request_meta"
+                    return result
+    except Exception:
+        # Capability detection must never make a normal tool call fail.
+        return result
+    return result
+
+
+# Deprecated host allow-list names are retained as empty compatibility sets.
 MCP_APPS_WIDGET_HOSTS = frozenset(
     {
-        "codex",
-        "claude_desktop",
         # ── Tentative MCP Apps hosts (2026-06) ──
         # These hosts MAY support MCP Apps sandbox widgets — we include
         # _meta on tool results AND also open a local_browser page as a
         # fallback.  If the widget renders, the user can use either.
         # If it doesn't, the browser page is already open.
-        "claude_code_desktop",
-        "claude_code_vscode",
     }
 )
 
@@ -190,42 +359,33 @@ MCP_APPS_WIDGET_HOSTS = frozenset(
 # For these hosts we use "app_only" mode — no local_browser fallback.
 MCP_APPS_CONFIRMED_HOSTS = frozenset(
     {
-        "codex",
-        "claude_desktop",
-        "claude_code_desktop",
     }
 )
 
+# Both constants are intentionally empty.  They remain only for callers that
+# imported the legacy names; runtime routing uses inspect_mcp_client().
 
-def host_supports_mcp_apps_widget() -> bool:
-    """Return True when the host might render MCP Apps sandboxed iframes.
 
-    This is intentionally broader than ``host_mcp_apps_confirmed()``:
-    tentative hosts return True so widget metadata is sent, but they still
-    need local_browser fallback in hybrid mode.
+def host_supports_mcp_apps_widget(ctx: Any = None) -> bool:
+    """Return runtime MCP Apps support when context is available.
 
-    Supported hosts (as of 2026-06):
-      - Codex Desktop (confirmed — native MCP Apps sandbox)
-      - Claude Desktop (confirmed — legacy standalone app)
-      - Claude Code Desktop (confirmed — native MCP Apps sandbox)
-      - Claude Code VS Code extension (tentative — hybrid: widget + local_browser)
-
-    NOT supported (no sandboxed iframe capability):
-      - Codex VS Code plugin → uses localhost browser fallback
-      - Claude Code CLI → uses numbered fallback or TUI
+    The no-argument form is retained for old integrations and fails closed.
+    Rendering decisions must pass the current MCP context.
     """
-    return detect_host() in MCP_APPS_WIDGET_HOSTS
+    if ctx is not None:
+        return client_supports_mcp_apps(inspect_mcp_client(ctx).get("capabilities"))
+    # Static host sets are retained only for import compatibility and are not
+    # evidence of a current MCP capability.
+    return False
 
 
-def host_mcp_apps_confirmed() -> bool:
-    """Return True when the host is KNOWN to definitely support MCP Apps.
-
-    Confirmed hosts use ``app_only`` mode — no local_browser fallback.
-    Confirmed hosts use app-only mode: _meta is sent and no localhost
-    selection page is opened automatically.  Claude Code VS Code remains a
-    tentative host and uses hybrid mode.
-    """
-    return detect_host() in MCP_APPS_CONFIRMED_HOSTS
+def host_mcp_apps_confirmed(ctx: Any = None) -> bool:
+    """Return an explicit runtime capability, or a legacy diagnostic value."""
+    if ctx is not None:
+        return client_supports_mcp_apps(inspect_mcp_client(ctx).get("capabilities"))
+    # Static host sets are retained only for import compatibility and are not
+    # evidence of a current MCP capability.
+    return False
 
 
 def host_is_codex() -> bool:
@@ -267,107 +427,28 @@ def _is_http_url(url: str) -> bool:
 
 
 def _open_url_with_system_browser(url: str) -> bool:
-    """Ask the OS/default browser to open a URL without blocking the MCP tool."""
-    import subprocess
-    import sys
-    import threading
-    import webbrowser
-
-    target = (url or "").strip()
-    if not target:
-        return False
-
-    if _os.name == "nt":
-        try:
-            _os.startfile(target)  # type: ignore[attr-defined]
-            return True
-        except Exception:
-            pass
-
-    if sys.platform == "darwin":
-        try:
-            subprocess.Popen(
-                ["open", target],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
-            return True
-        except Exception:
-            pass
-
-    if _os.name == "posix":
-        try:
-            subprocess.Popen(
-                ["xdg-open", target],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-            )
-            return True
-        except Exception:
-            pass
-
-    result = {"opened": False}
-
-    def _open() -> None:
-        try:
-            result["opened"] = bool(webbrowser.open(target, new=2, autoraise=True))
-        except Exception:
-            result["opened"] = False
-
-    thread = threading.Thread(
-        target=_open,
-        name="paper-search-open-url",
-        daemon=True,
-    )
-    thread.start()
-    thread.join(timeout=1.5)
-    return bool(result["opened"] or thread.is_alive())
+    """Deprecated server-side opener; navigation belongs to the client."""
+    return False
 
 
 def _open_url_with_vscode_open_url(url: str) -> bool:
-    """Best-effort VS Code URL opener. Never pass URLs as command arguments."""
-    import subprocess
-
-    code = vscode_binary()
-    if not code:
-        return False
-    try:
-        subprocess.Popen(
-            [code, "--open-url", url],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        return True
-    except Exception:
-        return False
+    """Deprecated server-side VS Code opener."""
+    return False
 
 
 def _notify_vscode_companion(url: str) -> bool:
-    """Notify the optional VS Code companion via IPC without using code --command."""
-    try:
-        from .ui import vscode_bridge
-
-        return vscode_bridge._write_named_pipe(
-            {
-                "action": "open_selection_page",
-                "params": {"url": url},
-            }
-        )
-    except Exception:
-        return False
+    """Deprecated IPC hook; the companion is opened explicitly by the client."""
+    return False
 
 
 def open_url_in_host_result(url: str) -> Dict[str, Any]:
-    """Open *url* and return details about the selected nonblocking strategy."""
+    """Return a client-navigation instruction without opening a GUI server-side."""
     started = time.monotonic()
     target = (url or "").strip()
-    host = detect_host()
+    try:
+        host = detect_host()
+    except Exception:
+        host = "unknown"
     result: Dict[str, Any] = {
         "opened": False,
         "method": "",
@@ -380,30 +461,11 @@ def open_url_in_host_result(url: str) -> Dict[str, Any]:
             result["error"] = "empty_url"
             return result
 
-        if host_is_vscode() and _notify_vscode_companion(target):
-            result["opened"] = True
-            result["method"] = "vscode_companion_ipc"
+        if not _is_http_url(target):
+            result["error"] = "unsupported_url"
             return result
-
-        tried_system_browser = False
-        if _is_http_url(target):
-            tried_system_browser = True
-            if _open_url_with_system_browser(target):
-                result["opened"] = True
-                result["method"] = "system_browser"
-                return result
-
-        if host_is_vscode() and _open_url_with_vscode_open_url(target):
-            result["opened"] = True
-            result["method"] = "vscode_open_url"
-            return result
-
-        if not tried_system_browser and _open_url_with_system_browser(target):
-            result["opened"] = True
-            result["method"] = "system_browser"
-            return result
-
-        result["error"] = "no_opener_available"
+        result["method"] = "client_open_link"
+        result["error"] = "server_side_open_disabled"
         return result
     except Exception as exc:
         result["error"] = repr(exc)

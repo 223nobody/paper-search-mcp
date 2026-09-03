@@ -35,7 +35,7 @@ dependencies = [
     "feedparser",
     "fastmcp",
     "pypdf",
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]==1.28.1",
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
     "httpx[socks]>=0.28.1",
@@ -43,7 +43,7 @@ dependencies = [
 
 [project.optional-dependencies]
 publisher = [
-    "scansci-pdf[cloakbrowser]",
+    "scansci-pdf[cloakbrowser]>=1.14.0,<2",
 ]
 
 [project.urls]

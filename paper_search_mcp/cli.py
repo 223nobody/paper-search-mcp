@@ -417,7 +417,7 @@ async def cmd_workflow(args: argparse.Namespace) -> int:
     # ── Phase 4: Download ──────────────────────────────────────────────
     save_path = resolve_save_path(args.save_path)
     os.makedirs(save_path, exist_ok=True)
-    dl_concurrency = args.download_concurrency if args.download_concurrency > 0 else 4
+    dl_concurrency = args.download_concurrency if args.download_concurrency > 0 else 8
     semaphore = asyncio.Semaphore(dl_concurrency)
 
     downloaded: List[Dict[str, Any]] = []
@@ -628,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="MinerU parser mode (default: auto)")
     p_wf.add_argument("--no-parse", action="store_true", help="Skip MinerU parsing")
     p_wf.add_argument("--download-concurrency", type=int, default=0,
-                       help="Concurrent downloads (default: 4)")
+                       help="Concurrent downloads (default: 8)")
 
     return parser
 

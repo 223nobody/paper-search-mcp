@@ -1,66 +1,48 @@
 "use strict";
 
 const vscode = require("vscode");
+const http = require("http");
+const https = require("https");
 
-// ══════════════════════════════════════════════════════════════
-// Constants
-// ══════════════════════════════════════════════════════════════
 const VIEW_TYPE = "paperSearchSelector";
-const IPC_PIPE_NAME = "\\\\.\\pipe\\paper_search_mcp_selection";
-
-// ══════════════════════════════════════════════════════════════
-// Activation
-// ══════════════════════════════════════════════════════════════
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 10000;
+const MAX_REDIRECTS = 5;
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
-  console.log("[paper-search-companion] Activated");
-
-  // ── Command: open selector with explicit URL ──────────────
   const openCommand = vscode.commands.registerCommand(
     "paper-search-companion.openSelector",
     async (args) => {
       const url = typeof args === "string" ? args : args?.url;
       if (!url) {
-        // No URL provided — try reading from a temp state file
-        const fallbackUrl = await _readPendingUrl();
-        if (fallbackUrl) {
-          return _openSelectorPanel(context, fallbackUrl);
-        }
         vscode.window.showWarningMessage(
-          "Paper Search Companion: no selection URL provided. " +
-          "Run a paper search first."
+          "Paper Search Companion: provide a selection URL from the MCP tool."
         );
         return;
       }
       return _openSelectorPanel(context, url);
     }
   );
-
-  // ── Named-pipe poller (Windows) ───────────────────────────
-  let pipeServer = null;
-  if (process.platform === "win32") {
-    pipeServer = _startPipeServer(context);
-  }
-
   context.subscriptions.push(openCommand);
-  if (pipeServer) {
-    context.subscriptions.push({ dispose: () => pipeServer.close() });
-  }
 }
 
-// ══════════════════════════════════════════════════════════════
-// Webview Panel
-// ══════════════════════════════════════════════════════════════
-
 /**
- * Open a Webview Panel that loads the paper selection page.
- * @param {vscode.ExtensionContext} context
- * @param {string} url — localhost URL or data URI
+ * Open one self-contained Webview for an explicit selection URL.
+ * The page talks to the local MCP HTTP endpoint directly; the extension is
+ * only responsible for remote/desktop URI mapping and external links.
  */
-function _openSelectorPanel(context, url) {
+async function _openSelectorPanel(context, rawUrl) {
+  let target;
+  try {
+    target = _validateHttpUrl(rawUrl);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Paper Search Companion: ${err.message}`);
+    return null;
+  }
+
   const panel = vscode.window.createWebviewPanel(
     VIEW_TYPE,
     "Paper Selector",
@@ -71,302 +53,168 @@ function _openSelectorPanel(context, url) {
       localResourceRoots: [],
     }
   );
+  panel.webview.html = _loadingHtml(target);
 
-  _setPanelHtml(panel, url);
-
-  // ── Listen for selection result from the webview ──────────
   panel.webview.onDidReceiveMessage(
     async (message) => {
-      switch (message.type) {
-        case "selection-complete": {
-          const selected = message.selectedIndices || "";
-          const downloadOnly = message.downloadOnly || false;
-
-          vscode.window.showInformationMessage(
-            `Selected papers: ${selected || "none"}`
-          );
-
-          // Write result for the MCP server to pick up
-          await _writeSelectionResult({
-            selectedIndices: selected,
-            downloadOnly: downloadOnly,
-            timestamp: Date.now(),
-          });
-
-          // Close the panel after a brief delay
-          setTimeout(() => panel.dispose(), 500);
-          break;
-        }
-        case "selection-cancelled": {
-          vscode.window.showInformationMessage("Paper selection cancelled.");
-          panel.dispose();
-          break;
-        }
-        case "resize": {
-          // The webview requests a specific height
-          break;
-        }
+      if (message?.type !== "open-external") return;
+      try {
+        const external = _validateHttpUrl(message.url);
+        await vscode.env.openExternal(vscode.Uri.parse(external));
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Paper Search Companion: cannot open link (${err.message})`
+        );
       }
     },
     undefined,
     context.subscriptions
   );
 
-  panel.onDidDispose(() => {
-    console.log("[paper-search-companion] Panel disposed");
-  });
+  try {
+    // asExternalUri handles remote extension hosts and forwarded localhost
+    // ports without requiring the MCP process to know about VS Code routing.
+    const externalUri = await vscode.env.asExternalUri(vscode.Uri.parse(target));
+    const html = await _fetchHtml(externalUri.toString());
+    panel.webview.html = _prepareWebviewHtml(html, externalUri.toString());
+  } catch (err) {
+    panel.webview.html = _errorHtml(target, err);
+  }
 
+  panel.onDidDispose(() => {
+    console.log("[paper-search-companion] selector panel disposed");
+  });
   return panel;
 }
 
-/**
- * Set the panel's HTML — loads the external URL, but injects a
- * bridge script that intercepts form submissions and relays them
- * via VS Code's postMessage API.
- */
-function _setPanelHtml(panel, url) {
-  // When the URL is a localhost page, we load it via an iframe and
-  // inject a bridge.  When it's a data URI or the server is not yet
-  // running, show a loading state.
-  panel.webview.html = _loadingHtml(url);
-
-  // The actual page loads inside an iframe — once loaded we inject
-  // a small bridge script that captures the selection result.
-  panel.webview.onDidReceiveMessage(async (msg) => {
-    if (msg.type === "iframe-ready") {
-      // The iframe has loaded — inject the bridge
-      panel.webview.postMessage({
-        type: "inject-bridge",
-        script: _bridgeScript(),
-      });
-    }
-  }, undefined);
+function _validateHttpUrl(value) {
+  const parsed = new URL(String(value || ""));
+  if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname) {
+    throw new Error("selection URL must use http or https");
+  }
+  if (parsed.username || parsed.password || parsed.hash) {
+    throw new Error("selection URL must not contain credentials or a fragment");
+  }
+  return parsed.toString();
 }
 
-// ══════════════════════════════════════════════════════════════
-// HTML templates
-// ══════════════════════════════════════════════════════════════
+function _fetchHtml(url, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === "https:" ? https : http;
+    const request = transport.get(
+      parsed,
+      { headers: { Accept: "text/html,application/xhtml+xml" } },
+      (response) => {
+        const status = response.statusCode || 0;
+        if (status >= 300 && status < 400 && response.headers.location) {
+          response.resume();
+          if (redirects >= MAX_REDIRECTS) {
+            reject(new Error("selection page redirect limit exceeded"));
+            return;
+          }
+          try {
+            const redirect = new URL(response.headers.location, parsed).toString();
+            resolve(_fetchHtml(_validateHttpUrl(redirect), redirects + 1));
+          } catch (err) {
+            reject(err);
+          }
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          response.resume();
+          reject(new Error(`selection page returned HTTP ${status}`));
+          return;
+        }
+
+        const chunks = [];
+        let total = 0;
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          total += Buffer.byteLength(chunk, "utf8");
+          if (total > MAX_HTML_BYTES) {
+            request.destroy(new Error("selection page is too large"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on("end", () => resolve(chunks.join("")));
+        response.on("error", reject);
+      }
+    );
+    request.setTimeout(FETCH_TIMEOUT_MS, () => {
+      request.destroy(new Error("selection page request timed out"));
+    });
+    request.on("error", reject);
+  });
+}
+
+function _prepareWebviewHtml(html, baseUrl) {
+  const base = _escHtml(baseUrl);
+  const cspOrigin = _escHtml(new URL(baseUrl).origin);
+  const bridge = `
+<script>
+(() => {
+  const vscodeApi = acquireVsCodeApi();
+  document.addEventListener('click', (event) => {
+    const link = event.target.closest && event.target.closest('a[href]');
+    if (!link) return;
+    let target;
+    try { target = new URL(link.href, document.baseURI); } catch (_) { return; }
+    if (target.origin !== location.origin) {
+      event.preventDefault();
+      vscodeApi.postMessage({ type: 'open-external', url: target.toString() });
+    }
+  }, true);
+})();
+</script>`;
+  let documentHtml = String(html || "");
+  documentHtml = documentHtml.replace(/<base\b[^>]*>/gi, "");
+  if (/<head\b[^>]*>/i.test(documentHtml)) {
+    documentHtml = documentHtml.replace(
+      /(<head\b[^>]*>)/i,
+      `$1<meta name="paper-search-base" content="${base}"><base href="${base}">`
+    );
+    documentHtml = documentHtml.replace(
+      /(<head\b[^>]*>)/i,
+      `$1<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src ${cspOrigin}; img-src data: ${cspOrigin} https:; style-src 'unsafe-inline' ${cspOrigin}; script-src 'unsafe-inline' ${cspOrigin}; font-src data: ${cspOrigin};">`
+    );
+  } else {
+    documentHtml = `<!doctype html><html><head><base href="${base}"></head><body>${documentHtml}</body></html>`;
+  }
+  if (/<\/body>/i.test(documentHtml)) {
+    documentHtml = documentHtml.replace(/<\/body>/i, `${bridge}</body>`);
+  } else {
+    documentHtml += bridge;
+  }
+  return documentHtml;
+}
 
 function _loadingHtml(url) {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      display: flex; align-items: center; justify-content: center;
-      min-height: 100vh;
-      background: var(--vscode-editor-background);
-      color: var(--vscode-editor-foreground);
-      font-family: var(--vscode-font-family);
-      font-size: 14px;
-    }
-    .container { text-align: center; }
-    .spinner {
-      width: 40px; height: 40px;
-      border: 3px solid var(--vscode-input-border);
-      border-top-color: var(--vscode-button-background);
-      border-radius: 50%;
-      animation: spin .8s linear infinite;
-      margin: 0 auto 16px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .url { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 12px; word-break: break-all; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="spinner"></div>
-    <p>Loading paper selector…</p>
-    <p class="url">${_escHtml(url)}</p>
-  </div>
-  <iframe id="frame" src="${_escHtml(url)}"
-    sandbox="allow-scripts allow-forms allow-same-origin"
-    style="display:none; position:absolute; inset:0; width:100%; height:100%; border:none;"
-    onload="onFrameLoad()">
-  </iframe>
-  <script>
-    const vscodeApi = acquireVsCodeApi();
-    const frame = document.getElementById('frame');
-
-    function onFrameLoad() {
-      frame.style.display = 'block';
-      document.querySelector('.container').style.display = 'none';
-      // Tell the extension the iframe is ready
-      vscodeApi.postMessage({ type: 'iframe-ready' });
-    }
-
-    // Listen for bridge-injection command
-    window.addEventListener('message', (e) => {
-      const msg = e.data;
-      if (msg.type === 'inject-bridge') {
-        try {
-          frame.contentWindow.postMessage({
-            type: 'vscode-bridge',
-            script: msg.script,
-          }, '*');
-        } catch (_) {}
-      }
-      if (msg.type === 'selection-result') {
-        vscodeApi.postMessage(msg);
-      }
-    });
-  </script>
-</body>
-</html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+body { font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 32px; }
+code { word-break: break-all; }
+</style></head><body><p>Loading paper selector...</p><code>${_escHtml(url)}</code></body></html>`;
 }
 
-function _bridgeScript() {
-  return `
-(function() {
-  if (window.__vscodeBridgeInjected) return;
-  window.__vscodeBridgeInjected = true;
-
-  const vscodeApi = window.parent?.acquireVsCodeApi?.();
-  if (!vscodeApi) return;
-
-  // Hook into the existing form submission
-  const form = document.querySelector('form');
-  if (form) {
-    form.addEventListener('submit', function(e) {
-      e.preventDefault();
-      const selected = Array.from(
-        document.querySelectorAll('input[name="paper"]:checked')
-      ).map(el => el.value);
-
-      // Relay to VS Code extension
-      window.parent.postMessage({
-        type: 'selection-result',
-        selectedIndices: selected.join(','),
-        downloadOnly: window.data?.selection_semantics === 'download_selected_only',
-      }, '*');
-    }, true);
-  }
-
-  // Also hook button clicks
-  document.addEventListener('click', function(e) {
-    const btn = e.target.closest('#parse, #download');
-    if (!btn || btn.disabled) return;
-    // Let the original handler run, then capture
-    setTimeout(function() {
-      const status = document.getElementById('status');
-      if (status && status.classList.contains('success')) {
-        window.parent.postMessage({
-          type: 'selection-result',
-          selectedIndices: Array.from(
-            document.querySelectorAll('input[name="paper"]:checked')
-          ).map(el => el.value).join(','),
-          downloadOnly: window.data?.selection_semantics === 'download_selected_only',
-        }, '*');
-      }
-    }, 300);
-  });
-})();`;
+function _errorHtml(url, error) {
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+body { font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); padding: 32px; }
+code { word-break: break-all; }
+</style></head><body><h2>Paper selector unavailable</h2><p>${_escHtml(error?.message || error)}</p><p>Open this URL in a browser:</p><code>${_escHtml(url)}</code></body></html>`;
 }
 
-// ══════════════════════════════════════════════════════════════
-// Named Pipe polling (Windows)
-// ══════════════════════════════════════════════════════════════
-
-function _pollPipe(context) {
-  return _startPipeServer(context);
-  /*
-      // Pipe not available yet — that's fine
-    });
-
-    // Short timeout so we don't block
-  } catch (_) {
-    // Pipe polling failed silently
-  }
-  */
-}
-
-// ══════════════════════════════════════════════════════════════
-function _startPipeServer(context) {
-  try {
-    const net = require("net");
-    const server = net.createServer((socket) => {
-      let data = "";
-
-      socket.on("data", (chunk) => {
-        data += chunk.toString("utf8");
-      });
-      socket.on("end", () => _handlePipeRequest(context, data));
-      socket.on("error", () => {});
-    });
-
-    server.on("error", (err) => {
-      console.warn("[paper-search-companion] IPC pipe unavailable:", err?.message || err);
-    });
-    server.listen(IPC_PIPE_NAME);
-    return server;
-  } catch (err) {
-    console.warn("[paper-search-companion] IPC pipe setup failed:", err?.message || err);
-    return null;
-  }
-}
-
-function _handlePipeRequest(context, raw) {
-  try {
-    const request = JSON.parse(raw);
-    if (request?.action === "open_selection_page" && request?.params?.url) {
-      _openSelectorPanel(context, request.params.url);
-    }
-  } catch (_) {
-    // Ignore malformed messages
-  }
-}
-
-// Temp-file IPC helpers (cross-platform fallback)
-// ══════════════════════════════════════════════════════════════
-
-const { tmpdir } = require("os");
-const { join } = require("path");
-const { readFile, writeFile, unlink } = require("fs/promises");
-
-const PENDING_URL_FILE = join(tmpdir(), "paper_search_mcp_pending_url.json");
-const RESULT_FILE = join(tmpdir(), "paper_search_mcp_selection_result.json");
-
-async function _readPendingUrl() {
-  try {
-    const raw = await readFile(PENDING_URL_FILE, "utf-8");
-    await unlink(PENDING_URL_FILE).catch(() => {});
-    const data = JSON.parse(raw);
-    return data?.url || null;
-  } catch {
-    return null;
-  }
-}
-
-async function _writeSelectionResult(result) {
-  try {
-    await writeFile(RESULT_FILE, JSON.stringify(result, null, 2), "utf-8");
-  } catch (_) {
-    // Non-fatal: the MCP server can still work via its own HTTP handlers
-  }
-}
-
-// ══════════════════════════════════════════════════════════════
-// Utilities
-// ══════════════════════════════════════════════════════════════
-
-function _escHtml(s) {
-  return String(s)
+function _escHtml(value) {
+  return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
-
-// ══════════════════════════════════════════════════════════════
-// Export
-// ══════════════════════════════════════════════════════════════
 
 module.exports = { activate };
 
-// Re-evaluate after the module has been loaded (hot-reload compat)
 if (typeof module.hot?.accept === "function") {
   module.hot.accept();
 }

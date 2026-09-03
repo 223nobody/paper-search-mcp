@@ -2,18 +2,16 @@
   "mcpServers": {
     "paper-search-mcp": {
       "type": "stdio",
-      "command": "uv",
+      "command": "C:\\code\\paper-search-mcp\\.venv\\Scripts\\python.exe",
       "args": [
-        "run",
-        "--directory",
-        "C:\\code\\paper-search-mcp",
         "-m",
         "paper_search_mcp.server"
       ],
       "env": {
         "PAPER_SEARCH_MCP_SEARCH_PROFILE": "pdf-cs",
         "PAPER_SEARCH_MCP_MINERU_MODE": "auto",
-        "PAPER_SEARCH_MCP_MINERU_LANGUAGE": "en"
+        "PAPER_SEARCH_MCP_MINERU_LANGUAGE": "en",
+        "PAPER_SEARCH_MCP_DOWNLOAD_CONCURRENCY": "8"
       }
     }
   }

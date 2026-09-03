@@ -12,7 +12,11 @@ import asyncio
 import os
 import secrets
 import time
+import webbrowser
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+from mcp.server.fastmcp import Context
 
 from ..cache import (
     get_search_session as cache_get_search_session,
@@ -33,7 +37,6 @@ from ..engine.parse import (
     _codex_app_display_candidates,
     _paper_selection_app_payload,
     _reindexed_display_candidates,
-    _mcp_app_fallback_timeout_seconds,
     _selection_semantics_name,
     _selection_surface_policy,
     _workflow_parse_execution_name,
@@ -45,9 +48,8 @@ from ..ui.html_templates import (
 from ..ui.server import (
     LOCAL_PAPER_SELECTION_TOOL,
     _create_local_selection_page,
-    open_paper_selection_page as _open_local_paper_selection_page,
 )
-from ..utils import DEFAULT_SAVE_PATH, detect_host, host_supports_mcp_apps_widget
+from ..utils import DEFAULT_SAVE_PATH
 from ..selection_confirmation import (
     confirmation_required_response,
     consume_selection_confirmation_token,
@@ -57,94 +59,6 @@ from ..selection_confirmation import (
     selection_revision as _selection_revision,
 )
 from ..widgets.response import widget_tool_result
-
-
-# Per-selection_token background tasks that auto-open the local browser
-# fallback when the MCP App widget never reports ready.
-_FALLBACK_TIMERS: Dict[str, "asyncio.Task[None]"] = {}
-
-
-async def _auto_fallback_task(
-    selection_token: str,
-    *,
-    fallback_after_seconds: int,
-    candidates: List[Dict[str, Any]],
-    session: Dict[str, Any],
-    effective_semantics: str,
-    effective_parse_execution: str,
-    save_path: str,
-    use_scihub: bool,
-    mode: str,
-    backend: str,
-    force: bool,
-    custom_save_path_confirmed: bool,
-) -> None:
-    """Sleep *fallback_after_seconds*, then open local page if App is not ready."""
-    try:
-        await asyncio.sleep(fallback_after_seconds)
-    except asyncio.CancelledError:
-        return
-
-    state = await asyncio.to_thread(cache_read_selection_ui_state, selection_token)
-    state = state if isinstance(state, dict) else {}
-    if bool(state.get("app_ready") or state.get("fallback_opened_at") or state.get("fallback_url")):
-        return  # already handled
-
-    requested_count = int(
-        session.get("metadata", {}).get("requested_count") or 0
-        if isinstance(session, dict)
-        else 0
-    )
-    full_total = int(
-        session.get("metadata", {}).get("full_total") or len(candidates)
-        if isinstance(session, dict)
-        else len(candidates)
-    )
-    try:
-        from ..ui.server import _create_local_selection_page as _make_page
-        from ..utils import open_url_in_host
-
-        display_candidates = _codex_app_display_candidates(
-            candidates, requested_count=requested_count
-        )
-        display_candidates = _reindexed_display_candidates(display_candidates)
-        page = _make_page(
-            selection_token=selection_token,
-            papers=display_candidates,
-            save_path=save_path,
-            use_scihub=use_scihub,
-            mode=mode,
-            backend=backend,
-            force=force,
-            custom_save_path_confirmed=custom_save_path_confirmed,
-            selection_semantics=effective_semantics,
-            parse_execution=effective_parse_execution,
-            force_reopen=False,
-        )
-        opened = await asyncio.to_thread(open_url_in_host, page["url"])
-        if opened:
-            from ..ui.server import mark_local_selection_page_opened
-            mark_local_selection_page_opened(page["page_id"])
-
-        stored = dict(state)
-        stored.update(
-            {
-                "fallback_url": page["url"],
-                "fallback_page_id": page["page_id"],
-                "fallback_opened_at": time.time() if opened else stored.get("fallback_opened_at", 0),
-                "fallback_reused": bool(page.get("reused")),
-            }
-        )
-        await asyncio.to_thread(
-            cache_write_selection_ui_state, selection_token, stored
-        )
-    except Exception:
-        import logging
-        logging.getLogger(__name__).exception(
-            "Auto-fallback for %s failed", selection_token
-        )
-    finally:
-        _FALLBACK_TIMERS.pop(selection_token, None)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +111,7 @@ async def _handle_render_paper_selection_app(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = "",
     parse_execution: str = "",
+    ctx: Optional[Context] = None,
 ) -> Any:
     """Render a checkbox paper selector for MCP Apps-capable hosts.
 
@@ -232,22 +147,29 @@ async def _handle_render_paper_selection_app(
         requested_count=requested_count,
     )
     app_candidates = _reindexed_display_candidates(app_candidates)
+    surface = _selection_surface_policy(force_open=True, ctx=ctx)
     ui_state = await asyncio.to_thread(
         cache_read_selection_ui_state, selection_token
     ) if session else {}
-    app_attempt_id = f"app_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+    app_attempt_id = (
+        f"app_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+        if surface.get("surface") == "mcp_app"
+        else ""
+    )
     if session:
         stored_state = dict(ui_state) if isinstance(ui_state, dict) else {}
-        surface = _selection_surface_policy(force_open=True)
         stored_state.update(
             {
-                "app_render_attempted_at": time.time(),
-                "app_attempt_id": app_attempt_id,
-                "app_ready": False,
-                "fallback_after_seconds": int(
-                    surface.get("fallback_after_seconds")
-                    or _mcp_app_fallback_timeout_seconds()
+                "app_render_attempted_at": (
+                    time.time() if surface.get("surface") == "mcp_app" else 0
                 ),
+                "app_attempt_id": app_attempt_id,
+                "app_ready": False if surface.get("surface") == "mcp_app" else bool(
+                    stored_state.get("app_ready")
+                ),
+                # Kept for response-shape compatibility; fallback is explicit
+                # and is never scheduled by the server.
+                "fallback_after_seconds": 0,
             }
         )
         ui_state = await asyncio.to_thread(
@@ -255,35 +177,8 @@ async def _handle_render_paper_selection_app(
             selection_token,
             stored_state,
         )
-    # ── Auto-fallback timer: when surface is mcp_app_then_local, open the ──
-    # ── local browser page after fallback_after_seconds if the MCP App     ──
-    # ── widget never reports ready.  One timer per selection_token.        ──
-    surface = _selection_surface_policy(force_open=True)
-    fallback_after = int(
-        surface.get("fallback_after_seconds")
-        or _mcp_app_fallback_timeout_seconds()
-    )
-    if surface.get("surface") == "mcp_app_then_local" and fallback_after > 0:
-        # Cancel any previous timer for this token so only one fires.
-        prev = _FALLBACK_TIMERS.pop(selection_token, None)
-        if prev is not None and not prev.done():
-            prev.cancel()
-        _FALLBACK_TIMERS[selection_token] = asyncio.create_task(
-            _auto_fallback_task(
-                selection_token,
-                fallback_after_seconds=fallback_after,
-                candidates=candidates,
-                session=session,
-                effective_semantics=effective_semantics,
-                effective_parse_execution=effective_parse_execution,
-                save_path=save_path or DEFAULT_SAVE_PATH,
-                use_scihub=use_scihub,
-                mode=mode,
-                backend=backend,
-                force=force,
-                custom_save_path_confirmed=custom_save_path_confirmed,
-            )
-        )
+    # Do not start a timer that guesses whether an App rendered.  A host
+    # that cannot render the App can explicitly call the browser tool instead.
     persisted_selection = _selection_state_payload(
         selection_token, session, ui_state
     ) if session else {}
@@ -302,23 +197,51 @@ async def _handle_render_paper_selection_app(
         full_total=full_total,
         persisted_selection=persisted_selection,
     )
-    payload["detected_host"] = detect_host()
-    payload["app_widget_supported"] = host_supports_mcp_apps_widget()
-    payload["selection_surface"] = _selection_surface_policy(force_open=True)
+    payload["detected_host"] = surface.get("detected_host", "unknown")
+    payload["app_widget_supported"] = bool(surface.get("app_widget_supported"))
+    payload["selection_surface"] = surface
     payload["app_attempt_id"] = app_attempt_id
     payload["fallback_after_seconds"] = int(
-        payload["selection_surface"].get("fallback_after_seconds")
-        or _mcp_app_fallback_timeout_seconds()
+        payload["selection_surface"].get("fallback_after_seconds") or 0
     )
     payload["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
     payload["status_tool"] = "get_paper_selection_surface_status"
-    if not payload["app_widget_supported"]:
-        payload["fallback_reason"] = "host_without_mcp_app_sandbox"
+    if surface.get("surface") == "ui_disabled":
+        payload["status"] = "ui_disabled"
+        payload["error"] = "selection_ui_disabled"
+        payload["recommended_tool"] = ""
+        payload["message"] = (
+            "Paper selection UI is disabled by PAPER_SEARCH_MCP_SELECTION_UI_MODE."
+        )
+    elif not payload["app_widget_supported"]:
+        payload["fallback_reason"] = "client_capability_missing"
         payload["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
         payload["fallback_instructions"] = (
             f"Call {LOCAL_PAPER_SELECTION_TOOL} with this selection_token to "
             "open the localhost checkbox selector."
         )
+        # Make the T2 contract self-contained even when a client invokes the
+        # render tool directly: return the same browser URL instead of asking
+        # the client to infer how to construct one.
+        fallback_page = await _handle_open_paper_selection_page(
+            selection_token=selection_token,
+            papers=None,
+            save_path=save_path,
+            use_scihub=use_scihub,
+            mode=mode,
+            backend=backend,
+            force=force,
+            custom_save_path_confirmed=custom_save_path_confirmed,
+            selection_semantics=effective_semantics,
+            parse_execution=effective_parse_execution,
+            open_browser=False,
+        )
+        payload["interaction"] = "browser_url_selection"
+        payload["recommended_tool"] = LOCAL_PAPER_SELECTION_TOOL
+        payload["local_browser"] = fallback_page
+        payload["recommended_url"] = fallback_page.get("url", "")
+        payload["local_browser_url"] = fallback_page.get("url", "")
+        payload["opened"] = False
     return widget_tool_result(payload, _RENDER_PAPER_SELECTION_TOOL_META)
 
 
@@ -394,7 +317,7 @@ async def _handle_report_paper_selection_app_ready(
     client_instance_id: str = "",
     app_attempt_id: str = "",
 ) -> Dict[str, Any]:
-    """Record that the MCP App iframe rendered and could call tools."""
+    """Record that the MCP App rendered and could call tools."""
     session = await asyncio.to_thread(cache_get_search_session, selection_token)
     if not session:
         return {
@@ -404,6 +327,13 @@ async def _handle_report_paper_selection_app_ready(
         }
     state = await asyncio.to_thread(cache_read_selection_ui_state, selection_token)
     stored = dict(state) if isinstance(state, dict) else {}
+    if not stored.get("app_render_attempted_at"):
+        return {
+            "status": "unsupported",
+            "selection_token": selection_token,
+            "app_ready": False,
+            "message": "MCP App readiness cannot be reported for a browser-routed selection.",
+        }
     stored.update(
         {
             "app_ready": True,
@@ -417,10 +347,6 @@ async def _handle_report_paper_selection_app_ready(
         selection_token,
         stored,
     )
-    # Cancel the auto-fallback timer — the MCP App is confirmed live.
-    prev = _FALLBACK_TIMERS.pop(selection_token, None)
-    if prev is not None and not prev.done():
-        prev.cancel()
     return {
         "status": "ok",
         "selection_token": selection_token,
@@ -433,6 +359,7 @@ async def _handle_report_paper_selection_app_ready(
 
 async def _handle_get_paper_selection_surface_status(
     selection_token: str,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """Return whether the MCP App is ready or local fallback should be used."""
     session = await asyncio.to_thread(cache_get_search_session, selection_token)
@@ -446,30 +373,22 @@ async def _handle_get_paper_selection_surface_status(
         }
     state = await asyncio.to_thread(cache_read_selection_ui_state, selection_token)
     state = state if isinstance(state, dict) else {}
-    surface = _selection_surface_policy(force_open=True)
+    surface = _selection_surface_policy(force_open=True, ctx=ctx)
     now = time.time()
     attempted_at = float(state.get("app_render_attempted_at") or 0)
     ready_at = float(state.get("app_ready_at") or 0)
     fallback_after = int(
         state.get("fallback_after_seconds")
         or surface.get("fallback_after_seconds")
-        or _mcp_app_fallback_timeout_seconds()
+        or 0
     )
     elapsed = max(0.0, now - attempted_at) if attempted_at else 0.0
     app_ready = bool(state.get("app_ready") or ready_at)
     fallback_url = str(state.get("fallback_url") or "")
     fallback_opened = bool(state.get("fallback_opened_at") or fallback_url)
-    fallback_allowed = surface.get("surface") in {
-        "mcp_app_then_local",
-        "hybrid",
-        "local_browser",
-    }
-    fallback_recommended = (
-        fallback_allowed
-        and not app_ready
-        and attempted_at > 0
-        and elapsed >= fallback_after
-    )
+    # A server timer must not guess whether a host rendered an App.  The
+    # browser URL is always available as an explicit client action.
+    fallback_recommended = False
     return {
         "status": "ok",
         "selection_token": selection_token,
@@ -488,7 +407,7 @@ async def _handle_get_paper_selection_surface_status(
         "message": (
             "MCP App rendered successfully."
             if app_ready
-            else "MCP App is pending; use local fallback if the iframe is not visible."
+            else "MCP App readiness has not been reported by the client."
             if fallback_recommended
             else "Waiting for MCP App readiness signal."
         ),
@@ -719,7 +638,7 @@ async def _handle_open_paper_url_in_browser(
     paper_index: int,
     url_kind: str = "paper",
 ) -> Dict[str, Any]:
-    """Open a paper or PDF URL from the stored session via the host browser."""
+    """Resolve a paper or PDF URL for the client to open."""
     kind = (url_kind or "paper").strip().lower()
     if kind not in {"paper", "pdf"}:
         return {
@@ -755,17 +674,30 @@ async def _handle_open_paper_url_in_browser(
             "url_kind": kind,
             "message": "No URL is available for this paper.",
         }
-    from ..utils import open_url_in_host
-
-    opened = bool(await asyncio.to_thread(open_url_in_host, url))
+    parsed = urlparse(url)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        return {
+            "status": "invalid_url",
+            "selection_token": selection_token,
+            "paper_index": paper_index,
+            "url_kind": kind,
+            "message": "Only credential-free http(s) URLs can be opened by the client.",
+        }
     return {
-        "status": "ok" if opened else "open_failed",
+        "status": "ok",
         "selection_token": selection_token,
         "paper_index": paper_index,
         "url_kind": kind,
         "url": url,
-        "opened": opened,
-        "message": "Opened in browser." if opened else "Could not open automatically; copy the URL.",
+        "opened": False,
+        "method": "client_open_link",
+        "message": "URL resolved. The host should open it or let the user copy it.",
     }
 
 
@@ -807,7 +739,7 @@ async def _handle_open_paper_selection_page(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = "",
     parse_execution: str = "",
-    open_browser: bool = True,
+    open_browser: bool = False,
     force_reopen: bool = False,
 ) -> Dict[str, Any]:
     """Open a local browser checkbox selector for clients without MCP Apps UI.
@@ -858,17 +790,15 @@ async def _handle_open_paper_selection_page(
         parse_execution=effective_parse_execution,
         force_reopen=force_reopen,
     )
+    # Auto-launch the default browser when requested.  ``webbrowser.open``
+    # dispatches to os.startfile on Windows, ``open`` on macOS, and xdg-open on
+    # Linux; on headless/remote hosts it safely returns False.
     opened = False
-    if open_browser:
-        from ..utils import open_url_in_host
-        if not bool(page.get("already_opened")):
-            opened = await asyncio.to_thread(open_url_in_host, page["url"])
-            if opened:
-                from ..ui.server import mark_local_selection_page_opened
-
-                mark_local_selection_page_opened(page["page_id"])
-        else:
-            opened = True
+    if open_browser and page.get("url"):
+        try:
+            opened = bool(webbrowser.open(page["url"]))
+        except Exception:
+            opened = False
     try:
         from ..ui import server as _ui_server
 
@@ -925,10 +855,6 @@ async def _handle_open_paper_selection_page(
                 "fallback_reused": bool(page.get("reused")),
             }
         )
-        # Cancel auto-fallback timer — we're here, so it's handled.
-        prev = _FALLBACK_TIMERS.pop(selection_token, None)
-        if prev is not None and not prev.done():
-            prev.cancel()
         await asyncio.to_thread(
             cache_write_selection_ui_state,
             selection_token,

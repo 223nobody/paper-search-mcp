@@ -52,6 +52,16 @@ def _copernicus_pdf_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 
+def _acl_anthology_pdf_url(doi: str) -> str:
+    # ACL Anthology is fully open access. DOI forms:
+    #   10.18653/v1/2025.acl-long.1511  -> https://aclanthology.org/2025.acl-long.1511.pdf
+    #   10.18653/v1/N19-1423            -> https://aclanthology.org/N19-1423.pdf
+    parts = doi.lower().split("10.18653/v1/", 1)
+    if len(parts) != 2 or not parts[1]:
+        return ""
+    return f"https://aclanthology.org/{parts[1]}.pdf"
+
+
 PUBLISHER_PDF_TEMPLATES: dict[str, Callable[[str], str]] = {
     "10.1038/s41467": _nature_oa_pdf_url,
     "10.1038/s41598": _nature_oa_pdf_url,
@@ -64,6 +74,7 @@ PUBLISHER_PDF_TEMPLATES: dict[str, Callable[[str], str]] = {
     "10.1186": _springer_open_pdf_url,
     "10.7717": _peerj_pdf_url,
     "10.5194": _copernicus_pdf_url,
+    "10.18653": _acl_anthology_pdf_url,
 }
 
 

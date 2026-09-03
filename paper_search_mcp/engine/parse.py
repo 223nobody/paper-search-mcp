@@ -31,7 +31,14 @@ from ..cache import (
     _session_path as cache_session_path,
 )
 from ..config import env_file_path, get_env
-from ..utils import DEFAULT_SAVE_PATH, extract_doi, resolve_save_path
+from ..utils import (
+    DEFAULT_SAVE_PATH,
+    client_supports_mcp_apps,
+    client_supports_elicitation_url,
+    extract_doi,
+    inspect_mcp_client,
+    resolve_save_path,
+)
 from .paper import (
     _paper_parse_candidate,
     _ranking_profile_name,
@@ -50,7 +57,6 @@ SEARCH_SOURCE_TIMEOUT_ENV = "SEARCH_SOURCE_TIMEOUT_SECONDS"
 DOWNLOAD_TIMEOUT_ENV = "DOWNLOAD_TIMEOUT_SECONDS"
 AUTO_OPEN_SELECTION_UI_ENV = "AUTO_OPEN_SELECTION_UI"
 SELECTION_UI_MODE_ENV = "SELECTION_UI_MODE"
-MCP_APP_FALLBACK_TIMEOUT_SECONDS_ENV = "MCP_APP_FALLBACK_TIMEOUT_SECONDS"
 SAVED_PDF_BATCH_PROMPT_ENV = "SAVED_PDF_BATCH_PROMPT"
 SAVED_PDF_BATCH_WINDOW_ENV = "SAVED_PDF_BATCH_WINDOW_SECONDS"
 PARSE_PROMPT_TIMEOUT_SECONDS_ENV = "PARSE_PROMPT_TIMEOUT_SECONDS"
@@ -60,7 +66,6 @@ PARSE_PROMPT_ALLOW_REOPEN_ENV = "PARSE_PROMPT_ALLOW_REOPEN"
 
 _DEFAULT_PARSE_PROMPT_TIMEOUT_SECONDS = 180
 _DEFAULT_PARSE_PROMPT_TIMEOUT_PER_PAPER_SECONDS = 15
-DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS = 8
 
 PAPER_SELECTION_WIDGET_URI = "ui://paper-search/paper-selection.html"
 PAPER_SELECTION_WIDGET_TOOL = "render_paper_selection_app"
@@ -566,21 +571,15 @@ def _selection_ui_mode() -> str:
     if normalized in {"off", "none", "disabled", "disable", "false", "no"}:
         return "off"
     if normalized in {"app", "app_only", "mcp_app", "mcp"}:
+        # Kept as a legacy configuration spelling.  It can request an App
+        # surface, but cannot grant capability when the handshake is absent.
         return "app_only"
     if normalized in {
         "browser", "local", "local_browser", "open", "force", "force_open",
     }:
         return "local_browser"
-    # ── Auto-detect ──
-    # Confirmed MCP Apps hosts (codex, claude_desktop, claude_code_desktop):
-    #   "app_only" — widget only, no local_browser
-    # Tentative MCP Apps hosts (claude_code_vscode):
-    #   "auto" — widget _meta is sent AND local_browser opens as fallback
-    if not raw or normalized == "auto":
-        from ..utils import detect_host  # noqa: PLC0415
-        from ..utils import host_mcp_apps_confirmed  # noqa: PLC0415
-        if host_mcp_apps_confirmed() and detect_host() != "claude_code_desktop":
-            return "app_only"
+    # Auto is deliberately independent of host names.  Capability evidence is
+    # evaluated by _selection_surface_policy when the MCP Context is present.
     return "auto"
 
 
@@ -590,143 +589,63 @@ def _selection_ui_should_open(*, force_open: bool = False) -> bool:
         return False
     if mode == "local_browser":
         return True
-    from ..utils import detect_host, host_mcp_apps_confirmed  # noqa: PLC0415
-    if mode == "app_only":
-        return bool(force_open and not host_mcp_apps_confirmed())
-    if detect_host() == "claude_code_desktop":
-        return False
-    # Only CONFIRMED MCP Apps hosts (codex, claude_desktop,
-    # claude_code_desktop) skip the local browser.  Tentative hosts
-    # (claude_code_vscode) open local_browser as a fallback.
-    if host_mcp_apps_confirmed():
-        return False
-    if force_open:
-        return True
-    return _env_flag_enabled(AUTO_OPEN_SELECTION_UI_ENV, default="false")
+    # ``force_open`` is retained for API compatibility but no longer means
+    # “open a GUI”.  Browser navigation is a host/user action; server-side
+    # opening is intentionally disabled.
+    return False
 
 
-def _mcp_app_fallback_timeout_seconds() -> int:
-    raw = (
-        get_env(
-            MCP_APP_FALLBACK_TIMEOUT_SECONDS_ENV,
-            str(DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS),
-        ).strip()
-        or str(DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS)
-    )
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return DEFAULT_MCP_APP_FALLBACK_TIMEOUT_SECONDS
+def _selection_surface_policy(
+    *, force_open: bool = False, ctx: Any = None
+) -> Dict[str, Any]:
+    """Resolve the UI surface from MCP capabilities, not host allow-lists."""
+    inspected = inspect_mcp_client(ctx)
+    capabilities = inspected.get("capabilities", {})
+    wire_apps = client_supports_mcp_apps(capabilities)
+    wire_elicitation_url = client_supports_elicitation_url(capabilities)
+    host = str((inspected.get("client_info") or {}).get("name") or "").strip()
+    # clientInfo is useful for diagnostics; it never grants T1 on its own.
+    if host:
+        detected_host = host
+    else:
+        from ..utils import detect_host  # noqa: PLC0415
 
-
-def _selection_surface_policy(*, force_open: bool = False) -> Dict[str, Any]:
-    """Describe the preferred paper-selection surface for the current host.
-
-    Four primary client scenarios are explicitly mapped:
-
-    ========================= ============= ============
-    Scenario                   MCP App       Local Brwsr
-    ========================= ============= ============
-    Codex Desktop              ✅ (default)  ❌
-    Claude Desktop             ✅ (default)  ❌
-    Claude Code Desktop        ✅ (default)  ❌
-    Codex VS Code plugin       ❌            ✅ (default)
-    Claude Code VS Code ext.   ✅ (hybrid)*  ✅ (fallback)
-    ========================= ============= ============
-
-    * Hybrid mode: ``_meta`` is always sent (so MCP Apps widget
-    can render if supported), AND the local browser page is opened
-    as a working fallback.
-
-    The ``SELECTION_UI_MODE`` env var can override: ``off``, ``app_only``,
-    ``local_browser``, ``auto`` (default).  In forced user-confirmation flows,
-    ``app_only`` is treated as hybrid/local fallback for non-confirmed hosts so
-    a misconfiguration cannot suppress every visible selector.
-    """
-    from ..utils import (  # noqa: PLC0415
-        detect_host,
-        host_mcp_apps_confirmed,
-        host_supports_mcp_apps_widget,
-    )
-
-    host = detect_host()
+        detected_host = detect_host()
     mode = _selection_ui_mode()
-    app_supported = host_supports_mcp_apps_widget()
-    app_confirmed = host_mcp_apps_confirmed()
-    local_should_open = _selection_ui_should_open(force_open=force_open)
-
-    # ── Per-host default surface (before mode overrides) ──
-    # codex_vscode and claude_code_vscode do NOT have sandboxed iframe
-    # support → fall back to localhost browser checkbox.
-    _HOST_DEFAULT_SURFACE: Dict[str, str] = {
-        "codex": "mcp_app",
-        "claude_code_desktop": "mcp_app_then_local",
-        "claude_desktop": "mcp_app",
-        "codex_vscode": "local_browser",
-        "claude_code_vscode": "hybrid",
-        "claude_code_cli": "local_browser",
-        "vscode_generic": "local_browser",
-    }
+    local_should_open = False
 
     if mode == "off":
-        surface = "numbered_fallback"
+        surface = "ui_disabled"
         reason = "selection_ui_disabled"
-    elif mode == "app_only":
-        if app_confirmed:
-            surface = "mcp_app"
-            reason = "app_only_configured"
-        elif force_open and app_supported:
-            surface = "hybrid"
-            reason = f"app_only_unsupported_host_{host}_using_hybrid_fallback"
-        elif force_open:
-            surface = "local_browser"
-            reason = f"app_only_unsupported_host_{host}_using_local_browser"
-        else:
-            surface = "mcp_app" if app_supported else "numbered_fallback"
-            reason = (
-                "app_only_tentative_host"
-                if app_supported
-                else "mcp_app_requested_but_unsupported"
-            )
     elif mode == "local_browser":
-        surface = "local_browser"
+        surface = "browser"
         reason = "local_browser_configured"
-    elif host == "claude_code_desktop" and app_supported:
-        surface = "mcp_app_then_local"
-        reason = "host_claude_code_desktop_try_mcp_app_then_local_fallback"
-    elif app_confirmed:
+    elif wire_apps:
         surface = "mcp_app"
-        reason = f"host_{host}_supports_mcp_app_sandbox"
-    elif app_supported and (force_open or local_should_open):
-        surface = "hybrid"
-        reason = f"host_{host}_tentative_mcp_app_with_local_browser_fallback"
-    elif app_supported:
-        surface = _HOST_DEFAULT_SURFACE.get(host, "hybrid")
-        reason = f"host_{host}_tentative_mcp_app"
-    elif force_open or local_should_open:
-        surface = "local_browser"
-        reason = f"host_{host}_without_mcp_app_sandbox"
+        reason = "client_capability_mcp_apps"
     else:
-        surface = _HOST_DEFAULT_SURFACE.get(host, "numbered_fallback")
-        reason = "local_browser_not_auto_opened"
+        surface = "browser"
+        reason = (
+            "client_capability_unknown"
+            if inspected.get("source") == "unavailable"
+            else "client_mcp_apps_not_declared"
+        )
 
     return {
         "surface": surface,
         "reason": reason,
-        "detected_host": host,
+        "detected_host": detected_host,
+        "client_info": inspected.get("client_info", {}),
+        "protocol_version": inspected.get("protocol_version", ""),
+        "capability_source": inspected.get("source", "unavailable"),
         "ui_mode": mode,
-        "app_widget_supported": app_supported,
-        "app_widget_confirmed": app_confirmed,
+        "app_widget_supported": wire_apps,
+        "app_widget_confirmed": wire_apps,
+        "elicitation_url_supported": wire_elicitation_url,
         "local_browser_should_open": local_should_open,
-        "fallback_after_seconds": _mcp_app_fallback_timeout_seconds()
-        if surface == "mcp_app_then_local"
-        else 0,
-        "fallback_tool": "open_paper_selection_page"
-        if surface in {"mcp_app_then_local", "hybrid", "local_browser"}
-        else "",
-        "status_tool": "get_paper_selection_surface_status"
-        if surface == "mcp_app_then_local"
-        else "",
+        "fallback_after_seconds": 0,
+        "fallback_tool": "open_paper_selection_page" if surface == "browser" else "",
+        "status_tool": "",
     }
 
 
@@ -1255,11 +1174,9 @@ def _promote_paper_selection_app(result: Dict[str, Any]) -> Dict[str, Any]:
             nested_surface = parse_prompt.get("selection_surface")
             if isinstance(nested_surface, dict):
                 surface = nested_surface
-    if isinstance(surface, dict) and surface.get("surface") not in {
-        "mcp_app",
-        "mcp_app_then_local",
-        "hybrid",
-    }:
+    if not isinstance(surface, dict):
+        return result
+    if surface.get("surface") != "mcp_app":
         return result
 
     # ── Set _meta for MCP Apps surfaces, including tentative hybrid hosts.
@@ -1268,8 +1185,8 @@ def _promote_paper_selection_app(result: Dict[str, Any]) -> Dict[str, Any]:
     # Tentative hosts (Claude Code VSCode): hybrid mode —
     #   _meta is sent so the client CAN render the widget, AND a
     #   local_browser page is opened as a fallback.
-    from ..utils import host_supports_mcp_apps_widget  # noqa: PLC0415
-    if not host_supports_mcp_apps_widget():
+    # Client names are diagnostic only; capability evidence controls `_meta`.
+    if not bool(surface.get("app_widget_supported")):
         return result
 
     app_meta = app.get("_meta")
@@ -1413,13 +1330,13 @@ async def _prompt_parse_saved_pdfs(
     parse_execution_name = _workflow_parse_execution_name(parse_execution)
 
     fallback: Dict[str, Any] = {
-        "status": "elicitation_unavailable",
-        "interaction": "backend_session_numbered_selection",
+        "status": "selection_required",
+        "interaction": "browser_url_selection",
         "selection_token": session["selection_token"],
         "instructions": (
-            "PDF saved. Present the numbered papers to the user. To parse "
-            "selected PDFs, call parse_selected_papers(selection_token=<token>, "
-            "selected_indices='1') or selected_indices='all'."
+            "PDF saved. Render the MCP App or call open_paper_selection_page "
+            "with selection_token, then call parse_selected_papers for the "
+            "selected indices."
         ),
         "papers": candidates,
         "total": len(candidates),
@@ -1458,14 +1375,11 @@ async def _prompt_parse_saved_pdfs(
             "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
             "recommended_selected_indices": "",
             "message": (
-                "PDF saved. Select PDFs in the checkbox UI or use numbered "
-                "indices before MinerU parsing."
+                "PDF saved. Select PDFs in the MCP App or browser page before "
+                "MinerU parsing."
             ),
         }
-        if (
-            len(candidates) > AUTO_PARSE_SAVED_PDF_LIMIT
-            and _attach_local_selection_ui_fn is not None
-        ):
+        if _attach_local_selection_ui_fn is not None:
             await _attach_local_selection_ui_fn(
                 prompt_response,
                 selection_token=session["selection_token"],
@@ -1477,6 +1391,7 @@ async def _prompt_parse_saved_pdfs(
                 force=force,
                 custom_save_path_confirmed=custom_save_path_confirmed,
                 force_open=True,
+                ctx=ctx,
             )
         return _promote_paper_selection_app(prompt_response)
 
@@ -1551,130 +1466,25 @@ async def _prompt_parse_saved_pdfs(
             ),
         }
 
-    if ctx is None:
-        if _attach_local_selection_ui_fn is not None:
-            await _attach_local_selection_ui_fn(
-                fallback,
-                selection_token=session["selection_token"],
-                papers=candidates,
-                save_path=save_path,
-                use_scihub=False,
-                mode=mode,
-                backend=backend,
-                force=force,
-                custom_save_path_confirmed=custom_save_path_confirmed,
-                force_open=True,
-            )
-        fallback["parse_decision_required"] = True
-        fallback["requires_user_parse_decision"] = True
-        fallback["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
-        fallback["recommended_selected_indices"] = ""
-        return _promote_paper_selection_app(fallback)
-
-    options = [_elicitation_option_label(candidate) for candidate in selectable]
-    schema = _build_paper_selection_schema(options)
-    try:
-        elicitation = await ctx.elicit(
-            message="PDF saved. Select PDFs for MinerU PDF parsing.",
-            schema=schema,
-        )
-    except Exception as exc:
-        return {
-            **fallback,
-            "message": f"Elicitation request failed: {exc}",
-        }
-
-    if getattr(elicitation, "action", "") != "accept":
-        return {
-            **fallback,
-            "status": "elicitation_not_accepted",
-            "elicitation_action": getattr(elicitation, "action", ""),
-            "message": (
-                "User declined or cancelled parsing. "
-                "Use parse_selected_papers with numbered indices if needed."
-            ),
-        }
-
-    selected_values = getattr(
-        getattr(elicitation, "data", None), "selected_papers", []
-    )
-    try:
-        selected_indices = _parse_elicitation_selected_indices(
-            selected_values, len(candidates)
-        )
-    except ValueError as exc:
-        return {
-            **fallback,
-            "status": "invalid_elicitation_selection",
-            "message": str(exc),
-        }
-
-    if not selected_indices:
-        return {
-            **fallback,
-            "status": "no_selection",
-            "message": (
-                "No PDFs were selected. Use parse_selected_papers "
-                "with numbered indices if needed."
-            ),
-        }
-
-    selected_indices_arg = ",".join(
-        str(index) for index in selected_indices
-    )
-    if parse_execution_name == "sync":
-        parse_result = await _parse_selected_papers_fn(
+    if _attach_local_selection_ui_fn is not None:
+        await _attach_local_selection_ui_fn(
+            fallback,
             selection_token=session["selection_token"],
-            selected_indices=selected_indices_arg,
+            papers=candidates,
             save_path=save_path,
             use_scihub=False,
             mode=mode,
             backend=backend,
             force=force,
             custom_save_path_confirmed=custom_save_path_confirmed,
+            force_open=True,
+            ctx=ctx,
         )
-        return {
-            **parse_result,
-            "interaction": "elicitation",
-            "selection_token": session["selection_token"],
-            "selected_indices": selected_indices,
-            "recommended_tool": "get_parsed_paper",
-            "recommended_selected_indices": selected_indices_arg,
-            "parse_execution": parse_execution_name,
-        }
-
-    if _submit_parse_job_fn is None:
-        return {
-            **fallback,
-            "status": "error",
-            "message": "submit_parse_job is not available.",
-        }
-    parse_job = await _submit_parse_job_fn(
-        selection_token=session["selection_token"],
-        selected_indices=selected_indices_arg,
-        save_path=save_path,
-        use_scihub=False,
-        mode=mode,
-        backend=backend,
-        force=force,
-        custom_save_path_confirmed=custom_save_path_confirmed,
-    )
-    return {
-        "status": (
-            parse_job.get("status", "submitted")
-            if isinstance(parse_job, dict)
-            else "submitted"
-        ),
-        "interaction": "elicitation",
-        "selection_token": session["selection_token"],
-        "selected_indices": selected_indices,
-        "recommended_tool": "get_parse_job_status",
-        "recommended_selected_indices": selected_indices_arg,
-        "parse_execution": parse_execution_name,
-        "parse_job": parse_job,
-        "message": "Submitted a MinerU parse job for the selected PDFs.",
-    }
-
+    fallback["parse_decision_required"] = True
+    fallback["requires_user_parse_decision"] = True
+    fallback["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
+    fallback["recommended_selected_indices"] = ""
+    return _promote_paper_selection_app(fallback)
 
 async def _parse_prompt_for_download_results(
     *,
@@ -1783,7 +1593,7 @@ async def _parse_prompt_for_download_results(
     )
     fallback: Dict[str, Any] = {
         "status": "ok" if selectable else "no_parse_ready_pdfs",
-        "interaction": "backend_session_numbered_selection",
+        "interaction": "browser_url_selection",
         "selection_token": parse_session["selection_token"],
         "download_selection_token": selection_token,
         **timeout_meta,
@@ -1871,8 +1681,8 @@ async def _parse_prompt_for_download_results(
 
     if parse_execution_name == "prompt":
         fallback["message"] = (
-            f"Saved {len(candidates)} PDFs. Select PDFs in the checkbox UI "
-            "or use numbered indices before MinerU parsing."
+            f"Saved {len(candidates)} PDFs. Select PDFs in the MCP App or "
+            "browser page before MinerU parsing."
         )
         fallback["parse_decision_required"] = True
         fallback["requires_user_parse_decision"] = True
@@ -1893,6 +1703,7 @@ async def _parse_prompt_for_download_results(
                 force=force,
                 custom_save_path_confirmed=custom_save_path_confirmed,
                 force_open=True,
+                ctx=ctx,
             )
         await asyncio.to_thread(_write_pending_parse_prompt_state, fallback)
         return _promote_paper_selection_app(fallback)
@@ -1967,8 +1778,8 @@ async def _parse_prompt_for_download_results(
     if len(candidates) > AUTO_PARSE_SAVED_PDF_LIMIT:
         fallback["message"] = (
             f"Saved {len(candidates)} PDFs, which is above the auto-parse "
-            f"limit of {AUTO_PARSE_SAVED_PDF_LIMIT}. Use the checkbox UI "
-            "or numbered indices to choose PDFs for MinerU."
+            f"limit of {AUTO_PARSE_SAVED_PDF_LIMIT}. Use the MCP App or "
+            "browser selection page to choose PDFs for MinerU."
         )
         fallback["parse_decision_required"] = True
         fallback["requires_user_parse_decision"] = True
@@ -1984,128 +1795,29 @@ async def _parse_prompt_for_download_results(
                 force=force,
                 custom_save_path_confirmed=custom_save_path_confirmed,
                 force_open=True,
+                ctx=ctx,
             )
 
-    if ctx is None:
-        prompted = {
-            **fallback,
-            "parse_decision_required": True,
-            "requires_user_parse_decision": True,
-            "recommended_tool": PAPER_SELECTION_WIDGET_TOOL,
-            "recommended_selected_indices": "",
-        }
-        await asyncio.to_thread(_write_pending_parse_prompt_state, prompted)
-        return _promote_paper_selection_app(
-            {
-                **prompted,
-            }
-        )
-
-    options = [_elicitation_option_label(candidate) for candidate in selectable]
-    schema = _build_paper_selection_schema(options)
-    try:
-        elicitation = await ctx.elicit(
-            message="More than 10 PDFs were saved. Select PDFs for MinerU "
-            "PDF parsing.",
-            schema=schema,
-        )
-    except Exception as exc:
-        return {
-            **fallback,
-            "message": f"Elicitation request failed: {exc}",
-        }
-
-    if getattr(elicitation, "action", "") != "accept":
-        return {
-            **fallback,
-            "status": "elicitation_not_accepted",
-            "elicitation_action": getattr(elicitation, "action", ""),
-            "message": (
-                "User declined or cancelled parsing. "
-                "Use the checkbox UI or numbered indices if needed."
-            ),
-        }
-
-    selected_values = getattr(
-        getattr(elicitation, "data", None), "selected_papers", []
-    )
-    try:
-        selected_indices = _parse_elicitation_selected_indices(
-            selected_values, len(candidates)
-        )
-    except ValueError as exc:
-        return {
-            **fallback,
-            "status": "invalid_elicitation_selection",
-            "message": str(exc),
-        }
-
-    if not selected_indices:
-        return {
-            **fallback,
-            "status": "no_selection",
-            "message": (
-                "No PDFs were selected. Use the checkbox UI or numbered "
-                "indices if needed."
-            ),
-        }
-
-    selected_indices_arg = ",".join(
-        str(index) for index in selected_indices
-    )
-    if parse_execution_name == "sync":
-        parse_result = await _parse_selected_papers_fn(
+    if _attach_local_selection_ui_fn is not None:
+        await _attach_local_selection_ui_fn(
+            fallback,
             selection_token=parse_session["selection_token"],
-            selected_indices=selected_indices_arg,
+            papers=candidates,
             save_path=save_path,
             use_scihub=use_scihub,
             mode=mode,
             backend=backend,
             force=force,
             custom_save_path_confirmed=custom_save_path_confirmed,
+            force_open=True,
+            ctx=ctx,
         )
-        return {
-            **parse_result,
-            "interaction": "elicitation",
-            "selection_token": parse_session["selection_token"],
-            "download_selection_token": selection_token,
-            "papers": candidates,
-            "selected_indices": selected_indices,
-            "recommended_tool": "get_parsed_paper",
-            "recommended_selected_indices": selected_indices_arg,
-            "parse_execution": parse_execution_name,
-        }
-
-    if _submit_parse_job_fn is None:
-        return {
-            **fallback,
-            "status": "error",
-            "message": "submit_parse_job is not available.",
-        }
-    parse_job = await _submit_parse_job_fn(
-        selection_token=parse_session["selection_token"],
-        selected_indices=selected_indices_arg,
-        save_path=save_path,
-        use_scihub=use_scihub,
-        mode=mode,
-        backend=backend,
-        force=force,
-        custom_save_path_confirmed=custom_save_path_confirmed,
-    )
-    return {
-        **fallback,
-        "status": (
-            parse_job.get("status", "submitted")
-            if isinstance(parse_job, dict)
-            else "submitted"
-        ),
-        "interaction": "elicitation",
-        "selected_indices": selected_indices,
-        "recommended_tool": "get_parse_job_status",
-        "recommended_selected_indices": selected_indices_arg,
-        "parse_job": parse_job,
-        "message": "Submitted a MinerU parse job for the selected PDFs.",
-    }
+    fallback["parse_decision_required"] = True
+    fallback["requires_user_parse_decision"] = True
+    fallback["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
+    fallback["recommended_selected_indices"] = ""
+    await asyncio.to_thread(_write_pending_parse_prompt_state, fallback)
+    return _promote_paper_selection_app(fallback)
 
 
 async def _pre_download_selection_prompt(
@@ -2225,6 +1937,7 @@ async def _pre_download_selection_prompt(
             force_open=True,
             selection_semantics=semantics,
             parse_execution=parse_execution,
+            ctx=ctx,
         )
     return _promote_paper_selection_app(prompt)
 
@@ -2409,7 +2122,6 @@ async def _create_paper_selection_result(
     parse_ready_total = sum(
         1 for candidate in candidates if candidate["parse_ready"]
     )
-    numbered_fallback = _numbered_paper_fallback(candidates)
     action_description = (
         f"call {action_tool}(selection_token=<token>, "
         "selected_indices='1,3,5') or selected_indices='all'."
@@ -2440,20 +2152,20 @@ async def _create_paper_selection_result(
         "selection_semantics": semantics,
         "requested_count": requested_count,
         "instructions": (
-            f"Present the numbered papers to the user. To {action_verb} "
-            f"selected papers, {action_description}"
+            "Render the MCP App when the client advertises the "
+            "io.modelcontextprotocol/ui capability. Otherwise call "
+            "open_paper_selection_page with the selection_token, then "
+            f"{action_description}"
         ),
         "papers": candidates,
-        "numbered_fallback": numbered_fallback,
         "fallback": {
-            "interaction": "backend_session_numbered_selection",
+            "interaction": "browser_url_selection",
             "selection_token": session["selection_token"],
             "full_selection_token": full_session["selection_token"],
             "instructions": (
-                "If checkbox UI is unavailable, show numbered_fallback and "
-                f"pass the user's numbers to {action_tool}."
+                "Call open_paper_selection_page with the selection_token; "
+                f"then pass the selected indices to {action_tool}."
             ),
-            "papers": numbered_fallback,
         },
         "total": len(candidates),
         "display_total": len(candidates),

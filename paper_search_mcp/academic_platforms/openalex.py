@@ -176,6 +176,34 @@ class OpenAlexSearcher(PaperSource):
 
         return papers
 
+    def get_arxiv_url_by_doi(self, doi: str) -> str:
+        """Resolve a DOI to an arXiv URL via OpenAlex's full location list.
+
+        OpenAlex records the arXiv preprint as one of a work's ``locations``
+        (often not the ``primary_location``, which points at the paywalled
+        publisher). Returns the first arXiv landing/PDF URL, or "".
+        """
+        normalized = (doi or "").strip().replace("https://doi.org/", "")
+        if not normalized:
+            return ""
+        try:
+            url = f"{self.BASE_URL}/https://doi.org/{normalized}"
+            response = self.session.get(url, timeout=30)
+            if response.status_code != 200:
+                return ""
+            item = response.json()
+            locations = [item.get("primary_location")] + list(item.get("locations") or [])
+            for loc in locations:
+                if not isinstance(loc, dict):
+                    continue
+                for key in ("pdf_url", "landing_page_url"):
+                    candidate = (loc.get(key) or "").lower()
+                    if "arxiv.org" in candidate:
+                        return loc.get(key) or ""
+        except Exception as e:
+            logger.warning(f"OpenAlex DOI→arXiv lookup failed for {doi}: {e}")
+        return ""
+
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         """
         OpenAlex does not host PDFs natively, it only links to open access versions.

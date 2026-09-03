@@ -1,528 +1,208 @@
-"""Tests for host environment detection in paper_search_mcp.utils."""
+"""Tests for diagnostic host detection and capability-based UI routing."""
 
 from __future__ import annotations
 
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+from paper_search_mcp.engine.parse import (
+    _selection_surface_policy,
+    _selection_ui_mode,
+    _selection_ui_should_open,
+)
 from paper_search_mcp.utils import (
+    MCP_APPS_EXTENSION_ID,
+    MCP_APPS_HTML_MIME,
     _notify_vscode_companion,
+    client_supports_elicitation_url,
+    client_supports_mcp_apps,
     detect_host,
-    host_mcp_apps_confirmed,
-    host_is_claude_code,
-    host_is_codex,
-    host_is_vscode,
-    host_supports_mcp_apps_widget,
+    inspect_mcp_client,
     open_url_in_host_result,
     vscode_binary,
 )
 
 
-# ══════════════════════════════════════════════════════════════
-# Fixtures to control the detection cache
-# ══════════════════════════════════════════════════════════════
-
-
 @pytest.fixture(autouse=True)
 def _clear_detect_host_cache():
-    """Each test gets a fresh host detection result."""
     detect_host.cache_clear()
     yield
     detect_host.cache_clear()
 
 
-# ══════════════════════════════════════════════════════════════
-# Codex detection (disk-based: ~/.codex/config.toml)
-# ══════════════════════════════════════════════════════════════
+def _ctx(capabilities=None, *, name="test-client", request_meta=None):
+    client_params = SimpleNamespace(
+        capabilities=capabilities or {},
+        protocolVersion="2025-06-18",
+        clientInfo={"name": name, "version": "1.0"},
+    )
+    request_context = SimpleNamespace(
+        meta=request_meta,
+        request=SimpleNamespace(
+            params=SimpleNamespace(meta=request_meta, _meta=request_meta)
+        ),
+    )
+    return SimpleNamespace(
+        session=SimpleNamespace(client_params=client_params),
+        request_context=request_context,
+    )
+
+
+def _apps_capabilities(location="extensions"):
+    return {
+        location: {
+            MCP_APPS_EXTENSION_ID: {"mimeTypes": [MCP_APPS_HTML_MIME]}
+        }
+    }
 
 
 def test_detect_codex_from_config_file():
-    """When ~/.codex/config.toml exists, return 'codex'."""
     with tempfile.TemporaryDirectory() as tmp:
         codex_dir = Path(tmp) / ".codex"
         codex_dir.mkdir()
-        (codex_dir / "config.toml").write_text("[model]\n")
-
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch.object(Path, "home", return_value=Path(tmp)):
-                assert detect_host() == "codex"
-                assert host_is_codex() is True
-                assert host_supports_mcp_apps_widget() is True
-                assert host_is_vscode() is False
-                assert host_is_claude_code() is False
+        (codex_dir / "config.toml").write_text("[model]\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            Path, "home", return_value=Path(tmp)
+        ):
+            assert detect_host() == "codex"
 
 
-# ══════════════════════════════════════════════════════════════
-# Claude Code detection (env-var based, takes priority)
-# ══════════════════════════════════════════════════════════════
-
-
-def test_detect_claude_code_vscode():
-    """CLAUDECODE=1 + claude-vscode entrypoint → claude_code_vscode."""
-    env = {
-        "CLAUDECODE": "1",
-        "CLAUDE_CODE_ENTRYPOINT": "claude-vscode",
-        "VSCODE_PID": "12345",
-    }
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}, "claude_code_vscode"),
+        ({"CLAUDECODE": "1", "TERM": "xterm"}, "claude_code_cli"),
+        ({"CLAUDECODE": "1", "CLAUDE_CODE_DESKTOP": "1"}, "claude_code_desktop"),
+        ({"CLAUDE_DESKTOP": "1"}, "claude_desktop"),
+        ({"PAPER_SEARCH_MCP_CLIENT_HOST": "deepseek_harness"}, "dsh"),
+        ({"PAPER_SEARCH_MCP_CLIENT_HOST": "zcode"}, "zcode"),
+    ],
+)
+def test_detect_explicit_hosts(env, expected):
     with mock.patch.dict(os.environ, env, clear=True):
-        assert detect_host() == "claude_code_vscode"
-        assert host_is_codex() is False
-        # claude_code_vscode is a tentative MCP Apps host: _meta is sent,
-        # local_browser fallback is also opened, default surface is local_browser.
-        assert host_supports_mcp_apps_widget() is True
-        assert host_is_vscode() is True
-        assert host_is_claude_code() is True
+        assert detect_host() == expected
 
 
-def test_detect_claude_code_cli():
-    """CLAUDECODE=1 alone → claude_code_cli."""
-    env = {"CLAUDECODE": "1"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        assert detect_host() == "claude_code_cli"
-        assert host_is_codex() is False
-        assert host_supports_mcp_apps_widget() is False
-        assert host_is_vscode() is False
-        assert host_is_claude_code() is True
+def test_dsh_and_zcode_markers_are_diagnostic_only():
+    for env, expected in [({"DSH_VERSION": "1"}, "dsh"), ({"INTEGRATION_IDE": "ZCode"}, "zcode")]:
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            Path, "home", side_effect=RuntimeError("no home")
+        ):
+            detect_host.cache_clear()
+            assert detect_host() == expected
+            assert _selection_surface_policy(force_open=True)["surface"] == "browser"
 
 
-def test_detect_claude_code_desktop_is_confirmed_apps_host():
-    """Claude Code Desktop gets Apps metadata without localhost auto-open."""
-    env = {"CLAUDECODE": "1", "CLAUDE_CODE_DESKTOP": "1"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        detect_host.cache_clear()
-        assert detect_host() == "claude_code_desktop"
-        assert host_supports_mcp_apps_widget() is True
-        assert host_mcp_apps_confirmed() is True
-        assert host_is_claude_code() is True
-        detect_host.cache_clear()
+def test_legacy_host_capability_helpers_fail_closed_without_context():
+    from paper_search_mcp.utils import host_mcp_apps_confirmed, host_supports_mcp_apps_widget
 
-
-def test_claude_code_takes_priority_over_codex_config():
-    """CLAUDECODE=1 should win even if ~/.codex/config.toml exists."""
-    with tempfile.TemporaryDirectory() as tmp:
-        codex_dir = Path(tmp) / ".codex"
-        codex_dir.mkdir()
-        (codex_dir / "config.toml").write_text("[model]\n")
-
-        env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-vscode"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(Path, "home", return_value=Path(tmp)):
-                # Runtime env var takes priority over disk check
-                assert detect_host() == "claude_code_vscode"
-                assert host_is_codex() is False
-
-
-# ══════════════════════════════════════════════════════════════
-# Claude Desktop detection
-# ══════════════════════════════════════════════════════════════
-
-
-def test_detect_claude_desktop():
-    """CLAUDE_DESKTOP env var → claude_desktop."""
-    env = {"CLAUDE_DESKTOP": "1"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        assert detect_host() == "claude_desktop"
-        assert host_supports_mcp_apps_widget() is True
-
-
-# ══════════════════════════════════════════════════════════════
-# Generic VS Code detection
-# ══════════════════════════════════════════════════════════════
-
-
-def test_detect_vscode_generic():
-    """VSCODE_PID alone without known AI agent markers."""
-    env = {"VSCODE_PID": "99999"}
-    _keep_home(env)
-    with tempfile.TemporaryDirectory() as tmp:
-        with mock.patch.object(Path, "home", return_value=Path(tmp)):
-            with mock.patch.dict(os.environ, env, clear=True):
-                assert detect_host() == "vscode_generic"
-                assert host_supports_mcp_apps_widget() is False
-                assert host_is_vscode() is True
-                assert host_is_claude_code() is False
-
-
-def test_detect_codex_vscode_takes_priority_over_codex_config():
-    """Codex IDE extension in VS Code should keep localhost fallback behavior."""
-    with tempfile.TemporaryDirectory() as tmp:
-        codex_dir = Path(tmp) / ".codex"
-        codex_dir.mkdir()
-        (codex_dir / "config.toml").write_text("[model]\n")
-
-        env = {
-            "VSCODE_PID": "24680",
-            "PATH": rf"{tmp}\.vscode\extensions\openai.chatgpt-1.0.0\bin",
-        }
-        _keep_home(env)
-        with mock.patch.object(Path, "home", return_value=Path(tmp)):
-            with mock.patch.dict(os.environ, env, clear=True):
-                assert detect_host() == "codex_vscode"
-                assert host_is_codex() is False
-                assert host_supports_mcp_apps_widget() is False
-                assert host_is_vscode() is True
-
-
-def test_explicit_client_host_can_force_codex_desktop():
-    """Desktop users can explicitly force MCP Apps support if auto-detect is thin."""
-    env = {
-        "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
-        "VSCODE_PID": "24680",
-    }
-    with mock.patch.dict(os.environ, env, clear=True):
-        assert detect_host() == "codex"
-        assert host_is_codex() is True
-        assert host_supports_mcp_apps_widget() is True
-
-
-def _keep_home(env: dict) -> None:
-    """Preserve the home-directory env var so Path.home() works."""
-    for key in ("HOME", "USERPROFILE", "HOMEPATH", "HOMEDRIVE"):
-        val = os.environ.get(key)
-        if val:
-            env.setdefault(key, val)
-
-
-# ══════════════════════════════════════════════════════════════
-# Unknown / fallback
-# ══════════════════════════════════════════════════════════════
-
-
-def test_detect_unknown():
-    """No markers at all → unknown."""
-    with mock.patch.dict(os.environ, {}, clear=True):
-        # Ensure no .codex dir exists at the fake home
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(Path, "home", return_value=Path(tmp)):
-                assert detect_host() == "unknown"
-                assert host_supports_mcp_apps_widget() is False
-                assert host_is_vscode() is False
-                assert host_is_claude_code() is False
-
-
-# ══════════════════════════════════════════════════════════════
-# vscode_binary detection
-# ══════════════════════════════════════════════════════════════
-
-
-def test_vscode_binary_returns_string():
-    """vscode_binary() always returns a string (empty if not found)."""
-    result = vscode_binary()
-    assert isinstance(result, str)
+    assert host_supports_mcp_apps_widget() is False
+    assert host_mcp_apps_confirmed() is False
 
 
 def test_vscode_binary_from_env_cwd():
-    """When VSCODE_CWD is set, prefer binary from that directory."""
     with tempfile.TemporaryDirectory() as tmp:
         bin_dir = Path(tmp) / "bin"
         bin_dir.mkdir(parents=True)
-        (bin_dir / "code").write_text("")
-
-        env = {"VSCODE_CWD": tmp}
-        with mock.patch.dict(os.environ, env, clear=True):
-            result = vscode_binary()
-            assert result == str(bin_dir / "code")
+        (bin_dir / "code").write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"VSCODE_CWD": tmp}, clear=True):
+            assert vscode_binary() == str(bin_dir / "code")
 
 
-def test_codex_vscode_opens_http_url_with_companion_ipc_without_cli_command():
-    env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_vscode"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        detect_host.cache_clear()
-        with mock.patch(
-            "paper_search_mcp.utils._notify_vscode_companion",
-            return_value=True,
-        ) as notify_mock, mock.patch(
-            "paper_search_mcp.utils._open_url_with_system_browser",
-            return_value=True,
-        ) as browser_mock, mock.patch("subprocess.run") as run_mock:
-            result = open_url_in_host_result(
-                "http://127.0.0.1:64901/paper-selection/test"
-            )
-
-    assert result["opened"] is True
-    assert result["method"] == "vscode_companion_ipc"
-    notify_mock.assert_called_once()
-    browser_mock.assert_not_called()
-    run_mock.assert_not_called()
+@pytest.mark.parametrize("location", ["extensions", "experimental"])
+def test_mcp_apps_requires_explicit_mime_capability(location):
+    assert client_supports_mcp_apps(_apps_capabilities(location)) is True
+    assert client_supports_mcp_apps(
+        {location: {MCP_APPS_EXTENSION_ID: {"mimeTypes": ["text/html"]}}}
+    ) is False
+    assert client_supports_mcp_apps({}) is False
 
 
-def test_vscode_companion_notification_uses_explicit_ipc_payload():
-    with mock.patch(
-        "paper_search_mcp.ui.vscode_bridge._write_named_pipe",
-        return_value=True,
-    ) as pipe_mock, mock.patch(
-        "paper_search_mcp.ui.vscode_bridge.notify_companion_extension",
-        return_value=True,
-    ) as pending_file_mock:
-        opened = _notify_vscode_companion(
-            "http://127.0.0.1:64901/paper-selection/test"
-        )
-
-    assert opened is True
-    pipe_mock.assert_called_once_with(
-        {
-            "action": "open_selection_page",
-            "params": {"url": "http://127.0.0.1:64901/paper-selection/test"},
-        }
-    )
-    pending_file_mock.assert_not_called()
+def test_elicitation_url_empty_mapping_is_a_capability():
+    assert client_supports_elicitation_url({"elicitation": {"url": {}}}) is True
+    assert client_supports_elicitation_url({"elicitation": {"form": {}}}) is False
 
 
-def test_codex_vscode_http_url_falls_back_to_system_browser_not_command_arg():
-    env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_vscode"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        detect_host.cache_clear()
-        with mock.patch(
-            "paper_search_mcp.utils._notify_vscode_companion",
-            return_value=False,
-        ) as notify_mock, mock.patch(
-            "paper_search_mcp.utils._open_url_with_system_browser",
-            return_value=True,
-        ) as browser_mock, mock.patch("subprocess.run") as run_mock:
-            result = open_url_in_host_result(
-                "http://127.0.0.1:64901/paper-selection/test"
-            )
-
-    assert result["opened"] is True
-    assert result["method"] == "system_browser"
-    notify_mock.assert_called_once()
-    browser_mock.assert_called_once()
-    run_mock.assert_not_called()
+def test_inspect_mcp_client_reads_initialize_capabilities():
+    inspected = inspect_mcp_client(_ctx(_apps_capabilities(), name="zcode"))
+    assert inspected["source"] == "initialize"
+    assert inspected["client_info"]["name"] == "zcode"
+    assert client_supports_mcp_apps(inspected["capabilities"]) is True
 
 
-def test_codex_vscode_last_resort_uses_nonblocking_open_url():
-    env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_vscode"}
-    with mock.patch.dict(os.environ, env, clear=True):
-        detect_host.cache_clear()
-        with mock.patch(
-            "paper_search_mcp.utils._notify_vscode_companion",
-            return_value=False,
-        ), mock.patch(
-            "paper_search_mcp.utils._open_url_with_system_browser",
-            return_value=False,
-        ) as browser_mock, mock.patch(
-            "paper_search_mcp.utils.vscode_binary",
-            return_value="code.cmd",
-        ), mock.patch("subprocess.Popen") as popen_mock, mock.patch(
-            "subprocess.run"
-        ) as run_mock:
-            result = open_url_in_host_result(
-                "http://127.0.0.1:64901/paper-selection/test"
-            )
-
-    assert result["opened"] is True
-    assert result["method"] == "vscode_open_url"
-    browser_mock.assert_called_once()
-    popen_mock.assert_called_once()
-    args = popen_mock.call_args.args[0]
-    assert args == [
-        "code.cmd",
-        "--open-url",
-        "http://127.0.0.1:64901/paper-selection/test",
-    ]
-    assert "paper-search-companion.openSelector" not in args
-    run_mock.assert_not_called()
+def test_request_meta_capabilities_override_initialize_values():
+    meta = {
+        "io.modelcontextprotocol/clientCapabilities": _apps_capabilities()
+    }
+    inspected = inspect_mcp_client(_ctx({}, request_meta=meta))
+    assert inspected["source"] == "request_meta"
+    assert client_supports_mcp_apps(inspected["capabilities"]) is True
 
 
-# ══════════════════════════════════════════════════════════════
-# UI mode selection integration tests
-# ══════════════════════════════════════════════════════════════
+def test_explicit_apps_capability_selects_t1_regardless_of_client_name():
+    for name in ("dsh", "zcode", "unknown-client"):
+        policy = _selection_surface_policy(ctx=_ctx(_apps_capabilities(), name=name))
+        assert policy["surface"] == "mcp_app"
+        assert policy["app_widget_supported"] is True
+        assert policy["detected_host"] == name
 
-class TestSelectionUiMode:
-    """Test that _selection_ui_mode respects host detection."""
 
-    def test_app_only_for_codex(self):
-        """When host is codex, auto-detect switches to app_only."""
-        env = {}
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(os.environ, env, clear=True),
-        ):
-            codex_dir = Path(tmp) / ".codex"
-            codex_dir.mkdir()
-            (codex_dir / "config.toml").write_text("")
+def test_client_name_without_capability_selects_browser_t2():
+    for name in ("codex", "claude_desktop", "dsh", "zcode"):
+        policy = _selection_surface_policy(ctx=_ctx({}, name=name), force_open=True)
+        assert policy["surface"] == "browser"
+        assert policy["app_widget_supported"] is False
+        assert policy["fallback_tool"] == "open_paper_selection_page"
+        assert policy["local_browser_should_open"] is False
 
-            with mock.patch.object(Path, "home", return_value=Path(tmp)):
-                detect_host.cache_clear()
-                from paper_search_mcp.engine.parse import (
-                    _selection_ui_mode,
-                    _selection_ui_should_open,
-                )
 
-                mode = _selection_ui_mode()
-                assert mode == "app_only", f"Expected app_only, got {mode}"
-                # Browser should NOT open, even when force_open=True
-                assert _selection_ui_should_open(force_open=True) is False
-                assert _selection_ui_should_open(force_open=False) is False
+def test_ui_mode_overrides_do_not_grant_apps_or_open_gui():
+    with mock.patch.dict(
+        os.environ, {"PAPER_SEARCH_MCP_SELECTION_UI_MODE": "app_only"}, clear=True
+    ):
+        assert _selection_ui_mode() == "app_only"
+        assert _selection_surface_policy(ctx=_ctx({}))["surface"] == "browser"
+        assert _selection_ui_should_open(force_open=True) is False
 
-    def test_auto_for_claude_code(self):
-        """When host is claude_code, auto mode allows browser fallback."""
-        env = {"CLAUDECODE": "1"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import (
-                _selection_ui_mode,
-                _selection_ui_should_open,
-            )
+    with mock.patch.dict(
+        os.environ, {"PAPER_SEARCH_MCP_SELECTION_UI_MODE": "local_browser"}, clear=True
+    ):
+        assert _selection_surface_policy(ctx=_ctx({}))["surface"] == "browser"
+        assert _selection_ui_should_open(force_open=True) is True
 
-            mode = _selection_ui_mode()
-            assert mode == "auto", f"Expected auto, got {mode}"
-            # Browser SHOULD open when force_open=True
-            assert _selection_ui_should_open(force_open=True) is True
-            # But not by default
-            assert _selection_ui_should_open(force_open=False) is False
+    with mock.patch.dict(
+        os.environ, {"PAPER_SEARCH_MCP_SELECTION_UI_MODE": "off"}, clear=True
+    ):
+        assert _selection_surface_policy(ctx=_ctx({}))["surface"] == "ui_disabled"
 
-    def test_explicit_env_overrides_host(self):
-        """User-set PAPER_SEARCH_MCP_SELECTION_UI_MODE always wins."""
-        env = {"PAPER_SEARCH_MCP_SELECTION_UI_MODE": "local_browser"}
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(os.environ, env, clear=True),
-        ):
-            codex_dir = Path(tmp) / ".codex"
-            codex_dir.mkdir()
-            (codex_dir / "config.toml").write_text("")
 
-            with mock.patch.object(Path, "home", return_value=Path(tmp)):
-                detect_host.cache_clear()
-                from paper_search_mcp.engine.parse import _selection_ui_mode
+def test_server_side_url_opening_is_disabled():
+    url = "http://127.0.0.1:64901/paper-selection/test"
+    with mock.patch("paper_search_mcp.utils._notify_vscode_companion") as notify, mock.patch(
+        "paper_search_mcp.utils._open_url_with_system_browser"
+    ) as browser, mock.patch("paper_search_mcp.utils._open_url_with_vscode_open_url") as vscode_open:
+        result = open_url_in_host_result(url)
+    assert result["opened"] is False
+    assert result["method"] == "client_open_link"
+    assert result["error"] == "server_side_open_disabled"
+    notify.assert_not_called()
+    browser.assert_not_called()
+    vscode_open.assert_not_called()
 
-                # Explicit env setting beats auto-detection
-                mode = _selection_ui_mode()
-                assert mode == "local_browser"
 
-    def test_selection_surface_policy_for_codex_desktop(self):
-        env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import _selection_surface_policy
+def test_legacy_companion_ipc_hook_fails_closed():
+    assert _notify_vscode_companion("http://127.0.0.1/test") is False
 
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "mcp_app"
-            assert policy["detected_host"] == "codex"
-            assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is True
-            assert policy["local_browser_should_open"] is False
-            detect_host.cache_clear()
 
-    def test_selection_surface_policy_desktop_respects_local_browser_override(self):
-        env = {
-            "PAPER_SEARCH_MCP_CLIENT_HOST": "codex_desktop",
-            "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "local_browser",
-        }
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import _selection_surface_policy
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "local_browser"
-            assert policy["reason"] == "local_browser_configured"
-            assert policy["local_browser_should_open"] is True
-            detect_host.cache_clear()
-
-    def test_selection_surface_policy_for_codex_vscode_force_open(self):
-        env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_vscode"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import _selection_surface_policy
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "local_browser"
-            assert policy["detected_host"] == "codex_vscode"
-            assert policy["app_widget_supported"] is False
-            assert policy["app_widget_confirmed"] is False
-            assert policy["ui_mode"] == "auto"
-            assert policy["local_browser_should_open"] is True
-            detect_host.cache_clear()
-
-    def test_codex_vscode_auto_mode_uses_local_browser_not_app_only(self):
-        env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "codex_vscode"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import (
-                _selection_surface_policy,
-                _selection_ui_mode,
-                _selection_ui_should_open,
-            )
-
-            assert host_supports_mcp_apps_widget() is False
-            assert _selection_ui_mode() == "auto"
-            assert _selection_ui_should_open(force_open=True) is True
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "local_browser"
-            assert policy["reason"] == "host_codex_vscode_without_mcp_app_sandbox"
-            assert policy["detected_host"] == "codex_vscode"
-            assert policy["ui_mode"] == "auto"
-            assert policy["app_widget_supported"] is False
-            assert policy["app_widget_confirmed"] is False
-            assert policy["local_browser_should_open"] is True
-            detect_host.cache_clear()
-
-    def test_claude_code_desktop_auto_uses_app_first_surface(self):
-        env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import (
-                _selection_surface_policy,
-                _selection_ui_mode,
-                _selection_ui_should_open,
-            )
-
-            assert _selection_ui_mode() == "auto"
-            assert _selection_ui_should_open(force_open=True) is False
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "mcp_app_then_local"
-            assert policy["reason"] == "host_claude_code_desktop_try_mcp_app_then_local_fallback"
-            assert policy["detected_host"] == "claude_code_desktop"
-            assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is True
-            assert policy["local_browser_should_open"] is False
-            assert policy["fallback_tool"] == "open_paper_selection_page"
-            assert policy["status_tool"] == "get_paper_selection_surface_status"
-            assert policy["fallback_after_seconds"] >= 1
-            detect_host.cache_clear()
-
-    def test_claude_code_desktop_app_only_mode_keeps_mcp_app(self):
-        env = {
-            "PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_desktop",
-            "PAPER_SEARCH_MCP_SELECTION_UI_MODE": "app_only",
-        }
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import (
-                _selection_surface_policy,
-                _selection_ui_mode,
-                _selection_ui_should_open,
-            )
-
-            assert _selection_ui_mode() == "app_only"
-            assert _selection_ui_should_open(force_open=True) is False
-            assert _selection_ui_should_open(force_open=False) is False
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "mcp_app"
-            assert policy["reason"] == "app_only_configured"
-            assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is True
-            assert policy["local_browser_should_open"] is False
-            detect_host.cache_clear()
-
-    def test_claude_code_vscode_auto_uses_hybrid_surface(self):
-        env = {"PAPER_SEARCH_MCP_CLIENT_HOST": "claude_code_vscode"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            detect_host.cache_clear()
-            from paper_search_mcp.engine.parse import _selection_surface_policy
-
-            policy = _selection_surface_policy(force_open=True)
-            assert policy["surface"] == "hybrid"
-            assert policy["detected_host"] == "claude_code_vscode"
-            assert policy["app_widget_supported"] is True
-            assert policy["app_widget_confirmed"] is False
-            assert policy["local_browser_should_open"] is True
-            detect_host.cache_clear()
+def test_ui_disabled_is_an_explicit_surface_state():
+    with mock.patch.dict(
+        os.environ, {"PAPER_SEARCH_MCP_SELECTION_UI_MODE": "off"}, clear=True
+    ):
+        policy = _selection_surface_policy(ctx=_ctx({}))
+        assert policy["surface"] == "ui_disabled"
+        assert policy["fallback_tool"] == ""

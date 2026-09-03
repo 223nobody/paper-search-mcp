@@ -1,5 +1,13 @@
 <h1 align="center"> Paper Search MCP</h1>
 
+> **Current UI routing (2026-09)**: T1 MCP Apps rendering requires the wire
+> capability `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes`
+> to contain `text/html;profile=mcp-app`. dsh/ZCode names are diagnostic only;
+> clients without that capability receive the same checkbox page as a browser
+> URL. The MCP selection path does not open a GUI, use named-pipe IPC, or
+> return a numbered text fallback. `PAPER_SEARCH_MCP_SELECTION_UI_MODE=off`
+> returns `ui_disabled`.
+
 <p align="center">
   <b>🔬 A multi-source academic paper MCP server — search, download, and parse papers with AI agents</b>
 </p>
@@ -769,11 +777,16 @@ Downloads also keep lightweight method health stats in
 
 ### 🏢 Publisher-Version Tools (MCP Chaining)
 
-Three tools are available for downloading publisher final versions of cached arXiv papers via scansci-pdf MCP Chaining:
+Eight tools are available for downloading publisher final versions of cached arXiv papers via scansci-pdf MCP Chaining (requires scansci-pdf >= 1.14.0; older releases are rejected with an `upgrade_hint`):
 
-- `download_publisher_version` — download the publisher final version for a single cached arXiv paper.
+- `download_publisher_version` — download the publisher final version for a single cached arXiv paper (`bibtex` / `download_si` / `force` options).
 - `batch_download_publisher_versions` — batch download publisher versions for multiple papers (comma-separated or `"all"`).
-- `check_publisher_setup` — check scansci-pdf environment (installation, Tor, CloakBrowser, API Keys).
+- `check_publisher_setup` — check scansci-pdf environment (installation, version, Tor, CloakBrowser, API Keys).
+- `install_publisher_support` — async-install scansci-pdf >= 1.14.0 plus optional components.
+- `publisher_login` — institutional channel login (WebVPN / CARSI / EZProxy / publisher SSO); the login session is reused automatically.
+- `publisher_schools` — search / set the WebVPN university (100+ Chinese universities).
+- `publisher_channel_status` — check institutional channel session status.
+- `publisher_diagnostics` — upstream health / network / sources / setup diagnostics.
 
 For prompt examples, see [MCP 使用示例提示词.md](MCP使用示例提示词.md).
 
@@ -792,13 +805,15 @@ time, legacy file-search time, and the measured speedups as JSON.
 
 Upgrade cached arXiv papers to publisher final versions (Nature, Elsevier, Springer, etc.). Uses built-in scansci-pdf MCP Chaining with anti-detection browser (CloakBrowser), Tor proxy, and 13+ parallel download sources.
 
-**Auto-install on first use** — no manual setup. The tool automatically starts Tor, checks CloakBrowser availability, and probes reachable sources. For even better results, configure a free Elsevier API Key (1-2s direct ScienceDirect downloads).
+**Auto-install on first use** (pinned >= 1.14.0) — no manual setup. The tool automatically starts Tor, checks CloakBrowser availability, and probes reachable sources. For even better results, configure a free Elsevier API Key (1-2s direct ScienceDirect downloads).
 
-**Key tools**: `download_publisher_version` (single), `batch_download_publisher_versions` (batch), `check_publisher_setup` (diagnostics).
+**Paywalled papers via institutional channels**: `publisher_schools(action="search", query="university")` → `publisher_schools(action="set", school="...")` → `publisher_login(kind="webvpn")` (finish the login in the opened browser, then close it) → `publisher_channel_status` → retry the download.
+
+**Key tools**: `download_publisher_version` (single), `batch_download_publisher_versions` (batch), `check_publisher_setup` (diagnostics), `publisher_login` / `publisher_schools` / `publisher_channel_status` / `publisher_diagnostics` (institutional channels & diagnostics).
 
 > 📖 For detailed usage prompts, see [MCP 使用示例提示词.md](MCP使用示例提示词.md).
 
-> 💡 **How it works**: paper-search-mcp launches scansci-pdf as a subprocess via MCP Chaining (FastMCP Client + StdioTransport). It extracts the paper's DOI or arXiv ID from the cache and calls `scansci_pdf_smart_download`, which races 13+ sources in parallel. scansci-pdf is auto-installed via pip on first use; Tor is auto-downloaded and configured. Completely transparent to the user.
+> 💡 **How it works**: paper-search-mcp launches scansci-pdf as a subprocess via MCP Chaining (FastMCP Client + StdioTransport). It extracts the paper's DOI or arXiv ID from the cache and calls `scansci_pdf_download`, which races 13+ sources in parallel. Failures pass through the upstream `agent_hint` (e.g. suggesting `publisher_login` for paywalled papers). scansci-pdf is auto-installed via pip on first use (requires >= 1.14.0); Tor is auto-downloaded and configured. Completely transparent to the user.
 
 ## 🤝 Contributing
 

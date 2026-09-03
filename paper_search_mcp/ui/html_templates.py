@@ -1163,7 +1163,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
     function renderUrlField(paper) {
       const url = originalUrl(paper);
       const body = url
-        ? `<button class="paper-link open-paper-link" type="button" data-paper-index="${escapeHtml(paper.index)}" data-url-kind="paper">${escapeHtml(url)}</button>`
+        ? `<button class="paper-link open-paper-link" type="button" data-paper-index="${escapeHtml(paper.index)}" data-url-kind="paper" data-url="${escapeHtml(url)}">${escapeHtml(url)}</button>`
         : '<span class="muted-value">Not available</span>';
       return `<span class="url-field"><b>Original URL</b><em>${body}</em></span>`;
     }
@@ -1794,7 +1794,17 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
       event.stopPropagation();
       const paperIndex = Number(trigger.getAttribute("data-paper-index") || 0);
       const urlKind = trigger.getAttribute("data-url-kind") || "paper";
+      const paperUrl = String(trigger.getAttribute("data-url") || "").trim();
       try {
+        if (paperUrl && appOpenLinksSupported && app?.openLink) {
+          try {
+            await app.openLink({ url: paperUrl });
+            setStatus("Opened link.", "success");
+            return;
+          } catch (_) {
+            /* A stale capability must still fall back to URL resolution. */
+          }
+        }
         const result = await callTool("open_paper_url_in_browser", {
           selection_token: data.selection_token || "",
           paper_index: paperIndex,
@@ -1843,6 +1853,7 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
     const HAS_EXT_APPS = typeof globalThis.ExtApps !== 'undefined';
     const HAS_OPENAI  = typeof window.openai !== 'undefined' && window.openai.toolOutput;
     let app = null;  // MCP Apps App instance (Claude Desktop / standard MCP Apps)
+    let appOpenLinksSupported = false;
 
     async function initApp() {
       if (HAS_EXT_APPS) {
@@ -1867,10 +1878,20 @@ PAPER_SELECTION_WIDGET_HTML = r"""<!doctype html>
 
         await app.connect();
 
+        let hostContext = null;
+        try {
+          hostContext = await app.getHostContext?.();
+          const caps = hostContext?.capabilities || hostContext?.capability || {};
+          appOpenLinksSupported = Boolean(
+            caps.openLinks || caps.open_links || hostContext?.openLinks
+          );
+        } catch (_) {
+          appOpenLinksSupported = false;
+        }
+
         /* Some hosts provide initial data via host context */
-        const ctx = app.getHostContext();
-        if (ctx?.toolOutput) {
-          data = normalizeSelectionData(unwrapToolOutput(ctx.toolOutput));
+        if (hostContext?.toolOutput) {
+          data = normalizeSelectionData(unwrapToolOutput(hostContext.toolOutput));
         }
         render();
         await reportAppReady();
@@ -2377,36 +2398,6 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
       }, 1200);
     }
 
-    function startDownloadProgress(total) {
-      if (downloadTimer) window.clearInterval(downloadTimer);
-      let pct = 0;
-      const stages = [
-        [8, "Preparing selected papers"],
-        [24, "Resolving PDF routes"],
-        [48, "Downloading papers"],
-        [76, "Validating PDF files"],
-        [90, "Writing manifest"],
-      ];
-      progressPanel.hidden = false;
-      progressTitleText.textContent = "Downloading papers";
-      progressCurrent.textContent = "Preparing selected papers.";
-      progressMeta.textContent = total + " selected";
-      setSegments(0, 0);
-      progressList.innerHTML = `
-        <div class="download-skeleton" aria-live="polite">
-          <div class="download-step"><strong>Resolve</strong><span>Checking source and PDF routes.</span></div>
-          <div class="download-step"><strong>Acquire</strong><span>Saving selected PDFs.</span></div>
-          <div class="download-step"><strong>Verify</strong><span>Validating files and manifest.</span></div>
-        </div>`;
-      downloadTimer = window.setInterval(() => {
-        pct = Math.min(94, pct + Math.max(1, Math.round((96 - pct) * 0.08)));
-        const stage = stages.filter(([mark]) => pct >= mark).pop();
-        progressCurrent.textContent = (stage ? stage[1] : "Preparing selected papers") + ".";
-        progressMeta.textContent = total + " selected";
-        setSegments(pct, 0);
-      }, 420);
-    }
-
     function finishDownloadProgress(body) {
       if (downloadTimer) window.clearInterval(downloadTimer);
       downloadTimer = null;
@@ -2527,7 +2518,9 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
       lastParsePrompt = prompt || {};
       parseSelectionToken = String(lastParsePrompt.selection_token || "");
       parseSelectedIndices = String(lastParsePrompt.default_parse_selected_indices || lastParsePrompt.recommended_selected_indices || "all");
-      data.confirmation_token = String(responseBody?.confirmation_token || "");
+      if (responseBody?.confirmation_token) {
+        data.confirmation_token = String(responseBody.confirmation_token);
+      }
       lockedSelectedIndices = selected.slice();
       lockSelection();
       decisionPanel.hidden = false;
@@ -2656,6 +2649,103 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
       }
     }
 
+    function renderDownloadProgress(job) {
+      if (!job || typeof job !== "object") return;
+      const total = Number(job.total || 0);
+      const completed = Number(job.completed_items || 0);
+      const failed = Number(job.failed || 0);
+      const status = String(job.status || "running").toLowerCase();
+      const done = status === "completed";
+      const errored = status === "error" || status === "canceled";
+      const denominator = Math.max(1, total);
+      progressPanel.hidden = false;
+      progressTitleText.textContent = done ? "Download complete" : (errored ? "Download interrupted" : "Downloading papers");
+      progressCurrent.textContent = job.current || job.message || (job.job_id ? "Job " + job.job_id : "");
+      progressMeta.textContent = total ? completed + "/" + total + " done" : "";
+      setSegments(
+        Number(job.phase_downloading || job.downloading || 0) / denominator * 100,
+        0,
+        Number(job.phase_error || failed || 0) / denominator * 100,
+        Number(job.phase_completed || 0) / denominator * 100
+      );
+
+      const items = Array.isArray(job.items) ? job.items : [];
+      const stageOf = (item) => String(item.stage || item.status || "queued").toLowerCase();
+      const renderItem = (item) => {
+        const stage = stageOf(item);
+        const title = item.title || ("Paper " + (item.index || ""));
+        return '<div class="progress-item stage-' + escapeHtml(stage) + '">'
+          + '<strong>' + escapeHtml((item.index ? item.index + ". " : "") + title) + '</strong>'
+          + '<span>' + escapeHtml(stage + (item.message ? " - " + item.message : "")) + '</span>'
+          + '</div>';
+      };
+      const groups = [
+        ["Downloading", items.filter((item) => ["downloading"].includes(stageOf(item)))],
+        ["Queued", items.filter((item) => ["", "queued"].includes(stageOf(item)))],
+        ["Downloaded", items.filter((item) => ["completed"].includes(stageOf(item)))],
+        ["Attention", items.filter((item) => ["error", "failed", "skipped"].includes(stageOf(item)))],
+      ].filter(([, groupItems]) => groupItems.length);
+      progressList.innerHTML = groups.map(([groupName, groupItems]) =>
+        '<div class="progress-section-title">' + escapeHtml(groupName) + '</div>'
+        + groupItems.map(renderItem).join("")
+      ).join("");
+
+      if (terminalStatuses.has(status)) {
+        disconnectProgress();
+        if (done) {
+          const result = job.result || {};
+          finishDownloadProgress(result);
+          const prompt = result.parse_prompt && typeof result.parse_prompt === "object" ? result.parse_prompt : {};
+          const terminalStatus = String(prompt.status || result.status || "").toLowerCase();
+          if (["timed_out_no_parse", "completed_no_parse"].includes(terminalStatus)) {
+            renderTerminalNoParse(prompt.status ? prompt : result);
+          } else if (isParseReadyPrompt(prompt)) {
+            startParseDecision(prompt, lockedSelectedIndices, result);
+          } else {
+            parseButton.disabled = false;
+            setStatus(result.message || ("Downloaded " + (result.downloaded || 0) + " paper(s)."), result.status === "failed" ? "error" : "success");
+          }
+        } else {
+          parseButton.disabled = false;
+          setStatus(job.message || "Download interrupted.", "error");
+        }
+      }
+    }
+
+    function connectDownloadProgress(jobId) {
+      if (!jobId) return;
+      disconnectProgress();
+      if (typeof EventSource !== "undefined") {
+        eventSource = new EventSource("/api/progress-stream/" + encodeURIComponent(jobId));
+        eventSource.onmessage = (event) => {
+          try {
+            renderDownloadProgress(JSON.parse(event.data));
+          } catch (_) {}
+        };
+        eventSource.addEventListener("done", disconnectProgress);
+        eventSource.onerror = () => {
+          disconnectProgress();
+          pollDownloadProgress(jobId);
+        };
+      } else {
+        pollDownloadProgress(jobId);
+      }
+    }
+
+    async function pollDownloadProgress(jobId) {
+      try {
+        const response = await fetch("/api/parse-job/" + encodeURIComponent(jobId));
+        const body = await response.json();
+        renderDownloadProgress(body);
+        if (!terminalStatuses.has(String(body.status || "").toLowerCase())) {
+          pollTimer = window.setTimeout(() => pollDownloadProgress(jobId), 1000);
+        }
+      } catch (error) {
+        parseButton.disabled = false;
+        setStatus(error?.message || String(error), "error");
+      }
+    }
+
     document.getElementById("select-all").addEventListener("click", () => {
       document.querySelectorAll('input[name="paper"]:not(:disabled)').forEach((item) => {
         item.checked = true;
@@ -2684,7 +2774,6 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
         setStatus("Select at least one paper.", "error");
         return;
       }
-      const downloadThenParse = isDownloadThenParseFlow();
       const endpoint = workflowStage === "direct-parse"
         ? "/api/parse-selection/"
         : workflowStage === "download"
@@ -2698,8 +2787,7 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
       clearProgress();
       progressTitleText.textContent = workflowStage === "download" ? "Downloading papers" : "Starting MinerU parsing";
       progressCurrent.textContent = "Preparing selected papers.";
-      setStatus(workflowStage === "download" ? "Downloading..." : "Submitting MinerU parse job...");
-      if (workflowStage === "download") startDownloadProgress(selected.length);
+      setStatus(workflowStage === "download" ? "Starting download..." : "Submitting MinerU parse job...");
       try {
         const response = await fetch(endpoint + encodeURIComponent(data.page_id), {
           method: "POST",
@@ -2712,22 +2800,19 @@ def _render_local_selection_html(page_id: str, page: Dict[str, Any]) -> str:
         });
         const body = await response.json();
         if (!response.ok) throw new Error(body.message || "Selection request failed.");
-        if (workflowStage === "download" && downloadThenParse) {
-          finishDownloadProgress(body);
-          const prompt = body?.parse_prompt && typeof body.parse_prompt === "object" ? body.parse_prompt : {};
-          if (["timed_out_no_parse", "completed_no_parse"].includes(String(prompt.status || body.status || ""))) {
-            renderTerminalNoParse(prompt.status ? prompt : body);
-            return;
+        if (workflowStage === "download") {
+          // Download now runs as a background job; stream real per-paper progress.
+          if (body.confirmation_token) {
+            data.confirmation_token = String(body.confirmation_token);
           }
-          if (!isParseReadyPrompt(prompt)) {
+          lockedSelectedIndices = selected.slice();
+          if (body.job_id) {
+            setStatus("Downloading: " + body.job_id);
+            connectDownloadProgress(body.job_id);
+          } else {
             parseButton.disabled = false;
-            setStatus(
-              body.message || ("Downloaded " + (body.downloaded || 0) + " paper(s)."),
-              body.status === "failed" ? "error" : "success"
-            );
-            return;
+            setStatus(body.message || body.status || "Unable to start download.", "error");
           }
-          startParseDecision(prompt, selected, body);
           return;
         }
         renderProgress(body);

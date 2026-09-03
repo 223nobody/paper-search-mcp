@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from ..cache import get_search_session as cache_get_search_session
 from ..config import get_env
@@ -27,7 +28,7 @@ from ..engine.parse import (
     dismiss_parse_prompt_state,
     _codex_app_display_candidates,
     _reindexed_display_candidates,
-    _selection_semantics_name, _selection_ui_should_open,
+    _selection_semantics_name,
     _selection_surface_policy,
     _workflow_parse_execution_name,
 )
@@ -40,6 +41,7 @@ LOCAL_PAPER_SELECTION_TOOL = "open_paper_selection_page"
 DOWNLOAD_SELECTION_TIMEOUT_SECONDS_ENV = "DOWNLOAD_SELECTION_TIMEOUT_SECONDS"
 PARSE_PROMPT_TIMEOUT_PER_PAPER_SECONDS_ENV = "PARSE_PROMPT_TIMEOUT_PER_PAPER_SECONDS"
 DEFAULT_DOWNLOAD_SELECTION_TIMEOUT_SECONDS = 180
+MAX_SELECTION_REQUEST_BYTES = 1024 * 1024
 
 _LOCAL_SELECTION_LOCK = threading.Lock()
 _LOCAL_SELECTION_SERVER: Optional[ThreadingHTTPServer] = None
@@ -172,7 +174,23 @@ def _ensure_local_selection_server() -> None:
         selected_host, selected_port = _LOCAL_SELECTION_SERVER.server_address[:2]
         if selected_host in {"0.0.0.0", ""}:
             selected_host = "127.0.0.1"
-        _LOCAL_SELECTION_BASE_URL = f"http://{selected_host}:{selected_port}"
+        configured_base = get_env("BROWSER_BASE_URL", "").strip().rstrip("/")
+        if configured_base:
+            parsed = urlparse(configured_base)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                logger.warning(
+                    "Invalid PAPER_SEARCH_MCP_BROWSER_BASE_URL=%r; using local URL",
+                    configured_base,
+                )
+                configured_base = ""
+        _LOCAL_SELECTION_BASE_URL = configured_base or f"http://{selected_host}:{selected_port}"
         _LOCAL_SELECTION_THREAD = threading.Thread(
             target=_LOCAL_SELECTION_SERVER.serve_forever,
             name="paper-search-local-selection-ui",
@@ -283,7 +301,7 @@ async def open_paper_selection_page(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     parse_execution: str = "background",
-    open_browser: bool = True,
+    open_browser: bool = False,
     requested_count: int = 0,
     full_total: int = 0,
     force_reopen: bool = False,
@@ -309,16 +327,10 @@ async def open_paper_selection_page(
         parse_execution=parse_execution,
         force_reopen=force_reopen,
     )
+    # The server only creates and returns the page.  Browser navigation is a
+    # host/user action; ignore the legacy ``open_browser`` flag to avoid GUI
+    # calls from an MCP process (especially in containers and remote sessions).
     opened = False
-    if open_browser and not bool(page.get("already_opened")):
-        from ..utils import open_url_in_host
-        opened = bool(await asyncio.to_thread(open_url_in_host, page["url"]))
-        if opened:
-            _LOCAL_SELECTION_PAGES.get(page["page_id"], {})["opened_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-    elif bool(page.get("already_opened")):
-        opened = True
     host, port = _LOCAL_SELECTION_SERVER.server_address[:2] if _LOCAL_SELECTION_SERVER else ("", 0)
     return {
         "status": "ok",
@@ -382,6 +394,12 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
         self._send_html(_render_local_selection_html(page_id, page))
 
     def do_POST(self) -> None:
+        if not self._origin_allowed():
+            self._send_json(
+                {"status": "forbidden_origin", "message": "Request origin is not allowed."},
+                status=403,
+            )
+            return
         is_download_selection = False
         page_id = self._page_id_from_path("/api/parse-selection")
         is_parse_downloaded_selection = False
@@ -465,7 +483,7 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
                         "message": result.get("message", "MinerU parsing started."),
                     }
             elif is_download_selection:
-                from ..tools.orchestration import _run_download_selected_papers
+                from ..tools.orchestration import _submit_download_job
 
                 selection_confirmation = create_selection_confirmation_token(
                     selection_token=page["selection_token"],
@@ -490,8 +508,14 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
                 if confirmed.get("status") != "confirmed":
                     self._send_json(confirmed, status=403)
                     return
+
+                # Rotate the one-time UI token now so the subsequent parse step
+                # can reuse it without waiting for the background download job
+                # to finish.  The download itself runs off the request path.
+                page["confirmation_token"] = secrets.token_urlsafe(24)
+
                 result = asyncio.run(
-                    _run_download_selected_papers(
+                    _submit_download_job(
                         selection_token=page["selection_token"],
                         selected_indices=backend_selected_indices,
                         save_path=page.get("save_path", DEFAULT_SAVE_PATH),
@@ -501,17 +525,10 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
                         backend=page.get("backend", ""),
                         force=bool(page.get("force")),
                         custom_save_path_confirmed=bool(page.get("custom_save_path_confirmed")),
-                        large_batch_selection="never",
-                        bypass_large_batch_selection=True,
-                        _caller="local_browser_ui",
                     )
                 )
-                page["confirmation_token"] = secrets.token_urlsafe(24)
                 if isinstance(result, dict):
                     result["confirmation_token"] = page["confirmation_token"]
-                    prompt = result.get("parse_prompt")
-                    if isinstance(prompt, dict):
-                        page["last_parse_prompt"] = prompt
             else:
                 from ..tools.core import _run_download_and_parse_selected_papers
 
@@ -528,6 +545,10 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
                     )
                 )
             self._send_json(result)
+        except ValueError as exc:
+            message = str(exc)
+            status = 413 if message == "request_body_too_large" else 400
+            self._send_json({"status": "invalid_request", "message": message}, status=status)
         except Exception as exc:
             logger.exception("Local paper selection request failed")
             self._send_json({"status": "error", "message": str(exc)}, status=500)
@@ -588,11 +609,47 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
         return path[len(expected) :]
 
     def _read_json(self) -> Dict[str, Any]:
-        length = int(self.headers.get("content-length") or "0")
+        raw_length = self.headers.get("content-length") or "0"
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_content_length") from exc
+        if length < 0:
+            raise ValueError("invalid_content_length")
+        if length > MAX_SELECTION_REQUEST_BYTES:
+            raise ValueError("request_body_too_large")
         if length <= 0:
             return {}
+        content_type = str(self.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if content_type not in {"application/json", "application/*+json"} and not content_type.endswith("+json"):
+            raise ValueError("content_type_must_be_json")
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def _origin_allowed(self) -> bool:
+        """Allow same-origin browser posts while permitting clients without Origin."""
+        origin = str(self.headers.get("Origin") or "").strip()
+        referer = str(self.headers.get("Referer") or "").strip()
+        if not origin and referer:
+            origin = referer
+        if not origin or origin.lower() == "null":
+            return True
+        try:
+            # VS Code loads the same selection HTML into a synthetic Webview
+            # origin while its <base> points at the MCP HTTP server.
+            origin_scheme = urlparse(origin).scheme.lower()
+            if origin_scheme in {"vscode-webview", "vscode-webview-resource", "vscode-resource"}:
+                return True
+            expected = urlparse(_LOCAL_SELECTION_BASE_URL)
+            observed = urlparse(origin)
+            return bool(
+                expected.scheme
+                and expected.netloc
+                and observed.scheme == expected.scheme
+                and observed.netloc == expected.netloc
+            )
+        except Exception:
+            return False
 
     def _send_html(self, html: str, status: int = 200) -> None:
         body = html.encode("utf-8")
@@ -634,6 +691,22 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
             progress_unsubscribe(job_id, q)
             return
 
+        # If the job is already terminal when this subscriber connects (e.g. a
+        # very fast download finished before the EventSource opened), send the
+        # terminal snapshot and close immediately instead of idling on heartbeats.
+        try:
+            initial_status = str(snapshot.get("status") or "").lower()
+        except Exception:
+            initial_status = ""
+        if initial_status in {"completed", "error", "canceled", "not_found"}:
+            try:
+                self.wfile.write("event: done\ndata: {}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                self.close_connection = True
+            finally:
+                progress_unsubscribe(job_id, q)
+            return
+
         try:
             while True:
                 try:
@@ -663,6 +736,7 @@ class _LocalSelectionHandler(BaseHTTPRequestHandler):
                             "event: done\ndata: {}\n\n".encode("utf-8")
                         )
                         self.wfile.flush()
+                        self.close_connection = True
                         break
                 except Exception:
                     pass
@@ -684,10 +758,17 @@ async def _attach_local_selection_ui(
     force_open: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     parse_execution: str = "background",
+    ctx: Any = None,
 ) -> Dict[str, Any]:
-    surface = _selection_surface_policy(force_open=force_open)
+    surface = _selection_surface_policy(force_open=force_open, ctx=ctx)
     prompt["selection_surface"] = surface
-    if surface.get("surface") != "local_browser":
+    if surface.get("surface") not in {"browser", "local_browser"}:
+        if surface.get("surface") == "ui_disabled":
+            prompt["status"] = "ui_disabled"
+            prompt["error"] = "selection_ui_disabled"
+            prompt["message"] = (
+                "Paper selection UI is disabled by PAPER_SEARCH_MCP_SELECTION_UI_MODE."
+            )
         return prompt
 
     try:
@@ -702,7 +783,7 @@ async def _attach_local_selection_ui(
             custom_save_path_confirmed=custom_save_path_confirmed,
             selection_semantics=selection_semantics,
             parse_execution=parse_execution,
-            open_browser=True,
+            open_browser=False,
             requested_count=int(prompt.get("requested_count") or 0),
             full_total=int(prompt.get("full_total") or prompt.get("total") or len(papers)),
         )

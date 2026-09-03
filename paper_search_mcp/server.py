@@ -11,7 +11,6 @@ import re
 import secrets
 import threading
 import time
-import webbrowser
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,8 +46,6 @@ from .utils import (
     DEFAULT_SAVE_PATH,
     detect_host,
     extract_doi,
-    host_supports_mcp_apps_widget,
-    open_url_in_host,
     resolve_save_path,
 )
 from .selection_confirmation import (
@@ -162,10 +159,10 @@ from .engine.parse import (
     _prompt_parse_saved_pdfs as _engine_prompt_parse_saved_pdfs,
     _parse_prompt_for_download_results as _engine_parse_prompt_for_download_results,
     _pre_download_selection_prompt as _engine_pre_download_selection_prompt,
-    _numbered_paper_fallback,
     _paper_selection_app_meta, _paper_selection_tool_meta,
     _paper_selection_app_payload, _paper_selection_app_prompt,
     _codex_app_display_candidates, _codex_recommended_selected_indices,
+    _numbered_paper_fallback,
     _promote_paper_selection_app, _should_promote_paper_selection_app,
     _strip_widget_meta,
     _mineru_api_key_configured, _mineru_batch_parse_enabled,
@@ -2423,6 +2420,7 @@ MINERU_KEY_WIDGET_HTML = r"""<!doctype html>
         const needsSelection = !!prompt.parse_decision_required
           || prompt.recommended_tool === "render_paper_selection_app"
           || prompt.interaction === "backend_session_numbered_selection"
+          || prompt.interaction === "browser_url_selection"
           || prompt.interaction === "mcp_app";
         return {
           ...root,
@@ -3313,6 +3311,7 @@ async def render_paper_selection_app(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = "",
     parse_execution: str = "",
+    ctx: Optional[Context] = None,
 ) -> Any:
     """Render a checkbox paper selector for MCP Apps-capable hosts."""
     from .tools.widgets import _handle_render_paper_selection_app
@@ -3323,6 +3322,7 @@ async def render_paper_selection_app(
         custom_save_path_confirmed=custom_save_path_confirmed,
         selection_semantics=selection_semantics,
         parse_execution=parse_execution,
+        ctx=ctx,
     )
 
 
@@ -3331,7 +3331,7 @@ async def report_paper_selection_app_ready(
     client_instance_id: str = "",
     app_attempt_id: str = "",
 ) -> Dict[str, Any]:
-    """Record that the MCP App iframe rendered and can call server tools."""
+    """Record that the MCP App rendered and can call server tools."""
     from .tools.widgets import _handle_report_paper_selection_app_ready
 
     return await _handle_report_paper_selection_app_ready(
@@ -3343,12 +3343,14 @@ async def report_paper_selection_app_ready(
 
 async def get_paper_selection_surface_status(
     selection_token: str,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Return MCP App readiness and whether local fallback is recommended."""
+    """Return MCP App readiness diagnostics for capability-routed clients."""
     from .tools.widgets import _handle_get_paper_selection_surface_status
 
     return await _handle_get_paper_selection_surface_status(
         selection_token=selection_token,
+        ctx=ctx,
     )
 
 
@@ -3363,7 +3365,7 @@ async def open_paper_selection_page(
     custom_save_path_confirmed: bool = False,
     selection_semantics: str = "",
     parse_execution: str = "",
-    open_browser: bool = True,
+    open_browser: bool = False,
     force_reopen: bool = False,
 ) -> Dict[str, Any]:
     """Open a local browser checkbox selector for clients without MCP Apps UI."""
@@ -3497,11 +3499,12 @@ async def search_papers_for_parsing(
     max_results_per_source: int = 5,
     sources: str = "",
     year: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Search papers, persist a numbered selection session, and return parse candidates."""
+    """Search papers and return an MCP App or browser selection session."""
     return await _get_orch_fn("search_papers_for_parsing")(
         query=query, max_results_per_source=max_results_per_source,
-        sources=sources, year=year,
+        sources=sources, year=year, ctx=ctx,
     )
 
 
@@ -3512,12 +3515,13 @@ async def crawl_papers_for_selection(
     year: Optional[str] = None,
     ranking_profile: str = "",
     requested_count: int = 0,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Search papers and persist a checkbox/numbered selection session."""
+    """Search papers and persist an MCP App or browser selection session."""
     return await _get_orch_fn("crawl_papers_for_selection")(
         query=query, max_results_per_source=max_results_per_source,
         sources=sources, year=year,
-        ranking_profile=ranking_profile, requested_count=requested_count,
+        ranking_profile=ranking_profile, requested_count=requested_count, ctx=ctx,
     )
 
 
@@ -3533,7 +3537,7 @@ async def search_papers_with_elicitation(
     force: bool = False,
     ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    """Search papers, ask the MCP client for a multi-select choice, then parse."""
+    """Deprecated alias for capability-routed paper selection."""
     return await _get_orch_fn("search_papers_with_elicitation")(
         query=query, max_results_per_source=max_results_per_source,
         sources=sources, year=year, save_path=save_path,
@@ -3739,7 +3743,6 @@ PDF_CS_SOURCES = [
     "arxiv",
     "openalex",
     "crossref",
-    "dblp",
 ]
 
 AGENT_SKILL_FAST_SOURCES = [
@@ -3970,23 +3973,14 @@ async def _attach_local_selection_ui(
     force_open: bool = False,
     selection_semantics: str = SELECTION_SEMANTICS_PARSE,
     parse_execution: str = "none",
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
-    surface = _selection_surface_policy(force_open=force_open)
+    surface = _selection_surface_policy(force_open=force_open, ctx=ctx)
     prompt["selection_surface"] = surface
-    if surface.get("surface") == "numbered_fallback":
-        return prompt
-    if surface.get("surface") == "mcp_app_then_local":
-        prompt["fallback_tool"] = LOCAL_PAPER_SELECTION_TOOL
-        prompt["status_tool"] = "get_paper_selection_surface_status"
-        prompt["fallback_after_seconds"] = int(
-            surface.get("fallback_after_seconds") or 0
-        )
+    if surface.get("surface") == "ui_disabled":
         return prompt
     if surface.get("surface") == "mcp_app":
-        from .utils import host_mcp_apps_confirmed  # noqa: PLC0415
-
-        if host_mcp_apps_confirmed():
-            return prompt
+        return prompt
     # 已有本地浏览器页面，不重复创建
     if prompt.get("local_browser", {}).get("url"):
         return prompt
@@ -4003,7 +3997,7 @@ async def _attach_local_selection_ui(
             custom_save_path_confirmed=custom_save_path_confirmed,
             selection_semantics=selection_semantics,
             parse_execution=parse_execution,
-            open_browser=True,
+            open_browser=False,
         )
         prompt["local_browser"]["selection_surface"] = surface
         prompt["local_browser"]["selection_timeout_seconds"] = int(
@@ -4011,13 +4005,6 @@ async def _attach_local_selection_ui(
             or prompt["local_browser"].get("selection_timeout")
             or 0
         )
-        if surface.get("surface") == "hybrid":
-            prompt["interaction"] = "mcp_app"
-            prompt["recommended_tool"] = PAPER_SELECTION_WIDGET_TOOL
-            prompt["recommended_url"] = prompt["local_browser"].get("url", "")
-            prompt["local_browser_url"] = prompt["local_browser"].get("url", "")
-            prompt["page_id"] = prompt["local_browser"].get("page_id", "")
-            prompt["opened"] = bool(prompt["local_browser"].get("opened", False))
     except Exception as exc:
         logger.exception("Failed to open local paper selection UI")
         prompt["local_browser"] = {
@@ -4746,14 +4733,8 @@ def _prefer_local_selection_surface(response: Dict[str, Any]) -> Dict[str, Any]:
     url = str(local.get("url") or "")
     if not url:
         return response
-    surface = local.get("selection_surface")
-    surface_name = surface.get("surface") if isinstance(surface, dict) else ""
-    if surface_name == "hybrid":
-        response.setdefault("interaction", "mcp_app")
-        response.setdefault("recommended_tool", PAPER_SELECTION_WIDGET_TOOL)
-    else:
-        response["interaction"] = local.get("interaction", "local_browser_checkbox")
-        response["recommended_tool"] = LOCAL_PAPER_SELECTION_TOOL
+    response["interaction"] = local.get("interaction", "local_browser_checkbox")
+    response["recommended_tool"] = LOCAL_PAPER_SELECTION_TOOL
     response["recommended_url"] = url
     response["local_browser_url"] = url
     response["page_id"] = local.get("page_id", "")

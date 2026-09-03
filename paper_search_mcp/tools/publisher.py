@@ -72,6 +72,13 @@ _ARXIV_DOI_PREFIX = "10.48550"
 PUBLISHER_SETUP_TIMEOUT_ENV = "PUBLISHER_SETUP_TIMEOUT_SECONDS"
 PUBLISHER_TOR_TIMEOUT_ENV = "PUBLISHER_TOR_TIMEOUT_SECONDS"
 PUBLISHER_CLIENT_TIMEOUT_ENV = "PUBLISHER_CLIENT_TIMEOUT_SECONDS"
+PUBLISHER_LOGIN_TIMEOUT_ENV = "PUBLISHER_LOGIN_TIMEOUT_SECONDS"
+
+# Minimum supported scansci-pdf version.  The local MCP chains against the
+# 1.14.0 tool surface (17 slimmed tools); older releases expose different
+# tool names (smart_download / auto_setup / tor_start / config_set / …)
+# that no longer exist as MCP tools, so they are rejected at runtime.
+_MIN_SCANSCI_VERSION: tuple = (1, 14, 0)
 
 # ---------------------------------------------------------------------------
 # Module-level lazy state for the scansci-pdf MCP client connection
@@ -93,10 +100,20 @@ _keys_injected: bool = False
 # Track whether Tor is available so we can adapt setup timeouts.
 _tor_available: Optional[bool] = None  # tri-state: None=unchecked
 
+# Cached version-gate result: True = scansci-pdf >= _MIN_SCANSCI_VERSION.
+# Tri-state None means "not evaluated yet"; reset after (re)installs.
+_scansci_version_ok: Optional[bool] = None
+
 # Lock protecting client creation, setup, and crash-recovery resets.
 # Prevents concurrent _download_one_publisher_version calls from racing
 # on the shared _scansci_client / _scansci_setup_done state (P3-1).
 _scansci_lock: asyncio.Lock = asyncio.Lock()
+
+# Lock serialising interactive publisher logins (publisher_login tool).
+# Deliberately separate from _scansci_lock: logins hold the shared
+# fastmcp client context for minutes, which must not block concurrent
+# downloads (fastmcp multiplexes JSON-RPC over the stdio transport).
+_publisher_login_lock: asyncio.Lock = asyncio.Lock()
 
 # Module-level reference to the core download function.
 # Set by register_publisher_tools; importers MUST guard with None check.
@@ -531,6 +548,7 @@ def _auto_install_scansci_pdf() -> bool:
     gracefully degrade to OA-only sources.
     """
     global _scansci_install_attempted, _scansci_importable, _component_status
+    global _scansci_version_ok
 
     # Fast path: already importable (cached)
     if _scansci_importable is True:
@@ -565,8 +583,8 @@ def _auto_install_scansci_pdf() -> bool:
     logger.info("scansci-pdf not found — attempting auto-install …")
     install_ok = False
     for attempt, install_target in enumerate([
-        "scansci-pdf[cloakbrowser]",
-        "scansci-pdf",
+        "scansci-pdf[cloakbrowser]>=1.14.0,<2",
+        "scansci-pdf>=1.14.0,<2",
     ]):
         logger.info(
             "  install %s (attempt %d) …", install_target, attempt + 1
@@ -586,6 +604,7 @@ def _auto_install_scansci_pdf() -> bool:
     try:
         import scansci_pdf  # noqa: F401, PLC0415
         _scansci_importable = True
+        _scansci_version_ok = None  # re-evaluate the version gate
         logger.info("scansci-pdf base package installed ✓")
     except ImportError:
         logger.warning("scansci-pdf installed but still not importable")
@@ -645,6 +664,7 @@ async def _auto_install_scansci_pdf_async() -> bool:
     Returns ``True`` if scansci-pdf itself is importable afterwards.
     """
     global _scansci_install_attempted, _scansci_importable, _component_status
+    global _scansci_version_ok
 
     # Fast path: already importable (cached)
     if _scansci_importable is True:
@@ -678,8 +698,8 @@ async def _auto_install_scansci_pdf_async() -> bool:
     )
     install_ok = False
     for attempt, install_target in enumerate([
-        "scansci-pdf[cloakbrowser]",
-        "scansci-pdf",
+        "scansci-pdf[cloakbrowser]>=1.14.0,<2",
+        "scansci-pdf>=1.14.0,<2",
     ]):
         logger.info(
             "  [async] install %s (attempt %d) …",
@@ -705,6 +725,7 @@ async def _auto_install_scansci_pdf_async() -> bool:
     try:
         import scansci_pdf  # noqa: F401, PLC0415
         _scansci_importable = True
+        _scansci_version_ok = None  # re-evaluate the version gate
         logger.info("scansci-pdf base package installed ✓")
     except ImportError:
         logger.warning(
@@ -767,6 +788,43 @@ def _publisher_components_summary() -> str:
     return " | ".join(parts) if parts else "no optional components detected"
 
 
+def _check_scansci_version() -> Optional[str]:
+    """Return an upgrade-hint message when scansci-pdf is too old, else None.
+
+    The local MCP chains against the 1.14.0 tool surface (17 slimmed
+    tools).  Older releases expose different tool names that no longer
+    exist as MCP tools, so every call would fail with "Unknown tool".
+    Result is cached in ``_scansci_version_ok``; resets after (re)install.
+
+    Import of importlib.metadata happens at call time so tests can patch
+    ``importlib.metadata.version``.
+    """
+    global _scansci_version_ok
+
+    if _scansci_version_ok:
+        return None
+
+    try:
+        import importlib.metadata as _im  # noqa: PLC0415
+
+        raw = _im.version("scansci-pdf")
+        m = re.match(r"^(\d+)\.(\d+)\.(\d+)", raw or "")
+        if m and tuple(int(g) for g in m.groups()) >= _MIN_SCANSCI_VERSION:
+            _scansci_version_ok = True
+            return None
+        _scansci_version_ok = False
+        return (
+            f"scansci-pdf {raw} is too old (requires >= "
+            f"{'.'.join(str(p) for p in _MIN_SCANSCI_VERSION)}). "
+            'Upgrade with: uv pip install "scansci-pdf[cloakbrowser]>=1.14.0" '
+            "or: uv sync --extra publisher"
+        )
+    except Exception:
+        # Unversioned or broken install — let the call fail naturally.
+        _scansci_version_ok = True
+        return None
+
+
 async def _get_scansci_client() -> Optional[Any]:
     """Return a connected scansci-pdf MCP client, or ``None`` if unavailable.
 
@@ -795,10 +853,21 @@ async def _get_scansci_client() -> Optional[Any]:
     if not _scansci_importable and not await _auto_install_scansci_pdf_async():
         _scansci_error = (
             "scansci-pdf could not be installed. "
-            "Install manually: pip install scansci-pdf[cloakbrowser]  "
-            "or: uv pip install scansci-pdf[cloakbrowser]"
+            'Install manually: uv pip install "scansci-pdf[cloakbrowser]>=1.14.0"  '
+            "or: uv sync --extra publisher"
         )
         return None
+
+    # ── Version gate: refuse scansci-pdf < 1.14.0 ────────────────
+    # Older releases expose different tool names (smart_download /
+    # auto_setup / tor_start / config_set / …) that no longer exist
+    # as MCP tools in the 1.14.0 17-tool surface.
+    if _scansci_importable:
+        _ver_err = _check_scansci_version()
+        if _ver_err:
+            _scansci_error = "scansci-pdf upgrade required: " + _ver_err
+            logger.warning(_scansci_error)
+            return None
 
     # ── Create the MCP client via stdio transport ───────────────
     # Hold the lock around client creation to prevent concurrent
@@ -809,9 +878,14 @@ async def _get_scansci_client() -> Optional[Any]:
         if _scansci_client is not None:
             return _scansci_client
 
+        # The fastmcp Client timeout bounds every call_tool wait.
+        # publisher_login needs up to max_wait + overhead (~420 s for
+        # the default max_wait=300); all other calls are independently
+        # bounded by their own asyncio.wait_for, so the large default
+        # does not change their behaviour.
         client_timeout = max(
             30.0,
-            float(get_env(PUBLISHER_CLIENT_TIMEOUT_ENV, "120") or "120"),
+            float(get_env(PUBLISHER_CLIENT_TIMEOUT_ENV, "600") or "600"),
         )
         try:
             from fastmcp.client import Client  # noqa: PLC0415
@@ -849,12 +923,13 @@ async def _get_scansci_client() -> Optional[Any]:
 async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
     """Run one-time environment setup on first scansci-pdf connection.
 
-    Calls ``scansci_pdf_auto_setup`` (auto-starts Tor, probes Sci-Hub
-    domains, checks CloakBrowser) and then ``scansci_pdf_tor_start``.
+    Calls ``scansci_pdf_diagnostics(check="auto_setup")`` (auto-starts
+    Tor, probes Sci-Hub domains, checks CloakBrowser) and then
+    ``scansci_pdf_tor(action="start")`` — the 1.14.0 unified tool names.
 
     Each call has a **short timeout** — setup failures are logged but
-    never block the download.  ``smart_download`` gracefully degrades
-    to OA-only sources when Tor / CloakBrowser are unavailable.
+    never block the download.  ``scansci_pdf_download`` gracefully
+    degrades to OA-only sources when Tor / CloakBrowser are unavailable.
 
     Subsequent calls are a no-op (``_scansci_setup_done`` flag).
 
@@ -899,10 +974,14 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
         try:
             async with client:
                 # 1. Auto-setup — scans sources, downloads Tor if configured,
-                #    probes Sci-Hub domains.
+                #    probes Sci-Hub domains.  (1.14.0 exposes this through
+                #    the unified diagnostics tool.)
                 try:
                     result = await asyncio.wait_for(
-                        client.call_tool("scansci_pdf_auto_setup", {}),
+                        client.call_tool(
+                            "scansci_pdf_diagnostics",
+                            {"check": "auto_setup"},
+                        ),
                         timeout=setup_timeout,
                     )
                     parsed = _parse_call_tool_result(result)
@@ -923,7 +1002,10 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
                         )
                         try:
                             result = await asyncio.wait_for(
-                                client.call_tool("scansci_pdf_auto_setup", {}),
+                                client.call_tool(
+                                    "scansci_pdf_diagnostics",
+                                    {"check": "auto_setup"},
+                                ),
                                 timeout=_retry_timeout,
                             )
                             parsed = _parse_call_tool_result(result)
@@ -961,9 +1043,12 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
                         )
 
                 # 2. Tor start — fast timeout (default 5 s).  Non-fatal.
+                #    (1.14.0 exposes this through the unified tor tool.)
                 try:
                     result = await asyncio.wait_for(
-                        client.call_tool("scansci_pdf_tor_start", {}),
+                        client.call_tool(
+                            "scansci_pdf_tor", {"action": "start"}
+                        ),
                         timeout=tor_timeout,
                     )
                     tor_parsed = _parse_call_tool_result(result)
@@ -976,7 +1061,7 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
                         "note": f"Tor did not start within {tor_timeout}s.",
                     }
                     logger.warning(
-                        "scansci_pdf_tor_start timed out after %ss",
+                        "scansci_pdf_tor timed out after %ss",
                         tor_timeout,
                     )
 
@@ -1012,7 +1097,7 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
                         try:
                             await asyncio.wait_for(
                                 client.call_tool(
-                                    "scansci_pdf_config_set",
+                                    "scansci_pdf_config",
                                     {"key": _key, "value": _val},
                                 ),
                                 timeout=5,
@@ -1020,7 +1105,7 @@ async def _ensure_scansci_ready(client: Any) -> Dict[str, Any]:
                             _injected.append(_key)
                         except Exception:
                             logger.debug(
-                                "scansci_pdf_config_set(%s) skipped",
+                                "scansci_pdf_config(%s) skipped",
                                 _key,
                                 exc_info=True,
                             )
@@ -1085,27 +1170,6 @@ def _parse_call_tool_result(result: Any) -> Dict[str, Any]:
         return json.loads(str(result))
     except (json.JSONDecodeError, Exception):
         return {}
-
-
-def _cleanup_doi_index(save_dir: str) -> bool:
-    """Remove the .doi_index.json cache file that scansci-pdf creates.
-
-    scansci-pdf writes this file on every run.  If left in place it can
-    cause subsequent downloads to short-circuit to a stale cached arXiv
-    preprint instead of searching for the real publisher version.
-
-    Returns ``True`` if the file was removed, ``False`` if it didn't exist.
-    """
-    doi_index = Path(save_dir) / ".doi_index.json"
-    if not doi_index.exists():
-        return False
-    try:
-        doi_index.unlink()
-        logger.info("Cleaned up %s after download.", doi_index)
-        return True
-    except OSError as exc:
-        logger.warning("Could not remove %s: %s", doi_index, exc)
-        return False
 
 
 def _download_arxiv_preprint(
@@ -1517,14 +1581,6 @@ async def _download_publisher_by_doi(
     publisher_save_dir = Path(resolved_save) / "publish"
     publisher_save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove stale .doi_index.json
-    doi_index = publisher_save_dir / ".doi_index.json"
-    if doi_index.exists():
-        try:
-            doi_index.unlink()
-        except OSError:
-            pass
-
     # 1. Get scansci-pdf client
     client = await _get_scansci_client()
     if client is None:
@@ -1533,7 +1589,7 @@ async def _download_publisher_by_doi(
             "doi": doi,
             "message": (
                 "scansci-pdf is not available. "
-                "Install: pip install scansci-pdf[cloakbrowser]"
+                'Install: uv pip install "scansci-pdf[cloakbrowser]>=1.14.0"'
             ),
             "detail": _scansci_error,
         }
@@ -1550,7 +1606,7 @@ async def _download_publisher_by_doi(
             async with client:
                 result = await asyncio.wait_for(
                     client.call_tool(
-                        "scansci_pdf_smart_download",
+                        "scansci_pdf_download",
                         {
                             "identifier": doi,
                             "output_dir": str(publisher_save_dir),
@@ -1604,60 +1660,60 @@ async def _download_publisher_by_doi(
             }
 
     # 4. Parse response
-    try:
-        scansci_data = _parse_call_tool_result(result)
-        if not scansci_data.get("success"):
-            return {
-                "status": "download_failed",
-                "doi": doi,
-                "message": (
-                    "scansci-pdf was unable to download the publisher version "
-                    "for this DOI."
-                ),
-                "scansci_result": scansci_data,
-            }
-
-        pdf_path = scansci_data.get("file", "")
-        download_source = scansci_data.get("source", "unknown")
-
-        if not pdf_path or not _is_valid_pdf_file(pdf_path):
-            return {
-                "status": "invalid_pdf",
-                "doi": doi,
-                "message": "scansci-pdf returned a path that is not a valid PDF.",
-            }
-
-        pdf_sha256 = await asyncio.to_thread(sha256_file, pdf_path)
-        try:
-            pdf_bytes = os.path.getsize(os.path.expanduser(pdf_path))
-        except OSError:
-            pdf_bytes = 0
-
-        # Schedule background metadata enrichment from CrossRef
-        if doi and not doi.startswith(_ARXIV_DOI_PREFIX):
-            paper_key_hint = f"doi_{doi.replace('/', '_')}"
-            asyncio.create_task(
-                _enrich_download_metadata(
-                    paper_key=paper_key_hint,
-                    doi=doi,
-                    pdf_path=pdf_path,
-                    title_hint=title or "",
-                )
-            )
-
+    scansci_data = _parse_call_tool_result(result)
+    if not scansci_data.get("success"):
         return {
-            "status": "ok",
+            "status": "download_failed",
             "doi": doi,
-            "publisher_pdf": pdf_path,
-            "download_source": download_source,
-            "pdf_sha256": pdf_sha256,
-            "pdf_bytes": pdf_bytes,
-            "title": title or "",
-            "metadata_enrichment": "scheduled" if doi else "skipped",
+            "message": (
+                "scansci-pdf was unable to download the publisher version "
+                "for this DOI."
+            ),
+            "error_type": scansci_data.get("error_type", ""),
+            "action": scansci_data.get("action", ""),
+            "agent_hint": scansci_data.get("agent_hint", ""),
+            "hint": scansci_data.get("hint", ""),
+            "scansci_result": scansci_data,
         }
-    finally:
-        # Cleanup stale cache
-        _cleanup_doi_index(str(publisher_save_dir))
+
+    pdf_path = scansci_data.get("file", "")
+    download_source = scansci_data.get("source", "unknown")
+
+    if not pdf_path or not _is_valid_pdf_file(pdf_path):
+        return {
+            "status": "invalid_pdf",
+            "doi": doi,
+            "message": "scansci-pdf returned a path that is not a valid PDF.",
+        }
+
+    pdf_sha256 = await asyncio.to_thread(sha256_file, pdf_path)
+    try:
+        pdf_bytes = os.path.getsize(os.path.expanduser(pdf_path))
+    except OSError:
+        pdf_bytes = 0
+
+    # Schedule background metadata enrichment from CrossRef
+    if doi and not doi.startswith(_ARXIV_DOI_PREFIX):
+        paper_key_hint = f"doi_{doi.replace('/', '_')}"
+        asyncio.create_task(
+            _enrich_download_metadata(
+                paper_key=paper_key_hint,
+                doi=doi,
+                pdf_path=pdf_path,
+                title_hint=title or "",
+            )
+        )
+
+    return {
+        "status": "ok",
+        "doi": doi,
+        "publisher_pdf": pdf_path,
+        "download_source": download_source,
+        "pdf_sha256": pdf_sha256,
+        "pdf_bytes": pdf_bytes,
+        "title": title or "",
+        "metadata_enrichment": "scheduled" if doi else "skipped",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2093,6 +2149,10 @@ def register_publisher_tools(mcp):  # noqa: C901
         save_path: str,
         timeout: int,
         force_reparse: bool,
+        *,
+        bibtex: bool = False,
+        download_si: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
         """Core logic for downloading one publisher PDF.  Used by both the
         single and batch tools.
@@ -2121,14 +2181,15 @@ def register_publisher_tools(mcp):  # noqa: C901
             # ── Auto-download arXiv preprint to seed the cache ──────
             arxiv_id = _extract_arxiv_id(paper_key, "", "")
             if not arxiv_id:
-                # paper_key format: "arxiv_1706.03762" or "arxiv_1706.03762v7"
+                # paper_key format: "arxiv_1706.03762" / "arxiv_1706_03762"
+                # (cache keys use the underscore form), optional vN suffix.
                 m = re.match(
-                    r"^arxiv_(\d{4}\.\d{4,5})(?:v\d+)?$",
+                    r"^arxiv_(\d{4})[._](\d{4,5})(?:v\d+)?$",
                     paper_key,
                     re.IGNORECASE,
                 )
                 if m:
-                    arxiv_id = m.group(1)
+                    arxiv_id = f"{m.group(1)}.{m.group(2)}"
             if not arxiv_id:
                 return {
                     "status": "not_found",
@@ -2214,9 +2275,13 @@ def register_publisher_tools(mcp):  # noqa: C901
         #       2. Semantic Scholar title search (fallback, with API key)
         #       3. arXiv API title → Semantic Scholar title search
         #
-        #     When all DOI lookups fail, we pass skip_l0_arxiv=True to
-        #     scansci-pdf, which bypasses the [L0] shortcut and lets
-        #     Phase 1/2 publisher sources race for the paper directly.
+        #     scansci-pdf 1.14.0 removed the skip_l0_arxiv escape hatch:
+        #     an arXiv-ID input is hard-routed to the [L0] arXiv direct
+        #     download.  So publisher-version preference is expressed
+        #     here: resolving a DOI and passing it upstream lets the
+        #     OA/grey/institutional sources race on the DOI; when no
+        #     DOI is found the arXiv ID is passed and [L0] returns the
+        #     preprint (same as the old default behaviour).
         if identifier_type == "arxiv_id" and identifier:
             # Tier 1: direct arXiv-ID→DOI lookup
             real_doi = await asyncio.to_thread(
@@ -2260,15 +2325,16 @@ def register_publisher_tools(mcp):  # noqa: C901
             else:
                 logger.info(
                     "No publisher DOI found for %s (arXiv %s) — "
-                    "will use skip_l0_arxiv=True to bypass "
-                    "scansci-pdf [L0] arXiv shortcut and allow "
-                    "publisher sources to race.",
+                    "passing the arXiv ID; scansci-pdf [L0] will "
+                    "return the arXiv preprint.",
                     paper_key, identifier,
                 )
 
         # 2c. Dedup check: skip download if a valid publisher PDF already
         #     exists on disk for this paper (DOI-based matching).
-        if identifier_type == "doi":
+        #     Skipped entirely when force=True — a forced download must
+        #     not early-return the cached PDF.
+        if not force and identifier_type == "doi":
             _publish_dir = Path(publisher_save_dir)
             if _publish_dir.exists():
                 # First check for a DOI-derived filename pattern
@@ -2302,7 +2368,7 @@ def register_publisher_tools(mcp):  # noqa: C901
                                 }
         # Also check for publisher PDFs by paper_key pattern
         _publish_dir = Path(publisher_save_dir)
-        if _publish_dir.exists():
+        if not force and _publish_dir.exists():
             _key_slug = re.sub(r"[^a-zA-Z0-9_.-]", "_", paper_key)
             for _candidate in sorted(
                 _publish_dir.glob(f"*{_key_slug}*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True
@@ -2340,8 +2406,8 @@ def register_publisher_tools(mcp):  # noqa: C901
                 "paper_key": paper_key,
                 "message": (
                     "scansci-pdf is not available. "
-                    "Install manually: pip install scansci-pdf[cloakbrowser]  "
-                    "or: uv pip install scansci-pdf[cloakbrowser]"
+                    'Install manually: uv pip install "scansci-pdf[cloakbrowser]>=1.14.0"  '
+                    "or: uv sync --extra publisher"
                 ),
                 "detail": _scansci_error,
             }
@@ -2349,48 +2415,47 @@ def register_publisher_tools(mcp):  # noqa: C901
         # 4. One-time environment setup (Tor, browser, Sci-Hub domains)
         setup_report = await _ensure_scansci_ready(client)
 
-        # 5. Remove stale .doi_index.json to prevent scansci-pdf from
-        #    short-circuiting to a cached arXiv preprint instead of
-        #    actually downloading the publisher version.
-        save_dir = publisher_save_dir
-        doi_index = Path(save_dir) / ".doi_index.json"
-        doi_index_existed = doi_index.exists()
-        if doi_index_existed:
+        # 4b. force=True — clear the upstream result cache for this
+        #     identifier so a fresh download is attempted even when a
+        #     publisher PDF is already cached.  (The upstream cache is
+        #     TTL'd and strategy-aware; we no longer delete its
+        #     .doi_index.json out from under it.)
+        if force:
             try:
-                doi_index.unlink()
+                async with client:
+                    await asyncio.wait_for(
+                        client.call_tool(
+                            "scansci_pdf_cache_clear",
+                            {"identifier": identifier},
+                        ),
+                        timeout=30,
+                    )
                 logger.info(
-                    "Removed %s to allow fresh publisher download.", doi_index
+                    "Force download for %s — upstream cache cleared.",
+                    identifier,
                 )
-            except OSError as exc:
-                logger.warning("Could not remove %s: %s", doi_index, exc)
-        setup_report["doi_index_cleared"] = doi_index_existed
+            except Exception as exc:
+                logger.warning(
+                    "scansci_pdf_cache_clear(%s) failed (non-fatal): %s",
+                    identifier, exc,
+                )
 
-        # 6. Call scansci-pdf (with retry for transient failures — P2-1)
+        # 5. Call scansci-pdf (with retry for transient failures — P2-1)
         MAX_RETRIES = 3
         result = None
-
-        # When we only have an arXiv ID (publisher DOI lookup failed),
-        # pass skip_l0_arxiv=True to bypass scansci-pdf's [L0] arXiv
-        # direct shortcut and allow Phase 1/2 publisher sources to race.
-        _skip_l0 = (identifier_type == "arxiv_id")
-        if _skip_l0:
-            logger.info(
-                "Passing skip_l0_arxiv=True — allowing scansci-pdf "
-                "Phase 1/2 publisher sources to race for %s",
-                paper_key,
-            )
+        save_dir = publisher_save_dir
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with client:
                     result = await asyncio.wait_for(
                         client.call_tool(
-                            "scansci_pdf_smart_download",
+                            "scansci_pdf_download",
                             {
                                 "identifier": identifier,
                                 "output_dir": str(save_dir),
-                                "skip_l0_arxiv": _skip_l0,
-                                "skip_phase1_oa": _skip_l0,
+                                "bibtex": bibtex,
+                                "download_si": download_si,
                             },
                         ),
                         timeout=timeout,
@@ -2399,7 +2464,6 @@ def register_publisher_tools(mcp):  # noqa: C901
 
             except asyncio.TimeoutError:
                 if attempt == MAX_RETRIES:
-                    _cleanup_doi_index(publisher_save_dir)
                     return {
                         "status": "timeout",
                         "paper_key": paper_key,
@@ -2448,7 +2512,6 @@ def register_publisher_tools(mcp):  # noqa: C901
                         # Re-create the client for the next attempt
                         client = await _get_scansci_client()
                         if client is None:
-                            _cleanup_doi_index(publisher_save_dir)
                             return {
                                 "status": "error",
                                 "paper_key": paper_key,
@@ -2484,9 +2547,8 @@ def register_publisher_tools(mcp):  # noqa: C901
                     else:
                         hint = (
                             " Retry with a VPN or proxy configured "
-                            "in scansci-pdf (scansci_pdf_config_set)."
+                            "in scansci-pdf (scansci_pdf_config)."
                         )
-                    _cleanup_doi_index(publisher_save_dir)
                     return {
                         "status": "error",
                         "paper_key": paper_key,
@@ -2505,7 +2567,6 @@ def register_publisher_tools(mcp):  # noqa: C901
                 logger.exception(
                     "scansci-pdf call_tool failed for %s", paper_key
                 )
-                _cleanup_doi_index(publisher_save_dir)
                 return {
                     "status": "error",
                     "paper_key": paper_key,
@@ -2514,125 +2575,139 @@ def register_publisher_tools(mcp):  # noqa: C901
                 }
 
         # 7. Parse scansci-pdf response
-        try:
-            scansci_data = _parse_call_tool_result(result)
-            if not scansci_data.get("success"):
-                return {
-                    "status": "download_failed",
-                    "paper_key": paper_key,
-                    "identifier_sent": identifier,
-                    "identifier_type": identifier_type,
-                    "message": (
-                        "scansci-pdf was unable to download the publisher "
-                        "version for this paper."
-                    ),
-                    "scansci_result": scansci_data,
-                }
-
-            pdf_path = scansci_data.get("file", "")
-            download_source = scansci_data.get("source", "unknown")
-
-            # 7. Validate the downloaded PDF
-            if not pdf_path or not _is_valid_pdf_file(pdf_path):
-                return {
-                    "status": "invalid_pdf",
-                    "paper_key": paper_key,
-                    "identifier_sent": identifier,
-                    "scansci_file": pdf_path,
-                    "message": (
-                        "scansci-pdf returned a path that does not point "
-                        "to a valid PDF file."
-                    ),
-                }
-
-            pdf_sha256 = await asyncio.to_thread(sha256_file, pdf_path)
-            try:
-                pdf_bytes = os.path.getsize(os.path.expanduser(pdf_path))
-            except OSError:
-                pdf_bytes = 0
-
-            # 8. Record download in paper-search cache
-            await asyncio.to_thread(
-                record_download,
-                pdf_path=pdf_path,
-                paper_key_hint=paper_key,
-                source=meta["source"],
-                paper_id=meta["paper_id"],
-                doi=meta["doi"],
-                title=meta["title"],
-                downloader="scansci-pdf",
-                legal_status="publisher",
-            )
-
-            # 8b. Enrich metadata from CrossRef (background, non-blocking).
-            #     Fires after the response is returned so the user sees
-            #     the download result immediately.
-            real_doi_for_enrich = meta.get("doi", "")
-            if real_doi_for_enrich and not real_doi_for_enrich.startswith(_ARXIV_DOI_PREFIX):
-                asyncio.create_task(
-                    _enrich_download_metadata(
-                        paper_key=paper_key,
-                        doi=real_doi_for_enrich,
-                        pdf_path=pdf_path,
-                        title_hint=meta.get("title", ""),
-                    )
-                )
-
-            response: Dict[str, Any] = {
-                "status": "ok",
+        scansci_data = _parse_call_tool_result(result)
+        if not scansci_data.get("success"):
+            return {
+                "status": "download_failed",
                 "paper_key": paper_key,
                 "identifier_sent": identifier,
                 "identifier_type": identifier_type,
-                "publisher_pdf": pdf_path,
-                "download_source": download_source,
-                "downloader": "scansci-pdf",
-                "pdf_sha256": pdf_sha256,
-                "pdf_bytes": pdf_bytes,
-                "was_parsed": False,
-                "metadata_enrichment": "scheduled" if real_doi_for_enrich else "skipped",
-                "auto_downloaded_arxiv": auto_downloaded,
-                "setup": setup_report,
+                "message": (
+                    "scansci-pdf was unable to download the publisher "
+                    "version for this paper."
+                ),
+                # Pass through upstream actionable guidance so the agent
+                # can act on it (e.g. run publisher_login for paywalls).
+                "error_type": scansci_data.get("error_type", ""),
+                "action": scansci_data.get("action", ""),
+                "agent_hint": scansci_data.get("agent_hint", ""),
+                "hint": scansci_data.get("hint", ""),
+                "scansci_result": scansci_data,
             }
-            arxiv_id = _extract_arxiv_id(
-                meta["paper_id"], meta["doi"], meta["title"]
+
+        pdf_path = scansci_data.get("file", "")
+        download_source = scansci_data.get("source", "unknown")
+
+        # 7. Validate the downloaded PDF
+        if not pdf_path or not _is_valid_pdf_file(pdf_path):
+            return {
+                "status": "invalid_pdf",
+                "paper_key": paper_key,
+                "identifier_sent": identifier,
+                "scansci_file": pdf_path,
+                "message": (
+                    "scansci-pdf returned a path that does not point "
+                    "to a valid PDF file."
+                ),
+            }
+
+        pdf_sha256 = await asyncio.to_thread(sha256_file, pdf_path)
+        try:
+            pdf_bytes = os.path.getsize(os.path.expanduser(pdf_path))
+        except OSError:
+            pdf_bytes = 0
+
+        # 8. Record download in paper-search cache.  Note: when upstream
+        #    [L0] returned the arXiv preprint, download_source is "arxiv"
+        #    and the legal status stays "preprint" instead of "publisher".
+        await asyncio.to_thread(
+            record_download,
+            pdf_path=pdf_path,
+            paper_key_hint=paper_key,
+            source=meta["source"],
+            paper_id=meta["paper_id"],
+            doi=meta["doi"],
+            title=meta["title"],
+            downloader="scansci-pdf",
+            legal_status=(
+                "publisher"
+                if download_source != "arxiv"
+                else "preprint"
+            ),
+        )
+
+        # 8b. Enrich metadata from CrossRef (background, non-blocking).
+        #     Fires after the response is returned so the user sees
+        #     the download result immediately.
+        real_doi_for_enrich = meta.get("doi", "")
+        if real_doi_for_enrich and not real_doi_for_enrich.startswith(_ARXIV_DOI_PREFIX):
+            asyncio.create_task(
+                _enrich_download_metadata(
+                    paper_key=paper_key,
+                    doi=real_doi_for_enrich,
+                    pdf_path=pdf_path,
+                    title_hint=meta.get("title", ""),
+                )
             )
-            if arxiv_id:
-                response["arxiv_id"] = arxiv_id
-            if identifier_type == "doi":
-                response["publisher_doi"] = meta["doi"]
 
-            # 9. Optional re-parse with MinerU
-            if force_reparse:
-                try:
-                    from ..parsers.mineru import (  # noqa: PLC0415
-                        parse_pdf_with_mineru as run_parse,
-                    )
+        response: Dict[str, Any] = {
+            "status": "ok",
+            "paper_key": paper_key,
+            "identifier_sent": identifier,
+            "identifier_type": identifier_type,
+            "publisher_pdf": pdf_path,
+            "download_source": download_source,
+            "downloader": "scansci-pdf",
+            "pdf_sha256": pdf_sha256,
+            "pdf_bytes": pdf_bytes,
+            "was_parsed": False,
+            "metadata_enrichment": "scheduled" if real_doi_for_enrich else "skipped",
+            "auto_downloaded_arxiv": auto_downloaded,
+            "setup": setup_report,
+        }
+        arxiv_id = _extract_arxiv_id(
+            meta["paper_id"], meta["doi"], meta["title"]
+        )
+        if arxiv_id:
+            response["arxiv_id"] = arxiv_id
+        if identifier_type == "doi":
+            response["publisher_doi"] = meta["doi"]
 
-                    parse_result = await asyncio.to_thread(
-                        run_parse,
-                        pdf_path,
-                        paper_key_hint=paper_key,
-                        source=meta["source"],
-                        paper_id=meta["paper_id"],
-                        doi=meta["doi"],
-                        title=meta["title"],
-                        mode="auto",
-                        force=True,
-                    )
-                    response["was_parsed"] = True
-                    response["parse_result"] = parse_result
-                except Exception as exc:
-                    logger.exception(
-                        "MinerU re-parse after publisher download failed"
-                    )
-                    response["was_parsed"] = False
-                    response["parse_error"] = str(exc)
+        # Pass through upstream optional deliverables requested via the
+        # bibtex / download_si parameters.
+        if bibtex and scansci_data.get("bibtex"):
+            response["bibtex"] = scansci_data["bibtex"]
+        if download_si and scansci_data.get("supplementary"):
+            response["supplementary"] = scansci_data["supplementary"]
 
-            return response
-        finally:
-            # Clean up scansci-pdf's .doi_index.json cache so it doesn't
-            # short-circuit future downloads to stale arXiv preprints.
-            _cleanup_doi_index(publisher_save_dir)
+        # 9. Optional re-parse with MinerU
+        if force_reparse:
+            try:
+                from ..parsers.mineru import (  # noqa: PLC0415
+                    parse_pdf_with_mineru as run_parse,
+                )
+
+                parse_result = await asyncio.to_thread(
+                    run_parse,
+                    pdf_path,
+                    paper_key_hint=paper_key,
+                    source=meta["source"],
+                    paper_id=meta["paper_id"],
+                    doi=meta["doi"],
+                    title=meta["title"],
+                    mode="auto",
+                    force=True,
+                )
+                response["was_parsed"] = True
+                response["parse_result"] = parse_result
+            except Exception as exc:
+                logger.exception(
+                    "MinerU re-parse after publisher download failed"
+                )
+                response["was_parsed"] = False
+                response["parse_error"] = str(exc)
+
+        return response
 
     # Expose the core download function at module level so other modules
     # (e.g. server.py IEEE/ACM download routing) can import and call it.
@@ -2657,12 +2732,33 @@ def register_publisher_tools(mcp):  # noqa: C901
 
         # Already known-good — proceed
         if _scansci_importable is True:
+            # Version gate: reject scansci-pdf < 1.14.0 even when
+            # importable (its MCP tool names differ from the 1.14.0
+            # surface this module chains against).
+            _ver_err = _check_scansci_version()
+            if _ver_err:
+                return {
+                    "status": "unavailable",
+                    "message": (
+                        "scansci-pdf version too old (requires >= 1.14.0)."
+                    ),
+                    "upgrade_hint": _ver_err,
+                }
             return None
 
         # Re-check: maybe it was installed manually since last check
         try:
             import scansci_pdf  # noqa: F401, PLC0415
             _scansci_importable = True
+            _ver_err = _check_scansci_version()
+            if _ver_err:
+                return {
+                    "status": "unavailable",
+                    "message": (
+                        "scansci-pdf version too old (requires >= 1.14.0)."
+                    ),
+                    "upgrade_hint": _ver_err,
+                }
             return None
         except ImportError:
             _scansci_importable = False
@@ -2704,8 +2800,11 @@ def register_publisher_tools(mcp):  # noqa: C901
     async def download_publisher_version(
         paper_key: str,
         save_path: str = DEFAULT_SAVE_PATH,
-        timeout: int = 120,
+        timeout: int = 180,
         force_reparse: bool = False,
+        bibtex: bool = False,
+        download_si: bool = False,
+        force: bool = False,
     ) -> Dict[str, Any]:
         """Download the publisher final version of a cached arXiv paper.
 
@@ -2718,8 +2817,10 @@ def register_publisher_tools(mcp):  # noqa: C901
 
         **Prerequisites**
 
-        * scansci-pdf must be installed (call ``install_publisher_support``
-          first if you get a ``"not_installed"`` response).
+        * scansci-pdf >= 1.14.0 must be installed (call
+          ``install_publisher_support`` first if you get a
+          ``"not_installed"`` / ``"unavailable"`` response; older
+          versions are rejected with an ``upgrade_hint``).
         * The paper must already be cached in paper-search-mcp
           (use ``list_parsed_papers`` to see what is available).
         * The paper must have an arXiv ID or a publisher DOI.
@@ -2728,24 +2829,35 @@ def register_publisher_tools(mcp):  # noqa: C901
             paper_key: Parsed-paper key from the paper-search-mcp cache
                 (e.g. ``"arxiv_1706_03762"``).
             save_path: Directory where the publisher PDF is saved.
-            timeout: Maximum seconds per paper (default 120).
+            timeout: Maximum seconds per paper (default 180).
             force_reparse: If ``True``, also parse the publisher PDF with
                 MinerU after download.
+            bibtex: If ``True``, also return the BibTeX citation for the
+                paper (``bibtex`` field in the result).
+            download_si: If ``True``, also download the paper's
+                supplementary materials (``supplementary`` field).
+            force: If ``True``, clear the upstream result cache for this
+                identifier first so a fresh download is attempted even
+                when a publisher PDF is already cached on disk.
 
         Returns:
             A dict with ``status`` (one of ``"ok"``, ``"not_found"``,
             ``"not_applicable"``, ``"not_installed"``, ``"unavailable"``,
             ``"download_failed"``, ``"timeout"``, ``"invalid_pdf"``,
             ``"error"``) and, on success, ``publisher_pdf``,
-            ``download_source``, ``pdf_sha256``, etc.
+            ``download_source``, ``pdf_sha256``, etc.  Failures include
+            upstream ``agent_hint`` / ``hint`` / ``error_type`` fields
+            so the agent can act on them (e.g. run ``publisher_login``
+            for paywalled papers).
         """
-        # ── Fast-fail: scansci-pdf not installed ──────────────────
+        # ── Fast-fail: scansci-pdf not installed / too old ────────
         fast_fail = _ensure_publisher_available()
         if fast_fail is not None:
             return fast_fail
 
         return await _download_one_publisher_version(
-            paper_key, save_path, timeout, force_reparse
+            paper_key, save_path, timeout, force_reparse,
+            bibtex=bibtex, download_si=download_si, force=force,
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -2770,12 +2882,17 @@ def register_publisher_tools(mcp):  # noqa: C901
                 process every cached paper whose source is ``"arxiv"``.
             save_path: Directory where publisher PDFs are saved.
             timeout: Maximum seconds for the **entire batch** (default 300).
+                Use at least ``60 + 45 * N`` seconds for N papers; a
+                timed-out call reports ``suggested_timeout``.
             force_reparse: If ``True``, also parse each publisher PDF with
                 MinerU after download.
 
         Returns:
             A dict with ``total``, ``ok``, ``failed`` counts and a
-            ``results`` list of per-paper status dicts.
+            ``results`` list of per-paper status dicts.  Failed items
+            include upstream ``agent_hint`` / ``hint`` / ``error_type``
+            fields so the agent can act on them (e.g. run
+            ``publisher_login`` for paywalled papers).
         """
         # ── Fast-fail: scansci-pdf not installed ──────────────────
         fast_fail = _ensure_publisher_available()
@@ -2809,7 +2926,6 @@ def register_publisher_tools(mcp):  # noqa: C901
         resolved_save = resolve_save_path(save_path)
         identifiers: List[str] = []
         paper_map: Dict[str, str] = {}  # identifier → paper_key
-        has_arxiv_ids = False
 
         failed_results: List[Dict[str, Any]] = []
 
@@ -2824,13 +2940,15 @@ def register_publisher_tools(mcp):  # noqa: C901
                 # in the parsed cache were silently skipped.
                 arxiv_id = _extract_arxiv_id(paper_key, "", "")
                 if not arxiv_id:
+                    # Accept both "arxiv_1706.03762" and the underscore
+                    # cache-key form "arxiv_1706_03762".
                     m = re.match(
-                        r"^arxiv_(\d{4}\.\d{4,5})(?:v\d+)?$",
+                        r"^arxiv_(\d{4})[._](\d{4,5})(?:v\d+)?$",
                         paper_key,
                         re.IGNORECASE,
                     )
                     if m:
-                        arxiv_id = m.group(1)
+                        arxiv_id = f"{m.group(1)}.{m.group(2)}"
                 if arxiv_id:
                     logger.info(
                         "Batch: '%s' not in cache — auto-downloading arXiv %s …",
@@ -2882,7 +3000,6 @@ def register_publisher_tools(mcp):  # noqa: C901
 
             # Try to find a real publisher DOI
             if id_type == "arxiv_id":
-                has_arxiv_ids = True
                 real_doi = await asyncio.to_thread(
                     _lookup_real_publisher_doi, ident
                 )
@@ -2937,8 +3054,8 @@ def register_publisher_tools(mcp):  # noqa: C901
         # ── Call native batch API ──────────────────────────────────
         logger.info(
             "Batch download: %d papers via scansci_pdf_batch_download "
-            "(skip_l0_arxiv=%s, skip_phase1_oa=%s)",
-            len(identifiers), has_arxiv_ids, has_arxiv_ids,
+            "(resume=True)",
+            len(identifiers),
         )
         try:
             async with client:
@@ -2948,8 +3065,6 @@ def register_publisher_tools(mcp):  # noqa: C901
                         {
                             "identifiers": identifiers,
                             "output_dir": str(resolved_save),
-                            "skip_l0_arxiv": has_arxiv_ids,
-                            "skip_phase1_oa": has_arxiv_ids,
                             "resume": True,
                         },
                     ),
@@ -2962,6 +3077,7 @@ def register_publisher_tools(mcp):  # noqa: C901
                     f"Batch download timed out after {timeout}s. "
                     "Retry with a larger timeout or fewer papers."
                 ),
+                "suggested_timeout": 60 + 45 * len(raw),
                 "total": len(raw),
                 "ok": 0,
                 "failed": len(raw),
@@ -3020,6 +3136,9 @@ def register_publisher_tools(mcp):  # noqa: C901
                     "identifier_sent": ident,
                     "message": item.get("error", "unknown error"),
                     "error_type": item.get("error_type", ""),
+                    "action": item.get("action", ""),
+                    "agent_hint": item.get("agent_hint", ""),
+                    "hint": item.get("hint", ""),
                 })
 
         # ── Prepend any per-paper failures from the identifier-resolution
@@ -3065,6 +3184,18 @@ def register_publisher_tools(mcp):  # noqa: C901
                 "uv sync --extra publisher  &&  playwright install chromium"
             )
             return report
+
+        # 1b. Version check — the MCP chaining layer targets the 1.14.0
+        #     tool surface and rejects older releases.
+        try:
+            import importlib.metadata as _im  # noqa: PLC0415
+            report["scansci_pdf_version"] = _im.version("scansci-pdf")
+        except Exception:
+            pass
+        _ver_err = _check_scansci_version()
+        report["version_ok"] = _ver_err is None
+        if _ver_err:
+            report["upgrade_hint"] = _ver_err
 
         # 2. Component detection (CloakBrowser, Tor, Crypto)
         components = _detect_publisher_components()
@@ -3118,11 +3249,17 @@ def register_publisher_tools(mcp):  # noqa: C901
             return report
         report["client_available"] = True
 
-        # 4. Run health check + source scores inside scansci-pdf
+        # 4. Run health check + source scores inside scansci-pdf via the
+        #    unified diagnostics tool.  Explicit wait_for guards keep the
+        #    report bounded now that the client timeout is larger.
         try:
             async with client:
-                result = await client.call_tool(
-                    "scansci_pdf_health_check", {"detailed": True}
+                result = await asyncio.wait_for(
+                    client.call_tool(
+                        "scansci_pdf_diagnostics",
+                        {"check": "health", "detailed": True},
+                    ),
+                    timeout=90,
                 )
                 report["health"] = _parse_call_tool_result(result)
 
@@ -3130,8 +3267,12 @@ def register_publisher_tools(mcp):  # noqa: C901
                 #    and latencies) so users can see which download sources
                 #    are currently healthy.
                 try:
-                    scores_result = await client.call_tool(
-                        "scansci_pdf_source_scores", {}
+                    scores_result = await asyncio.wait_for(
+                        client.call_tool(
+                            "scansci_pdf_diagnostics",
+                            {"check": "sources"},
+                        ),
+                        timeout=60,
                     )
                     parsed_scores = _parse_call_tool_result(scores_result)
                     if parsed_scores:
@@ -3142,7 +3283,7 @@ def register_publisher_tools(mcp):  # noqa: C901
                             report["source_health_advice"] = advice
                 except Exception:
                     logger.debug(
-                        "scansci_pdf_source_scores unavailable",
+                        "scansci_pdf_diagnostics(check=sources) unavailable",
                         exc_info=True,
                     )
         except Exception as exc:
@@ -3207,12 +3348,26 @@ def register_publisher_tools(mcp):  # noqa: C901
                 pw = _check_playwright_browser()
                 pw_missing = not pw.get("chromium_browser")
             if not missing and not pw_missing:
+                try:
+                    import importlib.metadata as _im  # noqa: PLC0415
+                    _inst_ver = _im.version("scansci-pdf")
+                except Exception:
+                    _inst_ver = "unknown"
+                _ver_err = _check_scansci_version()
+                if _ver_err:
+                    return {
+                        "status": "upgrade_required",
+                        "message": _ver_err,
+                        "scansci_pdf_version": _inst_ver,
+                        "steps": [],
+                    }
                 return {
                     "status": "already_installed",
                     "message": (
                         "scansci-pdf and all publisher-access components "
                         "are already installed and ready."
                     ),
+                    "scansci_pdf_version": _inst_ver,
                     "components": {
                         k: v.get("available") for k, v in components.items()
                     },
@@ -3234,9 +3389,9 @@ def register_publisher_tools(mcp):  # noqa: C901
             return {
                 "status": "install_failed",
                 "message": (
-                    "scansci-pdf base package could not be installed. "
-                    "Check your network connection and try again, or "
-                    "install manually: uv sync --extra publisher"
+                    "scansci-pdf base package (>=1.14.0) could not be "
+                    "installed. Check your network connection and try "
+                    "again, or install manually: uv sync --extra publisher"
                 ),
                 "steps": steps,
                 "elapsed_seconds": (
@@ -3325,7 +3480,18 @@ def register_publisher_tools(mcp):  # noqa: C901
         pw_final = _check_playwright_browser()
         chromium_ok = bool(pw_final.get("chromium_browser"))
 
-        return {
+        try:
+            import importlib.metadata as _im  # noqa: PLC0415
+            _inst_ver = _im.version("scansci-pdf")
+        except Exception:
+            _inst_ver = "unknown"
+
+        # Re-evaluate the version gate after a (re)install.
+        global _scansci_version_ok
+        _scansci_version_ok = None
+        _ver_err = _check_scansci_version()
+
+        _report: Dict[str, Any] = {
             "status": "ok",
             "message": (
                 "Publisher support installed successfully."
@@ -3334,11 +3500,340 @@ def register_publisher_tools(mcp):  # noqa: C901
                        "some components are still missing."
             ),
             "scansci_pdf_importable": _scansci_importable,
+            "scansci_pdf_version": _inst_ver,
+            "version_ok": _ver_err is None,
             "components": {
                 k: v.get("available") for k, v in components.items()
             },
             "playwright_chromium": chromium_ok,
             "steps": steps,
             "elapsed_seconds": elapsed,
-            "ready_for_download": all_ok and chromium_ok,
+            "ready_for_download": all_ok and chromium_ok and _ver_err is None,
+        }
+        if _ver_err:
+            _report["upgrade_hint"] = _ver_err
+        return _report
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tool: publisher_login  (institutional channel login)
+    # ══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    async def publisher_login(
+        kind: str = "publisher",
+        identifier: str = "",
+        publisher: str = "",
+        custom_url: str = "",
+        cookie_file: str = "",
+        max_wait: int = 300,
+    ) -> Dict[str, Any]:
+        """Log into an institutional download channel via scansci-pdf.
+
+        Opens a browser on the user's machine for the selected channel;
+        **the user completes the login in that browser and then closes
+        the browser window** — the call returns only after that (or
+        after ``max_wait`` seconds).  Credentials never pass through
+        this tool; the login session (cookies) is reused by subsequent
+        ``download_publisher_version`` calls.
+
+        Use ``publisher_schools`` to search/set a WebVPN university
+        before ``kind="webvpn"``; use ``publisher_channel_status`` to
+        verify the channel afterwards.
+
+        Args:
+            kind: Channel to log into — ``"publisher"`` (DOI publisher
+                SSO, default), ``"webvpn"`` (university WebVPN),
+                ``"carsi"`` (CARSI federation, pass ``publisher``),
+                ``"ezproxy"`` (library proxy), ``"custom"`` (custom
+                login URL via ``custom_url``), or ``"cookie_import"``
+                (import browser cookies, optional ``cookie_file``).
+            identifier: DOI of the paper to fetch (used by the
+                ``"publisher"`` kind to open the right SSO page).
+            publisher: Publisher name for ``kind="carsi"`` (e.g.
+                ``"sciencedirect"``).
+            custom_url: Login URL for ``kind="custom"``.
+            cookie_file: Cookie file path for ``kind="cookie_import"``.
+            max_wait: Maximum seconds to wait for the user to finish
+                logging in (default 300).
+
+        Returns:
+            A dict with ``status`` (``"ok"`` / ``"busy"`` /
+            ``"unavailable"`` / ``"timeout"`` / ``"error"``) and
+            ``scansci_result`` (the parsed upstream result).
+        """
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
+        client = await _get_scansci_client()
+        if client is None:
+            return {
+                "status": "unavailable",
+                "message": "scansci-pdf is not available.",
+                "detail": _scansci_error,
+            }
+        await _ensure_scansci_ready(client)
+
+        # Serialise interactive logins (separate lock from _scansci_lock
+        # so concurrent downloads keep working while a login is open).
+        if _publisher_login_lock.locked():
+            return {
+                "status": "busy",
+                "message": "Another publisher login is already in progress.",
+            }
+        async with _publisher_login_lock:
+            login_timeout = max(
+                max_wait + 120,
+                float(
+                    get_env(PUBLISHER_LOGIN_TIMEOUT_ENV, "600") or "600"
+                ),
+            )
+            try:
+                async with client:
+                    result = await asyncio.wait_for(
+                        client.call_tool(
+                            "scansci_pdf_login",
+                            {
+                                "kind": kind,
+                                "identifier": identifier,
+                                "publisher": publisher,
+                                "custom_url": custom_url,
+                                "cookie_file": cookie_file,
+                                "max_wait": max_wait,
+                            },
+                        ),
+                        timeout=login_timeout,
+                    )
+            except asyncio.TimeoutError:
+                return {
+                    "status": "timeout",
+                    "message": (
+                        f"Login did not complete within {login_timeout}s. "
+                        "Retry with a larger max_wait or check the "
+                        "browser window."
+                    ),
+                }
+            except Exception as exc:
+                logger.exception("publisher_login failed")
+                return {
+                    "status": "error",
+                    "message": f"publisher_login failed: {exc}",
+                }
+
+        return {
+            "status": "ok",
+            # Keyed "scansci_result" (not "result") because the shared
+            # unwrap helpers strip a legacy {"result": dict} wrapper.
+            "scansci_result": _parse_call_tool_result(result),
+        }
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tool: publisher_schools  (WebVPN university search / set)
+    # ══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    async def publisher_schools(
+        action: str = "search",
+        query: str = "",
+        school: str = "",
+    ) -> Dict[str, Any]:
+        """Search or set the WebVPN university used by scansci-pdf.
+
+        100+ Chinese universities are supported.  Set a school before
+        ``publisher_login(kind="webvpn")``.
+
+        Args:
+            action: ``"search"`` (default) to search universities by
+                ``query``, or ``"set"`` to select a university by
+                ``school`` (its exact name).
+            query: Search keywords (e.g. ``"北京"``) for ``action="search"``.
+            school: University name for ``action="set"``.
+
+        Returns:
+            A dict with ``status`` (``"ok"`` / ``"unavailable"`` /
+            ``"timeout"`` / ``"error"``) and ``scansci_result``
+            (the parsed upstream result).
+        """
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
+        client = await _get_scansci_client()
+        if client is None:
+            return {
+                "status": "unavailable",
+                "message": "scansci-pdf is not available.",
+                "detail": _scansci_error,
+            }
+        await _ensure_scansci_ready(client)
+
+        try:
+            async with client:
+                result = await asyncio.wait_for(
+                    client.call_tool(
+                        "scansci_pdf_schools",
+                        {"action": action, "query": query, "school": school},
+                    ),
+                    timeout=60,
+                )
+        except asyncio.TimeoutError:
+            return {
+                "status": "timeout",
+                "message": "publisher_schools timed out after 60s.",
+            }
+        except Exception as exc:
+            logger.exception("publisher_schools failed")
+            return {
+                "status": "error",
+                "message": f"publisher_schools failed: {exc}",
+            }
+
+        return {
+            "status": "ok",
+            # Keyed "scansci_result" (not "result") because the shared
+            # unwrap helpers strip a legacy {"result": dict} wrapper.
+            "scansci_result": _parse_call_tool_result(result),
+        }
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tool: publisher_channel_status  (institutional channel status)
+    # ══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    async def publisher_channel_status(
+        kind: str = "webvpn",
+        doi: str = "",
+    ) -> Dict[str, Any]:
+        """Check the status of an institutional download channel.
+
+        Reports whether the selected WebVPN / CARSI / EZProxy / browser
+        session is alive and usable, optionally testing the channel
+        against a specific DOI.
+
+        Args:
+            kind: Channel to check — ``"webvpn"`` (default), ``"carsi"``,
+                ``"ezproxy"``, ``"browser"``, ``"browser_doctor"``
+                (browser health), or ``"webvpn_test"`` (probe the
+                channel with ``doi``).
+            doi: DOI used by ``kind="webvpn_test"``.
+
+        Returns:
+            A dict with ``status`` (``"ok"`` / ``"unavailable"`` /
+            ``"timeout"`` / ``"error"``) and ``scansci_result``
+            (the parsed upstream result).
+        """
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
+        client = await _get_scansci_client()
+        if client is None:
+            return {
+                "status": "unavailable",
+                "message": "scansci-pdf is not available.",
+                "detail": _scansci_error,
+            }
+        await _ensure_scansci_ready(client)
+
+        try:
+            async with client:
+                result = await asyncio.wait_for(
+                    client.call_tool(
+                        "scansci_pdf_channel_status",
+                        {"kind": kind, "doi": doi},
+                    ),
+                    timeout=90,
+                )
+        except asyncio.TimeoutError:
+            return {
+                "status": "timeout",
+                "message": "publisher_channel_status timed out after 90s.",
+            }
+        except Exception as exc:
+            logger.exception("publisher_channel_status failed")
+            return {
+                "status": "error",
+                "message": f"publisher_channel_status failed: {exc}",
+            }
+
+        return {
+            "status": "ok",
+            # Keyed "scansci_result" (not "result") because the shared
+            # unwrap helpers strip a legacy {"result": dict} wrapper.
+            "scansci_result": _parse_call_tool_result(result),
+        }
+
+    # ══════════════════════════════════════════════════════════════════
+    # Tool: publisher_diagnostics  (upstream health / network checks)
+    # ══════════════════════════════════════════════════════════════════
+
+    @mcp.tool()
+    async def publisher_diagnostics(
+        check: str = "health",
+        detailed: bool = False,
+    ) -> Dict[str, Any]:
+        """Run scansci-pdf diagnostics for the publisher download chain.
+
+        Aggregates the upstream health / network / source / setup
+        checks into one call, with targeted fix advice for blocked
+        sources or network problems.
+
+        Args:
+            check: Which diagnostic to run — ``"health"`` (default),
+                ``"network"``, ``"sources"`` (per-source success
+                rates), ``"setup"`` (component setup check), or
+                ``"auto_setup"`` (full auto-setup, may download the
+                Tor bundle on first run).
+            detailed: Pass ``True`` with ``check="health"`` for the
+                detailed health report.
+
+        Returns:
+            A dict with ``status`` (``"ok"`` / ``"unavailable"`` /
+            ``"timeout"`` / ``"error"``) and ``scansci_result``
+            (the parsed upstream result).
+        """
+        fast_fail = _ensure_publisher_available()
+        if fast_fail is not None:
+            return fast_fail
+
+        client = await _get_scansci_client()
+        if client is None:
+            return {
+                "status": "unavailable",
+                "message": "scansci-pdf is not available.",
+                "detail": _scansci_error,
+            }
+        await _ensure_scansci_ready(client)
+
+        # auto_setup may download the Tor bundle (~22 MB) on first run.
+        diag_timeout = 300 if check == "auto_setup" else 120
+        try:
+            async with client:
+                result = await asyncio.wait_for(
+                    client.call_tool(
+                        "scansci_pdf_diagnostics",
+                        {"check": check, "detailed": detailed},
+                    ),
+                    timeout=diag_timeout,
+                )
+        except asyncio.TimeoutError:
+            return {
+                "status": "timeout",
+                "message": (
+                    f"publisher_diagnostics({check}) timed out after "
+                    f"{diag_timeout}s."
+                ),
+            }
+        except Exception as exc:
+            logger.exception("publisher_diagnostics failed")
+            return {
+                "status": "error",
+                "message": f"publisher_diagnostics failed: {exc}",
+            }
+
+        return {
+            "status": "ok",
+            # Keyed "scansci_result" (not "result") because the shared
+            # unwrap helpers strip a legacy {"result": dict} wrapper.
+            "scansci_result": _parse_call_tool_result(result),
         }
